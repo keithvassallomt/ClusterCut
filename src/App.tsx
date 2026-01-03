@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { Monitor, Copy, History, ShieldCheck, ShieldAlert } from "lucide-react";
+import { Monitor, Copy, History, ShieldCheck } from "lucide-react";
 import clsx from "clsx";
 
 interface Peer {
