@@ -60,6 +60,8 @@ pub fn set_clipboard(text: String) {
             Ok(mut c) => {
                 if let Err(e) = c.set_text(text) {
                     eprintln!("Failed to set clipboard: {}", e);
+                } else {
+                    println!("Successfully set local clipboard content.");
                 }
             },
             Err(e) => eprintln!("Failed to init clipboard for write: {}", e),

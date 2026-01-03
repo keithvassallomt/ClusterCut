@@ -40,22 +40,31 @@ impl Transport {
     {
         let endpoint = self.endpoint.clone();
         tauri::async_runtime::spawn(async move {
+            println!("Starting transport listener loop...");
             while let Some(conn) = endpoint.accept().await {
+                println!("Transport accepted a connection attempt...");
                 let connection = conn.await;
                 match connection {
                     Ok(conn) => {
                         let remote_addr = conn.remote_address();
+                        println!("Transport established connection with {}", remote_addr);
                         let on_receive = on_receive.clone();
                         tauri::async_runtime::spawn(async move {
+                             println!("Waiting for bidirectional stream from {}", remote_addr);
                              while let Ok((_, mut recv)) = conn.accept_bi().await {
+                                 println!("Accepted stream from {}", remote_addr);
                                  // Limit 10MB
                                  if let Ok(buf) = recv.read_to_end(1024 * 1024 * 10).await {
+                                     println!("Read {} bytes from stream from {}", buf.len(), remote_addr);
                                      on_receive(buf, remote_addr);
+                                 } else {
+                                     eprintln!("Failed to read from stream from {}", remote_addr);
                                  }
                              }
+                             println!("Stream loop ended for {}", remote_addr);
                         });
                     }
-                    Err(e) => eprintln!("Connection failed: {}", e),
+                    Err(e) => eprintln!("Connection handshake failed: {}", e),
                 }
             }
         });
