@@ -169,6 +169,10 @@ pub fn run() {
             let state_ref = app.state::<AppState>();
             let state_for_thread = (*state_ref).clone();
 
+            // Clones for discovery loop
+            let discovery_handle = app_handle.clone();
+            let discovery_state = state_for_thread.clone();
+
             tauri::async_runtime::spawn(async move {
                 while let Ok(event) = receiver.recv_async().await {
                     match event {
@@ -191,14 +195,14 @@ pub fn run() {
                                         .unwrap_or_default()
                                         .as_secs(),
                                     is_trusted: {
-                                        let trusted = state_for_thread.trusted_keys.lock().unwrap();
+                                        let trusted = discovery_state.trusted_keys.lock().unwrap();
                                         trusted.contains_key(&id)
                                     },
                                 };
 
                                 println!("Added Peer: {:?}", peer);
-                                state_for_thread.add_peer(peer.clone());
-                                let _ = app_handle.emit("peer-update", &peer);
+                                discovery_state.add_peer(peer.clone());
+                                let _ = discovery_handle.emit("peer-update", &peer);
                             }
                         }
                         _ => {}
@@ -209,8 +213,12 @@ pub fn run() {
             // Keep variables alive? Transport endpoint drops if not stored.
             app.manage(transport.clone());
 
+            // Clones for transport listener
+            let listener_handle = app_handle.clone();
+            let listener_state = state_for_thread.clone();
+
             // Start Listening for incoming sync
-            transport.start_listening(|data, addr| {
+            transport.start_listening(move |data, addr| {
                 println!("Received {} bytes from {}", data.len(), addr);
                 // Try to deserialize as Message
                 if let Ok(msg) = serde_json::from_slice::<Message>(&data) {
@@ -229,7 +237,7 @@ pub fn run() {
                             // For now, emit event with IP and Msg.
 
                             // We need to pass the msg bytes to frontend so it can pass them back to respond_to_pairing
-                            let _ = app_handle.emit(
+                            let _ = listener_handle.emit(
                                 "pairing-request",
                                 serde_json::json!({
                                     "peer_ip": addr.ip().to_string(), // Frontend might need to look up Peer ID
@@ -245,8 +253,7 @@ pub fn run() {
                             // In initiate_pairing we stored by IP and ID.
                             // Let's lookup by IP.
                             let state_opt = {
-                                let mut pending =
-                                    state_for_thread.pending_handshakes.lock().unwrap();
+                                let mut pending = listener_state.pending_handshakes.lock().unwrap();
                                 pending.remove(&addr.to_string()) // Take ownership
                             };
 
@@ -260,10 +267,10 @@ pub fn run() {
                                         // We really need to know WHO we just paired with.
                                         // We can lookup Peer by IP in peers list.
                                         let mut trusted =
-                                            state_for_thread.trusted_keys.lock().unwrap();
+                                            listener_state.trusted_keys.lock().unwrap();
 
                                         // Lookup peer ID by IP
-                                        let peers = state_for_thread.get_peers();
+                                        let peers = listener_state.get_peers();
                                         // Iterate to find IP
                                         let mut found_id = None;
                                         for (p_id, p) in peers {
@@ -279,17 +286,16 @@ pub fn run() {
                                             // Update Peer status in map
                                             {
                                                 let mut peers_guard =
-                                                    state_for_thread.peers.lock().unwrap();
+                                                    listener_state.peers.lock().unwrap();
                                                 if let Some(peer) = peers_guard.get_mut(&id) {
                                                     peer.is_trusted = true;
                                                 }
                                             }
 
                                             // Emit update
-                                            if let Some(peer) =
-                                                state_for_thread.get_peers().get(&id)
+                                            if let Some(peer) = listener_state.get_peers().get(&id)
                                             {
-                                                let _ = app_handle.emit("peer-update", &peer);
+                                                let _ = listener_handle.emit("peer-update", &peer);
                                             }
 
                                             println!("Peer Trusted: {}", addr);

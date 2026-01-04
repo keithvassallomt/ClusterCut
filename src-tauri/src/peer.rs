@@ -1,6 +1,3 @@
-use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Peer {
     pub id: String,
