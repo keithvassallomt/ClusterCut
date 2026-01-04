@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { Monitor, Copy, History, ShieldCheck } from "lucide-react";
@@ -15,6 +15,8 @@ interface Peer {
 
 function App() {
   const [peers, setPeers] = useState<Peer[]>([]);
+  const peersRef = useRef<Peer[]>([]); // Ref to access peers inside stable listeners
+  
   const [clipboardHistory, setClipboardHistory] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<"devices" | "history">("devices");
 
@@ -23,7 +25,12 @@ function App() {
   const [incomingRequest, setIncomingRequest] = useState<{ peer_ip: string; msg: number[] } | null>(null);
   const [pin, setPin] = useState("");
   const [showPairingModal, setShowPairingModal] = useState(false);
-  const [pairingStep, setPairingStep] = useState<"init" | "respond">("init");
+  const [pairingStep, setPairingStep] = useState<"init" | "respond" | "waiting">("init");
+
+  // Keep ref in sync
+  useEffect(() => {
+      peersRef.current = peers;
+  }, [peers]);
 
   useEffect(() => {
     // Initial fetch
@@ -48,8 +55,8 @@ function App() {
         setIncomingRequest(event.payload);
         setPairingStep("respond");
         setShowPairingModal(true);
-        // Try to match IP to a known peer for display name
-        const peer = peers.find(p => p.ip === event.payload.peer_ip);
+        // Use ref to find peer without re-binding listener
+        const peer = peersRef.current.find(p => p.ip === event.payload.peer_ip);
         if (peer) setPairingPeer(peer);
     });
 
@@ -58,7 +65,7 @@ function App() {
       unlistenClipboard.then((f) => f());
       unlistenPairing.then((f) => f());
     };
-  }, [peers]); // Add peers to dependency to lookup peer on request? Or ref?
+  }, []); // Stable listener!
 
   const startPairing = (peer: Peer) => {
       setPairingPeer(peer);
