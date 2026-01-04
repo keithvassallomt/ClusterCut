@@ -257,6 +257,7 @@ pub fn run() {
                         }
                         mdns_sd::ServiceEvent::ServiceRemoved(_ty, fullname) => {
                             // Fullname is usually "InstanceName._service._udp.local."
+                            println!("Received ServiceRemoved for: {}", fullname);
                             // Our instance name is the ID.
                             let id = fullname.split('.').next().unwrap_or("unknown").to_string();
 

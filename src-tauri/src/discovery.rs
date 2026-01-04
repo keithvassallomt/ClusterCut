@@ -65,10 +65,8 @@ impl Drop for Discovery {
             if let Err(e) = self.daemon.unregister(fullname) {
                 eprintln!("Failed to unregister service: {}", e);
             }
-            // Give it a moment to send the packet?
-            // Drop might be running in a shutting down process.
-            // Thread might be killed soon.
-            // But usually unregister sends info immediately.
+            // Give the daemon time to send the goodbye packet before we drop it (and likely kill its background thread)
+            std::thread::sleep(std::time::Duration::from_millis(300));
         }
     }
 }
