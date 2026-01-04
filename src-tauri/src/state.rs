@@ -13,6 +13,7 @@ pub struct AppState {
     pub pending_handshakes: Arc<Mutex<HashMap<String, crate::crypto::SpakeState>>>,
     // Store trusted keys: PeerID -> Shared Key (32 bytes usually)
     pub trusted_keys: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    pub local_device_id: Arc<Mutex<String>>,
 }
 
 impl AppState {
@@ -21,6 +22,7 @@ impl AppState {
             peers: Arc::new(Mutex::new(HashMap::new())),
             pending_handshakes: Arc::new(Mutex::new(HashMap::new())),
             trusted_keys: Arc::new(Mutex::new(HashMap::new())),
+            local_device_id: Arc::new(Mutex::new(String::new())),
         }
     }
 

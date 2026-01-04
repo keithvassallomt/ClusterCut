@@ -59,14 +59,11 @@ async fn initiate_pairing(
     }
 
     // 4. Send Message
-    // We need our proper DeviceID. We generated it in run().
-    // We should probably store our own DeviceID in AppState to retrieve it.
-    // For now, I'll assume we can pass it or fix it later.
-    // Wait, Message::PairRequest needs device_id.
-    // Let's just send "unknown" for now and fix AppState to hold local ID.
+    let local_id = { state.local_device_id.lock().unwrap().clone() };
+
     let msg_struct = Message::PairRequest {
         msg,
-        device_id: "initiator-placeholder".to_string(),
+        device_id: local_id,
     };
     let data = serde_json::to_vec(&msg_struct).map_err(|e| e.to_string())?;
 
@@ -118,9 +115,11 @@ async fn respond_to_pairing(
     }
 
     // 5. Send Response
+    let local_id = { state.local_device_id.lock().unwrap().clone() };
+
     let msg_struct = Message::PairResponse {
         msg: msg_b,
-        device_id: "responder-placeholder".to_string(),
+        device_id: local_id,
     };
     let data = serde_json::to_vec(&msg_struct).map_err(|e| e.to_string())?;
 
@@ -157,6 +156,13 @@ pub fn run() {
             let run_id: u32 = rand::rng().random();
             let device_id = format!("ucp-{}", run_id);
 
+            // Store local ID in state
+            {
+                let state = app.state::<AppState>();
+                let mut id_lock = state.local_device_id.lock().unwrap();
+                *id_lock = device_id.clone();
+            }
+
             // Register this device with the actual QUIC port
             discovery
                 .register(&device_id, port)
@@ -182,6 +188,13 @@ pub fn run() {
                                     .get_property_val_str("id")
                                     .unwrap_or("unknown")
                                     .to_string();
+
+                                // Filter out self
+                                let local_id =
+                                    { discovery_state.local_device_id.lock().unwrap().clone() };
+                                if id == local_id {
+                                    continue;
+                                }
 
                                 let peer = Peer {
                                     id: id.clone(),

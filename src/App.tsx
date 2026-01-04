@@ -205,37 +205,56 @@ function App() {
           <div className="absolute inset-0 bg-black/80 flex items-center justify-center p-4 z-50 backdrop-blur-sm">
               <div className="bg-neutral-800 border border-neutral-700 rounded-xl p-6 w-full max-w-sm shadow-2xl">
                   <h3 className="text-lg font-bold mb-2">
-                      {pairingStep === "init" ? "Pair Device" : "Pairing Request"}
+                      {pairingStep === "init" ? "Pair Device" : 
+                       pairingStep === "waiting" ? "Waiting..." : "Pairing Request"}
                   </h3>
-                  <p className="text-neutral-400 text-sm mb-4">
-                      {pairingStep === "init" 
-                        ? `Enter a PIN to pair with ${pairingPeer?.hostname}. Proceed on the other device.` 
-                        : `Enter the PIN displayed on the other device (${incomingRequest?.peer_ip}).`
-                      }
-                  </p>
                   
-                  <input 
-                      type="text" 
-                      placeholder="Enter PIN (e.g. 1234)" 
-                      className="w-full bg-neutral-900 border border-neutral-700 rounded-lg px-4 py-3 mb-4 outline-none focus:border-blue-500 font-mono text-center text-xl tracking-widest"
-                      value={pin}
-                      onChange={e => setPin(e.target.value)}
-                  />
-                  
-                  <div className="flex gap-2">
-                      <button 
-                          onClick={() => setShowPairingModal(false)}
-                          className="flex-1 px-4 py-2 bg-neutral-700 hover:bg-neutral-600 rounded-lg transition-colors"
-                      >
-                          Cancel
-                      </button>
-                      <button 
-                          onClick={submitPairing}
-                          className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg transition-colors font-medium"
-                      >
-                          {pairingStep === "init" ? "Send Request" : "Verify & Pair"}
-                      </button>
-                  </div>
+                  {pairingStep === "waiting" ? (
+                      <div className="text-center py-4">
+                          <p className="text-neutral-400 text-sm mb-4">
+                              Request sent to {pairingPeer?.hostname}.<br/>
+                              Please check the other device.
+                          </p>
+                           <button 
+                              onClick={() => setShowPairingModal(false)}
+                              className="px-4 py-2 bg-neutral-700 hover:bg-neutral-600 rounded-lg transition-colors text-sm"
+                          >
+                              Close
+                          </button>
+                      </div>
+                  ) : (
+                    <>
+                      <p className="text-neutral-400 text-sm mb-4">
+                          {pairingStep === "init" 
+                            ? `Enter a PIN to pair with ${pairingPeer?.hostname}. Proceed on the other device.` 
+                            : `Enter the PIN displayed on the other device (${incomingRequest?.peer_ip}).`
+                          }
+                      </p>
+                      
+                      <input 
+                          type="text" 
+                          placeholder="Enter PIN (e.g. 1234)" 
+                          className="w-full bg-neutral-900 border border-neutral-700 rounded-lg px-4 py-3 mb-4 outline-none focus:border-blue-500 font-mono text-center text-xl tracking-widest"
+                          value={pin}
+                          onChange={e => setPin(e.target.value)}
+                      />
+                      
+                      <div className="flex gap-2">
+                          <button 
+                              onClick={() => setShowPairingModal(false)}
+                              className="flex-1 px-4 py-2 bg-neutral-700 hover:bg-neutral-600 rounded-lg transition-colors"
+                          >
+                              Cancel
+                          </button>
+                          <button 
+                              onClick={submitPairing}
+                              className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg transition-colors font-medium"
+                          >
+                              {pairingStep === "init" ? "Send Request" : "Verify & Pair"}
+                          </button>
+                      </div>
+                    </>
+                  )}
               </div>
           </div>
       )}
