@@ -59,11 +59,7 @@ async fn add_manual_peer(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-        is_trusted: {
-            let trusted = state.trusted_keys.lock().unwrap();
-            // We don't verify trust on add because we don't know real ID yet.
-            false
-        },
+        is_trusted: false,
     };
 
     state.add_peer(peer.clone());
@@ -125,57 +121,97 @@ async fn initiate_pairing(
 
 #[tauri::command]
 async fn respond_to_pairing(
-    peer_id: String,
+    peer_id: Option<String>,
+    peer_addr: Option<String>,
+    device_id: Option<String>,
     pin: String,
     request_msg: Vec<u8>,
     state: tauri::State<'_, AppState>,
     transport: tauri::State<'_, Transport>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    // 1. Find peer address
-    let peer_addr = {
+    // 1. Resolve Peer Address
+    let target_addr: std::net::SocketAddr = if let Some(addr_str) = peer_addr {
+        // Use explicit overwrite if provided (from Observed IP)
+        addr_str
+            .parse()
+            .map_err(|e| format!("Invalid Peer Address: {}", e))?
+    } else if let Some(id) = &peer_id {
+        // Lookup by ID
         let peers = state.get_peers();
-        if let Some(peer) = peers.get(&peer_id) {
+        if let Some(peer) = peers.get(id) {
             std::net::SocketAddr::new(peer.ip, peer.port)
         } else {
-            return Err("Peer not found".to_string());
+            return Err("Peer not found in list".to_string());
         }
+    } else {
+        return Err("Must provide either peer_id or peer_addr".to_string());
     };
 
-    // 2. Start SPAKE2 (Responder Identity)
+    // 2. Resolve Target ID (for Trust Store)
+    let target_id = if let Some(id) = device_id {
+        id
+    } else if let Some(id) = peer_id {
+        id
+    } else {
+        // If we don't have an ID, we can't trust them properly.
+        return Err("No Peer ID provided for trust storage".to_string());
+    };
+
+    // 3. Start SPAKE2 (Responder Identity)
     // IMPORTANT: If initiator used "initiator", responder used "responder".
     // Or if symmetric, we just use different IDs.
     let (spake_state, msg_b) =
         crypto::start_spake2(&pin, "responder", "initiator").map_err(|e| e.to_string())?;
 
-    // 3. Finish Handshake immediately (as we have Msg A)
+    // 4. Finish Handshake immediately (as we have Msg A)
     let shared_key = crypto::finish_spake2(spake_state, &request_msg)
         .map_err(|e| format!("Pairing Failed: {}", e))?;
 
-    println!("Pairing Success! Shared Key derived.");
+    println!("Pairing Success! Shared Key derived for {}.", target_id);
 
-    // 4. Store Key (Trust this peer)
+    // 5. Store Key (Trust this peer)
     {
         let mut trusted = state.trusted_keys.lock().unwrap();
-        trusted.insert(peer_id.clone(), shared_key);
+        trusted.insert(target_id.clone(), shared_key);
         // Save to disk
         save_trusted_peers(&app_handle, &trusted);
 
-        // Update Peer status in map
+        // Update Peer status in map OR Register new peer if unknown
         {
             let mut peers_guard = state.peers.lock().unwrap();
-            if let Some(peer) = peers_guard.get_mut(&peer_id) {
+
+            if let Some(peer) = peers_guard.get_mut(&target_id) {
+                // Existing peer
                 peer.is_trusted = true;
+                // Maybe update IP if it changed?
+                // peer.ip = target_addr.ip();
+                // peer.port = target_addr.port();
+            } else {
+                // New / Manual / NAT Peer
+                println!("Registering new trusted peer: {}", target_id);
+                let new_peer = Peer {
+                    id: target_id.clone(),
+                    ip: target_addr.ip(),
+                    port: target_addr.port(),
+                    hostname: format!("Peer ({})", target_addr.ip()), // Temp name
+                    last_seen: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    is_trusted: true,
+                };
+                peers_guard.insert(target_id.clone(), new_peer);
             }
         }
 
         // Emit update
-        if let Some(peer) = state.get_peers().get(&peer_id) {
+        if let Some(peer) = state.get_peers().get(&target_id) {
             let _ = app_handle.emit("peer-update", &peer);
         }
     }
 
-    // 5. Send Response
+    // 6. Send Response
     let local_id = { state.local_device_id.lock().unwrap().clone() };
 
     let msg_struct = Message::PairResponse {
@@ -185,7 +221,7 @@ async fn respond_to_pairing(
     let data = serde_json::to_vec(&msg_struct).map_err(|e| e.to_string())?;
 
     transport
-        .send_message(peer_addr, &data)
+        .send_message(target_addr, &data) // Respond to the Resolved Address
         .await
         .map_err(|e| e.to_string())?;
 
@@ -352,7 +388,8 @@ pub fn run() {
                             let _ = listener_handle.emit(
                                 "pairing-request",
                                 serde_json::json!({
-                                    "peer_ip": addr.ip().to_string(), // Frontend might need to look up Peer ID
+                                    "peer_addr": addr.to_string(), // Full SocketAddress (IP:PORT)
+                                    "device_id": device_id,       // Initiator ID
                                     "msg": msg
                                 }),
                             );
@@ -392,7 +429,7 @@ pub fn run() {
                                             }
                                         }
 
-                                        if let Some(mut id) = found_id {
+                                        if let Some(id) = found_id {
                                             // CHECK: Is this a manual peer?
                                             // The real ID is `device_id` (from packet).
                                             // The `id` we found is from our map (maybe "manual-...").

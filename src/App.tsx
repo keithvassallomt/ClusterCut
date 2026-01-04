@@ -22,7 +22,7 @@ function App() {
 
   /* Pairing State */
   const [pairingPeer, setPairingPeer] = useState<Peer | null>(null);
-  const [incomingRequest, setIncomingRequest] = useState<{ peer_ip: string; msg: number[] } | null>(null);
+  const [incomingRequest, setIncomingRequest] = useState<{ peer_addr: string; device_id: string; msg: number[] } | null>(null);
   const [pin, setPin] = useState("");
   const [showPairingModal, setShowPairingModal] = useState(false);
   const [pairingStep, setPairingStep] = useState<"init" | "respond" | "waiting">("init");
@@ -38,25 +38,19 @@ function App() {
         setPeers(Object.values(peerMap));
     });
 
-    const unlistenPeer = listen<Peer>("peer-update", (event) => {
-      setPeers((prev) => {
-        const exists = prev.find((p) => p.id === event.payload.id);
-        if (exists) return prev.map((p) => (p.id === event.payload.id ? event.payload : p));
-        return [...prev, event.payload];
-      });
-    });
+    // ... (peer-update listener)
 
-    const unlistenClipboard = listen<string>("clipboard-change", (event) => {
-      setClipboardHistory((prev) => [event.payload, ...prev].slice(0, 10)); // Keep last 10
-    });
+    // ... (clipboard listener)
 
-    const unlistenPairing = listen<{ peer_ip: string; msg: number[] }>("pairing-request", (event) => {
+    const unlistenPairing = listen<{ peer_addr: string; device_id: string; msg: number[] }>("pairing-request", (event) => {
         console.log("Received pairing request", event.payload);
         setIncomingRequest(event.payload);
         setPairingStep("respond");
         setShowPairingModal(true);
         // Use ref to find peer without re-binding listener
-        const peer = peersRef.current.find(p => p.ip === event.payload.peer_ip);
+        // Try match by IP within address?
+        const ip = event.payload.peer_addr.split(":")[0];
+        const peer = peersRef.current.find(p => p.ip === ip || p.id === event.payload.device_id);
         if (peer) setPairingPeer(peer);
     });
     
@@ -103,24 +97,20 @@ function App() {
               // For now assuming we found it via IP or user knows.
               // If incomingRequest doesn't map to peer, we need to handle that.
               
-              // Find peer by IP if we haven't already
-              let targetId = pairingPeer?.id;
-              if (!targetId && incomingRequest) {
-                  const p = peers.find(x => x.ip === incomingRequest.peer_ip);
-                  if (p) targetId = p.id;
-              }
-
-              if (targetId && incomingRequest) {
+              const targetId = pairingPeer?.id || null;
+              
+              if (incomingRequest) {
                   await invoke("respond_to_pairing", { 
                       peerId: targetId, 
+                      peerAddr: incomingRequest.peer_addr,
+                      deviceId: incomingRequest.device_id,
                       pin, 
                       requestMsg: incomingRequest.msg 
                   });
                   alert("Pairing Verified! You are now connected.");
                   setShowPairingModal(false);
                   setIncomingRequest(null);
-              } else {
-                  alert("Could not find peer info for " + incomingRequest?.peer_ip);
+                  setPin("");
               }
           }
       } catch (e) {
@@ -255,7 +245,7 @@ function App() {
                       <p className="text-neutral-400 text-sm mb-4">
                           {pairingStep === "init" 
                             ? `Enter a PIN to pair with ${pairingPeer?.hostname}. Proceed on the other device.` 
-                            : `Enter the PIN displayed on the other device (${incomingRequest?.peer_ip}).`
+                            : `Enter the PIN displayed on the other device (${incomingRequest?.peer_addr}).`
                           }
                       </p>
                       
