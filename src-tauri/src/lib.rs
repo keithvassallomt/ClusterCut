@@ -32,32 +32,16 @@ async fn add_manual_peer(
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    // Basic IP validation
-    let ip_addr: std::net::IpAddr = ip.parse().map_err(|_| "Invalid IP address")?;
-    // Default port for manual entry? We should probably ask for it or assume default QUIC port if not specified?
-    // Discovery usually tells us the port. Manual entry... let's assume valid port or passed in?
-    // "Quick and dirty" -> try default port? But port is random in current impl!
-    // Ah, `Transport::new(0)` binds random port.
-    // If we want manual entry, we need the peer to be listening on a known port OR we need to input it.
-    // User asked "via ip address".
-    // If the other peer is random port, we can't guess it.
-    // BUT maybe we can assume for "Quick and Dirty" that we might need the port too?
-    // Or... we just try to discover it? No, mDNS failed.
-    // FIX: We need to change `Transport::new(0)` to a fixed port if we want manual IP to work reliably without port input,
-    // OR require port input.
-    // User asked "via ip address".
-    // Let's allow "ip:port" string or defaults.
-    // But realistically, if we can't discover, we probably don't know the port if it's random.
-    // FAILURE mode: User enters IP. We assume what?
-    // Maybe we just let them enter IP and we assume the port is... wait, we print it on startup.
-    // Let's assume user knows the port or enters "IP:PORT".
-
-    // Parse IP:PORT or just IP
+    // Parse IP:PORT or just IP (Try SocketAddr first, then IP)
     let (addr, port) = if let Ok(sock) = ip.parse::<std::net::SocketAddr>() {
         (sock.ip(), sock.port())
     } else {
         // Just IP?
-        (ip_addr, 0) // 0 means... unusable? We need a port.
+        if let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() {
+            (ip_addr, 0)
+        } else {
+            return Err("Invalid IP address or format (use IP or IP:PORT)".to_string());
+        }
     };
 
     if port == 0 {
