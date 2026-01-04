@@ -415,6 +415,20 @@ pub fn run() {
             initiate_pairing,
             respond_to_pairing
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                println!("App Exit Requested - Cleaning up...");
+                // Explicitly drop discovery to trigger Unregister
+                let state = app_handle.state::<AppState>();
+                let mut d_lock = state.discovery.lock().unwrap();
+                if let Some(d) = d_lock.take() {
+                    // This will call Drop for Discovery
+                    // We can also call a method if we wanted, but Drop is fine.
+                    println!("Dropping Discovery Service...");
+                    drop(d);
+                }
+            }
+        });
 }
