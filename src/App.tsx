@@ -59,11 +59,16 @@ function App() {
         const peer = peersRef.current.find(p => p.ip === event.payload.peer_ip);
         if (peer) setPairingPeer(peer);
     });
+    
+    const unlistenRemove = listen<string>("peer-remove", (event) => {
+        setPeers((prev) => prev.filter(p => p.id !== event.payload));
+    });
 
     return () => {
       unlistenPeer.then((f) => f());
       unlistenClipboard.then((f) => f());
       unlistenPairing.then((f) => f());
+      unlistenRemove.then((f) => f());
     };
   }, []); // Stable listener!
 

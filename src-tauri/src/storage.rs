@@ -67,3 +67,35 @@ pub fn save_trusted_peers(app: &AppHandle, peers: &HashMap<String, Vec<u8>>) {
         }
     }
 }
+// ... (existing load/save trusted peers)
+
+pub fn load_device_id(app: &AppHandle) -> String {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("device_id", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+
+    if !path.exists() {
+        return String::new();
+    }
+
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+pub fn save_device_id(app: &AppHandle, id: &str) {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("device_id", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to resolve device_id path: {}", e);
+            return;
+        }
+    };
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let _ = fs::write(path, id);
+}

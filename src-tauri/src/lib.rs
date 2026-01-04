@@ -12,7 +12,7 @@ use peer::Peer;
 use protocol::Message;
 use rand::Rng;
 use state::AppState;
-use storage::{load_trusted_peers, save_trusted_peers};
+use storage::{load_device_id, load_trusted_peers, save_device_id, save_trusted_peers};
 use tauri::{Emitter, Manager};
 use transport::Transport;
 
@@ -115,9 +115,18 @@ async fn respond_to_pairing(
         // Save to disk
         save_trusted_peers(&app_handle, &trusted);
 
-        // Also might want to map Address -> Key for incoming packets?
-        // But address changes. PeerID is stable.
-        // We will need to map PeerID to connection.
+        // Update Peer status in map
+        {
+            let mut peers_guard = state.peers.lock().unwrap();
+            if let Some(peer) = peers_guard.get_mut(&peer_id) {
+                peer.is_trusted = true;
+            }
+        }
+
+        // Emit update
+        if let Some(peer) = state.get_peers().get(&peer_id) {
+            let _ = app_handle.emit("peer-update", &peer);
+        }
     }
 
     // 5. Send Response
@@ -166,9 +175,16 @@ pub fn run() {
 
             let discovery = Discovery::new().expect("Failed to initialize discovery");
 
-            // Generate a random device ID for this session
-            let run_id: u32 = rand::rng().random();
-            let device_id = format!("ucp-{}", run_id);
+            // Load (or generate) Device ID
+            let mut device_id = load_device_id(app.handle());
+            if device_id.is_empty() {
+                let run_id: u32 = rand::rng().random();
+                device_id = format!("ucp-{}", run_id);
+                save_device_id(app.handle(), &device_id);
+                println!("Generated new Device ID: {}", device_id);
+            } else {
+                println!("Loaded Device ID: {}", device_id);
+            }
 
             // Store local ID in state
             {
@@ -231,6 +247,21 @@ pub fn run() {
                                 discovery_state.add_peer(peer.clone());
                                 let _ = discovery_handle.emit("peer-update", &peer);
                             }
+                        }
+                        mdns_sd::ServiceEvent::ServiceRemoved(_ty, fullname) => {
+                            // Fullname is usually "InstanceName._service._udp.local."
+                            // Our instance name is the ID.
+                            let id = fullname.split('.').next().unwrap_or("unknown").to_string();
+
+                            println!("Peer Removed: {}", id);
+
+                            // Remove from state
+                            {
+                                let mut peers = discovery_state.peers.lock().unwrap();
+                                peers.remove(&id);
+                            }
+
+                            let _ = discovery_handle.emit("peer-remove", &id);
                         }
                         _ => {}
                     }
