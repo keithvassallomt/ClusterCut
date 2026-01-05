@@ -305,7 +305,8 @@ async fn respond_to_pairing(
                     .unwrap_or_default()
                     .as_secs(),
                 is_trusted: true,
-                is_manual: false, // Defaulting to false here as we assume mDNS, but we could check against existing known?
+                // If we don't know them via mDNS (runtime peers), treat as manual so we remember them.
+                is_manual: !state.peers.lock().unwrap().contains_key(&target_id),
             };
             kp_lock.insert(target_id.clone(), p.clone());
             save_known_peers(&app_handle, &kp_lock);
@@ -547,7 +548,8 @@ pub fn run() {
                                                     kp_lock.insert(peer.id.clone(), peer.clone());
                                                     
                                                     // Update Runtime + UI
-                                                    if !runtime_peers.contains_key(&peer.id) {
+                                                    // Only show Manual peers initially. mDNS peers will show up when discovered.
+                                                    if peer.is_manual && !runtime_peers.contains_key(&peer.id) {
                                                         runtime_peers.insert(peer.id.clone(), peer.clone());
                                                         let _ = listener_handle.emit("peer-update", &peer);
                                                     }
@@ -565,8 +567,12 @@ pub fn run() {
                                 eprintln!("Received Welcome but no session key found");
                             }
                         }
-                        Message::PeerDiscovery(peer) => {
+                        Message::PeerDiscovery(mut peer) => {
                              println!("Received Gossip about peer {} ({})", peer.hostname, peer.ip);
+                             // If it's gossiped, it means it's a Manual peer from someone else's perspective.
+                             // We should treat it as manual too, so we persist and see it.
+                             peer.is_manual = true; 
+
                              // Add to Known Peers and Runtime
                              {
                                  let mut kp_lock = listener_state.known_peers.lock().unwrap();
