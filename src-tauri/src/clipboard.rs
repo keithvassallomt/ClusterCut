@@ -56,6 +56,12 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                     println!("Clipboard Changed detected (len={})", text.len());
                     last_text = text.clone();
 
+                    // Update global deduplication cache to prevent echo loops
+                    {
+                        let mut last_global = state.last_clipboard_content.lock().unwrap();
+                        *last_global = text.clone();
+                    }
+
                     // Emit to frontend (local notification)
                     let _ = app_handle.emit("clipboard-change", &text);
 

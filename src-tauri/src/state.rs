@@ -17,8 +17,10 @@ pub struct AppState {
     // Known Peers (Persisted list of devices we know about)
     pub known_peers: Arc<Mutex<HashMap<String, Peer>>>,
     pub local_device_id: Arc<Mutex<String>>,
-    // Keep discovery alive so it doesn't unregister
+    // Discovery Service
     pub discovery: Arc<Mutex<Option<crate::discovery::Discovery>>>,
+    // Last Clipboard Content (for deduplication and loop prevention)
+    pub last_clipboard_content: Arc<Mutex<String>>,
 }
 
 impl AppState {
@@ -31,6 +33,7 @@ impl AppState {
             known_peers: Arc::new(Mutex::new(HashMap::new())),
             local_device_id: Arc::new(Mutex::new(String::new())),
             discovery: Arc::new(Mutex::new(None)),
+            last_clipboard_content: Arc::new(Mutex::new(String::new())),
         }
     }
 

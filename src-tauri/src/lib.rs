@@ -478,8 +478,55 @@ pub fn run() {
                                     match crypto::decrypt(&key_arr, &ciphertext) {
                                         Ok(plaintext) => {
                                             if let Ok(text) = String::from_utf8(plaintext) {
+                                                // 1. Deduplication Check
+                                                {
+                                                    let mut last = listener_state.last_clipboard_content.lock().unwrap();
+                                                    if *last == text {
+                                                        println!("Ignoring duplicate clipboard content caused by loop/echo.");
+                                                        return; // Stop processing
+                                                    }
+                                                    *last = text.clone();
+                                                }
+
                                                 println!("Decrypted Clipboard: {}", text);
-                                                clipboard::set_clipboard(text);
+                                                clipboard::set_clipboard(text.clone());
+
+                                                // 2. RELAY / RE-BROADCAST (Mesh Flooding)
+                                                // Used to bridge peers that can't route to each other (e.g. VPN <-> Local)
+                                                // Re-encrypt and send to everyone else.
+                                                // Note: We need a fresh nonce, so we call encrypt again.
+                                                let state_relay = listener_state.clone();
+                                                let transport_relay = transport_for_ack.clone();
+                                                let sender_addr = addr;
+                                                let relay_text = text.clone();
+                                                // 2. RELAY / RE-BROADCAST (Mesh Flooding)
+                                                // Used to bridge peers that can't route to each other (e.g. VPN <-> Local)
+                                                // Encrypt once (new nonce) and broadcast to all others.
+                                                let state_relay = listener_state.clone();
+                                                let transport_relay = transport_for_ack.clone();
+                                                let sender_addr = addr;
+                                                let relay_key_arr = key_arr; // Byte array is Copy/Send
+                                                
+                                                // Encrypt synchronously to avoid Send issues with Box<dyn StdError>
+                                                // and to be more efficient (encrypt once, send many).
+                                                if let Ok(relay_ciphertext) = crypto::encrypt(&relay_key_arr, text.as_bytes()) {
+                                                    let relay_data = serde_json::to_vec(&Message::Clipboard(relay_ciphertext)).unwrap_or_default();
+                                                    
+                                                    tauri::async_runtime::spawn(async move {
+                                                       let peers = state_relay.get_peers();
+                                                       for p in peers.values() {
+                                                            let p_addr = std::net::SocketAddr::new(p.ip, p.port);
+                                                            // Don't echo back to sender
+                                                            if p_addr == sender_addr {
+                                                                continue;
+                                                            }
+                                                            println!("Relaying clipboard to {}", p_addr);
+                                                            let _ = transport_relay.send_message(p_addr, &relay_data).await;
+                                                       }
+                                                    });
+                                                } else {
+                                                    eprintln!("Failed to encrypt for relay");
+                                                }
                                             }
                                         }
                                         Err(e) => eprintln!("Failed to decrypt clipboard: {}", e),
