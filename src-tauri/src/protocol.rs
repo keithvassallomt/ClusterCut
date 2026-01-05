@@ -16,4 +16,6 @@ pub enum Message {
         encrypted_cluster_key: Vec<u8>, // Encrypted with SPAKE2+ session key
         known_peers: Vec<crate::peer::Peer>,
     },
+    // Gossip: Broadcast new peer to known peers
+    PeerDiscovery(crate::peer::Peer),
 }

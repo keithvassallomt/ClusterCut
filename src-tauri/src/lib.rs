@@ -19,6 +19,38 @@ use storage::{
 use tauri::{Emitter, Manager};
 use transport::Transport;
 
+// Helper to broadcast a new peer to all known peers (Gossip)
+fn gossip_peer(
+    new_peer: &Peer,
+    state: &AppState,
+    transport: &Transport,
+    exclude_addr: Option<std::net::SocketAddr>,
+) {
+    let peers = state.get_peers();
+    let msg = Message::PeerDiscovery(new_peer.clone());
+    let data = serde_json::to_vec(&msg).unwrap_or_default();
+
+    for p in peers.values() {
+        // Don't gossip to the new peer itself
+        if p.id == new_peer.id {
+            continue;
+        }
+        let addr = std::net::SocketAddr::new(p.ip, p.port);
+        if Some(addr) == exclude_addr {
+            continue;
+        }
+
+        let transport_clone = transport.clone();
+        let data_vec = data.clone();
+        
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
+                eprintln!("Failed to gossip peer to {}: {}", addr, e);
+            }
+        });
+    }
+}
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -33,6 +65,7 @@ fn get_peers(state: tauri::State<AppState>) -> std::collections::HashMap<String,
 async fn add_manual_peer(
     ip: String,
     state: tauri::State<'_, AppState>,
+    transport: tauri::State<'_, Transport>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     // Parse IP:PORT or just IP (Try SocketAddr first, then IP)
@@ -53,8 +86,6 @@ async fn add_manual_peer(
 
     let id = format!("manual-{}", ip);
 
-    // Manual Entry: Add to Known Peers so it persists?
-    // And Add to Peermap for visibility.
     let peer = Peer {
         id: id.clone(),
         ip: addr,
@@ -69,7 +100,7 @@ async fn add_manual_peer(
 
     state.add_peer(peer.clone());
     
-    // Also save to known peers so it persists across restarts
+    // Save to known peers
     {
         let mut kp = state.known_peers.lock().unwrap();
         if !kp.contains_key(&id) {
@@ -79,6 +110,9 @@ async fn add_manual_peer(
     }
 
     let _ = app_handle.emit("peer-update", &peer);
+
+    // Gossip this new manual peer to others!
+    gossip_peer(&peer, &state, &transport, None);
 
     Ok(())
 }
@@ -218,14 +252,7 @@ async fn respond_to_pairing(
     };
     let data_welcome = serde_json::to_vec(&welcome_struct).map_err(|e| e.to_string())?;
 
-    // Use a small sleep delay to likely ensure PairResponse arrives first?
-    // UDP/QUIC streams are independent.
-    // Ideally we'd await confirmation but we are "fire and forget" here for now.
-    // Realistically, the Initiator needs to receive PairResponse first to derive the Session Key.
-    // If Welcome arrives first, it will fail to find the session key.
-    // We can just rely on retry or assume 100ms is enough.
-    // Or better: Initiator should buffer Welcome if it arrives early. (Complicated for MVP).
-    // Let's add a small sleep here just in case.
+    // Small delay to ensure order
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     transport
@@ -243,15 +270,23 @@ async fn respond_to_pairing(
                 id: target_id.clone(),
                 ip: target_addr.ip(),
                 port: target_addr.port(),
-                hostname: format!("Peer ({})", target_addr.ip()),
+                hostname: format!("Peer ({})", target_addr.ip()), // We don't know hostname yet properly? 
+                // Wait, request_msg didn't have hostname. 
+                // We rely on mDNS usually. For manual/VPN, we might want to exchange it.
                 last_seen: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
                 is_trusted: true,
             };
-            kp_lock.insert(target_id, p);
+            kp_lock.insert(target_id.clone(), p.clone());
             save_known_peers(&app_handle, &kp_lock);
+            
+            // Add to runtime and Gossip!
+            state.add_peer(p.clone());
+            let _ = app_handle.emit("peer-update", &p);
+            
+            gossip_peer(&p, &state, &transport, Some(target_addr));
         }
     }
 
@@ -285,6 +320,12 @@ pub fn run() {
                 // 2. Load Known Peers
                 let mut kp_lock = state.known_peers.lock().unwrap();
                 *kp_lock = load_known_peers(app_handle);
+                
+                // Load known peers into RUNTIME state too! (Fixes UI not showing known peers on restart)
+                let mut runtime_peers = state.peers.lock().unwrap();
+                for peer in kp_lock.values() {
+                     runtime_peers.insert(peer.id.clone(), peer.clone());
+                }
 
                 // 3. Load Device ID
                 let mut device_id = load_device_id(app_handle);
@@ -326,8 +367,6 @@ pub fn run() {
                                         continue;
                                     }
 
-                                    // Mark as trusted if we know them OR if we have the cluster key (implicit trust for everyone?)
-                                    // Visual indication: known peers = trusted.
                                     let is_known = {
                                         let kp = d_state.known_peers.lock().unwrap();
                                         kp.contains_key(&id)
@@ -369,6 +408,7 @@ pub fn run() {
             // Clones for transport listener
             let listener_handle = app.handle().clone();
             let listener_state = (*app.state::<AppState>()).clone();
+            let transport_for_ack = transport.clone();
 
             app.manage(transport.clone());
 
@@ -395,7 +435,6 @@ pub fn run() {
                                             if let Ok(text) = String::from_utf8(plaintext) {
                                                 println!("Decrypted Clipboard: {}", text);
                                                 clipboard::set_clipboard(text);
-                                                // Only emit if needed? Backend sets OS clipboard.
                                             }
                                         }
                                         Err(e) => eprintln!("Failed to decrypt clipboard: {}", e),
@@ -466,31 +505,49 @@ pub fn run() {
                                                 save_cluster_key(listener_handle.app_handle(), &cluster_key);
                                             }
 
-                                            // 2. Merge Known Peers
+                                            // 2. Merge Known Peers (AND Update Runtime)
                                             {
                                                 let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                                                let mut runtime_peers = listener_state.peers.lock().unwrap();
+                                                
                                                 for peer in known_peers {
-                                                    // Don't overwrite if exists? Or merge?
-                                                    // Trust the welcomer.
-                                                    kp_lock.insert(peer.id.clone(), peer);
+                                                    // Add to Persistent
+                                                    kp_lock.insert(peer.id.clone(), peer.clone());
+                                                    
+                                                    // Update Runtime + UI
+                                                    if !runtime_peers.contains_key(&peer.id) {
+                                                        runtime_peers.insert(peer.id.clone(), peer.clone());
+                                                        let _ = listener_handle.emit("peer-update", &peer);
+                                                    }
                                                 }
                                                 // Save known peers
                                                 save_known_peers(listener_handle.app_handle(), &kp_lock);
                                             }
 
-                                            // 3. Emit Update (Refresh UI)
-                                            // Maybe re-read peers?
-                                            // We could emit a "network-joined" event?
                                             println!("Successfully joined network!");
-                                            // Just emit current peer status
-                                            // TODO: Refresh frontend peer list status from is_trusted=false to true
                                         }
                                         Err(e) => eprintln!("Failed to decrypt Cluster Key: {}", e),
                                     }
                                 }
                             } else {
-                                eprintln!("Received Welcome but no session key found (packet ordering issue or auth failed?)");
+                                eprintln!("Received Welcome but no session key found");
                             }
+                        }
+                        Message::PeerDiscovery(peer) => {
+                             println!("Received Gossip about peer {} ({})", peer.hostname, peer.ip);
+                             // Add to Known Peers and Runtime
+                             {
+                                 let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                                 let mut runtime_peers = listener_state.peers.lock().unwrap();
+                                 
+                                 // Update Persistent
+                                 kp_lock.insert(peer.id.clone(), peer.clone());
+                                 save_known_peers(listener_handle.app_handle(), &kp_lock);
+                                 
+                                 // Update Runtime + UI
+                                 runtime_peers.insert(peer.id.clone(), peer.clone());
+                                 let _ = listener_handle.emit("peer-update", &peer);
+                             }
                         }
                     }
                 }
