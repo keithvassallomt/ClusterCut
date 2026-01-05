@@ -268,9 +268,11 @@ async fn respond_to_pairing(
         .map_err(|e| e.to_string())?;
 
     // B. Send Welcome (with encrypted key and known peers)
+    // B. Send Welcome (with encrypted key and known peers)
+    // Send only RUNTIME peers (currently online) so the new joiner doesn't get flooded with ghosts.
     let known_peers = {
-        let kp = state.known_peers.lock().unwrap();
-        kp.values().cloned().collect()
+        let peers = state.peers.lock().unwrap();
+        peers.values().cloned().collect()
     };
 
     let welcome_struct = Message::Welcome {
@@ -558,8 +560,9 @@ pub fn run() {
                                                     kp_lock.insert(peer.id.clone(), peer.clone());
                                                     
                                                     // Update Runtime + UI
-                                                    // Only show Manual peers initially. mDNS peers will show up when discovered.
-                                                    if peer.is_manual && !runtime_peers.contains_key(&peer.id) {
+                                                    // Since the Welcome packet now contains only ONLINE peers, we can safely add them all.
+                                                    // This ensures VPN peers learn about mDNS peers (transitive visibility).
+                                                    if !runtime_peers.contains_key(&peer.id) {
                                                         runtime_peers.insert(peer.id.clone(), peer.clone());
                                                         let _ = listener_handle.emit("peer-update", &peer);
                                                     }
