@@ -292,31 +292,41 @@ async fn respond_to_pairing(
     // C. Add Target to Known Peers locally
     {
         let mut kp_lock = state.known_peers.lock().unwrap();
-        if !kp_lock.contains_key(&target_id) {
-            let p = Peer {
-                id: target_id.clone(),
-                ip: target_addr.ip(),
-                port: target_addr.port(),
-                hostname: format!("Peer ({})", target_addr.ip()), // We don't know hostname yet properly? 
-                // Wait, request_msg didn't have hostname. 
-                // We rely on mDNS usually. For manual/VPN, we might want to exchange it.
-                last_seen: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                is_trusted: true,
-                // If we don't know them via mDNS (runtime peers), treat as manual so we remember them.
-                is_manual: !state.peers.lock().unwrap().contains_key(&target_id),
-            };
-            kp_lock.insert(target_id.clone(), p.clone());
-            save_known_peers(&app_handle, &kp_lock);
-            
-            // Add to runtime and Gossip!
-            state.add_peer(p.clone());
-            let _ = app_handle.emit("peer-update", &p);
-            
-            gossip_peer(&p, &state, &transport, Some(target_addr));
-        }
+        // ALWAYS update the peer info on successful pairing!
+        // This ensures ip/port updates and is_manual flag is set correctly.
+        let p = Peer {
+            id: target_id.clone(),
+            ip: target_addr.ip(),
+            port: target_addr.port(),
+            hostname: format!("Peer ({})", target_addr.ip()), 
+            last_seen: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            is_trusted: true,
+            // If we don't know them via mDNS (runtime peers), treat as manual so we remember them.
+            // Also, if they were ALREADY manual, keep them manual.
+            is_manual: {
+                let runtime = state.peers.lock().unwrap();
+                if let Some(existing) = kp_lock.get(&target_id) {
+                    if existing.is_manual {
+                        true
+                    } else {
+                        !runtime.contains_key(&target_id)
+                    }
+                } else {
+                    !runtime.contains_key(&target_id)
+                }
+            },
+        };
+        kp_lock.insert(target_id.clone(), p.clone());
+        save_known_peers(&app_handle, &kp_lock);
+        
+        // Add to runtime and Gossip!
+        state.add_peer(p.clone());
+        let _ = app_handle.emit("peer-update", &p);
+        
+        gossip_peer(&p, &state, &transport, Some(target_addr));
     }
 
     Ok(())
