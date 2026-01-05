@@ -71,7 +71,7 @@ pub fn load_known_peers(app: &AppHandle) -> HashMap<String, Peer> {
     match fs::read_to_string(&path) {
         Ok(content) => match serde_json::from_str::<HashMap<String, Peer>>(&content) {
             Ok(peers) => {
-                println!("Loaded {} known peers from disk.", peers.len());
+                println!("Loaded {} known peers from disk at {:?}", peers.len(), path);
                 peers
             }
             Err(e) => {
@@ -105,7 +105,7 @@ pub fn save_known_peers(app: &AppHandle, peers: &HashMap<String, Peer>) {
             if let Err(e) = fs::write(path, json) {
                 eprintln!("Failed to write known peers file: {}", e);
             } else {
-                println!("Saved known peers to disk.");
+                println!("Saved known peers to disk at {:?}", path);
             }
         }
         Err(e) => {
