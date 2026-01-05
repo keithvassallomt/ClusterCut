@@ -1,15 +1,62 @@
+use crate::peer::Peer;
 use std::collections::HashMap;
 use std::fs;
 use tauri::{path::BaseDirectory, AppHandle, Manager};
 
-// Defines the storage format
-// Just a map of PeerID -> Key (hex encoded or bytes? Bytes in memory, maybe hex in JSON for readability, but serde handles vector as array)
-// serde_json handles Vec<u8> as [u8, u8, ...] usually.
-
-pub fn load_trusted_peers(app: &AppHandle) -> HashMap<String, Vec<u8>> {
+pub fn load_cluster_key(app: &AppHandle) -> Option<Vec<u8>> {
     let path_resolver = app.path();
-    // Use AppConfig or AppData. AppConfig is better for settings/keys.
-    let path = match path_resolver.resolve("trusted_peers.json", BaseDirectory::AppConfig) {
+    let path = match path_resolver.resolve("cluster_key.bin", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to resolve cluster key path: {}", e);
+            return None;
+        }
+    };
+
+    if !path.exists() {
+        return None;
+    }
+
+    match fs::read(&path) {
+        Ok(key) => {
+            if key.len() != 32 {
+                eprintln!("Cluster key file has invalid length: {}", key.len());
+                return None;
+            }
+            println!("Loaded Cluster Key from disk.");
+            Some(key)
+        }
+        Err(e) => {
+            eprintln!("Failed to read cluster key file: {}", e);
+            None
+        }
+    }
+}
+
+pub fn save_cluster_key(app: &AppHandle, key: &[u8]) {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("cluster_key.bin", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to resolve cluster key path for saving: {}", e);
+            return;
+        }
+    };
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if let Err(e) = fs::write(path, key) {
+        eprintln!("Failed to write cluster key file: {}", e);
+    } else {
+        println!("Saved Cluster Key to disk.");
+    }
+}
+
+pub fn load_known_peers(app: &AppHandle) -> HashMap<String, Peer> {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("known_peers.json", BaseDirectory::AppConfig) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to resolve config path: {}", e);
@@ -22,26 +69,26 @@ pub fn load_trusted_peers(app: &AppHandle) -> HashMap<String, Vec<u8>> {
     }
 
     match fs::read_to_string(&path) {
-        Ok(content) => match serde_json::from_str::<HashMap<String, Vec<u8>>>(&content) {
+        Ok(content) => match serde_json::from_str::<HashMap<String, Peer>>(&content) {
             Ok(peers) => {
-                println!("Loaded {} trusted peers from disk.", peers.len());
+                println!("Loaded {} known peers from disk.", peers.len());
                 peers
             }
             Err(e) => {
-                eprintln!("Failed to parse trusted peers: {}", e);
+                eprintln!("Failed to parse known peers: {}", e);
                 HashMap::new()
             }
         },
         Err(e) => {
-            eprintln!("Failed to read trusted peers file: {}", e);
+            eprintln!("Failed to read known peers file: {}", e);
             HashMap::new()
         }
     }
 }
 
-pub fn save_trusted_peers(app: &AppHandle, peers: &HashMap<String, Vec<u8>>) {
+pub fn save_known_peers(app: &AppHandle, peers: &HashMap<String, Peer>) {
     let path_resolver = app.path();
-    let path = match path_resolver.resolve("trusted_peers.json", BaseDirectory::AppConfig) {
+    let path = match path_resolver.resolve("known_peers.json", BaseDirectory::AppConfig) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to resolve config path for saving: {}", e);
@@ -49,7 +96,6 @@ pub fn save_trusted_peers(app: &AppHandle, peers: &HashMap<String, Vec<u8>>) {
         }
     };
 
-    // Ensure directory exists
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -57,17 +103,16 @@ pub fn save_trusted_peers(app: &AppHandle, peers: &HashMap<String, Vec<u8>>) {
     match serde_json::to_string_pretty(peers) {
         Ok(json) => {
             if let Err(e) = fs::write(path, json) {
-                eprintln!("Failed to write trusted peers file: {}", e);
+                eprintln!("Failed to write known peers file: {}", e);
             } else {
-                println!("Saved trusted peers to disk.");
+                println!("Saved known peers to disk.");
             }
         }
         Err(e) => {
-            eprintln!("Failed to serialize trusted peers: {}", e);
+            eprintln!("Failed to serialize known peers: {}", e);
         }
     }
 }
-// ... (existing load/save trusted peers)
 
 pub fn load_device_id(app: &AppHandle) -> String {
     let path_resolver = app.path();

@@ -9,10 +9,13 @@ use std::sync::{Arc, Mutex};
 pub struct AppState {
     pub peers: Arc<Mutex<HashMap<String, Peer>>>,
     // Store pending handshakes map: PeerID -> SpakeState
-    // We need to wrap SpakeState to be Send + Sync (it should be)
     pub pending_handshakes: Arc<Mutex<HashMap<String, crate::crypto::SpakeState>>>,
-    // Store trusted keys: PeerID -> Shared Key (32 bytes usually)
-    pub trusted_keys: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    // Store completed session keys waiting for Welcome packet: Addr -> SessionKey
+    pub handshake_sessions: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    // Shared Network Key (One key to rule them all)
+    pub cluster_key: Arc<Mutex<Option<Vec<u8>>>>,
+    // Known Peers (Persisted list of devices we know about)
+    pub known_peers: Arc<Mutex<HashMap<String, Peer>>>,
     pub local_device_id: Arc<Mutex<String>>,
     // Keep discovery alive so it doesn't unregister
     pub discovery: Arc<Mutex<Option<crate::discovery::Discovery>>>,
@@ -23,7 +26,9 @@ impl AppState {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
             pending_handshakes: Arc::new(Mutex::new(HashMap::new())),
-            trusted_keys: Arc::new(Mutex::new(HashMap::new())),
+            handshake_sessions: Arc::new(Mutex::new(HashMap::new())),
+            cluster_key: Arc::new(Mutex::new(None)),
+            known_peers: Arc::new(Mutex::new(HashMap::new())),
             local_device_id: Arc::new(Mutex::new(String::new())),
             discovery: Arc::new(Mutex::new(None)),
         }

@@ -184,13 +184,13 @@ function App() {
                                     onClick={() => startPairing(peer)}
                                     className="px-3 py-1.5 bg-neutral-700 hover:bg-neutral-600 text-xs rounded-md transition-colors"
                                 >
-                                    Pair
+                                    Connect
                                 </button>
                                 {/* Status Indicator */}
                                 {peer.is_trusted && (
                                     <div className="flex items-center gap-1.5 px-2 py-1 bg-emerald-500/10 text-emerald-400 text-xs rounded-md border border-emerald-500/20">
                                         <ShieldCheck size={12} />
-                                        <span>Trusted</span>
+                                        <span>Connected</span>
                                     </div>
                                 )}
                             </div>
@@ -231,15 +231,15 @@ function App() {
           <div className="absolute inset-0 bg-black/80 flex items-center justify-center p-4 z-50 backdrop-blur-sm">
               <div className="bg-neutral-800 border border-neutral-700 rounded-xl p-6 w-full max-w-sm shadow-2xl">
                   <h3 className="text-lg font-bold mb-2">
-                      {pairingStep === "init" ? "Pair Device" : 
-                       pairingStep === "waiting" ? "Waiting..." : "Pairing Request"}
+                      {pairingStep === "init" ? "Connect to Device" : 
+                       pairingStep === "waiting" ? "Waiting..." : "Connection Request"}
                   </h3>
                   
                   {pairingStep === "waiting" ? (
                       <div className="text-center py-4">
                           <p className="text-neutral-400 text-sm mb-4">
                               Request sent to {pairingPeer?.hostname}.<br/>
-                              Please check the other device.
+                              Please check the other device to approve.
                           </p>
                            <button 
                                onClick={() => setShowPairingModal(false)}
@@ -252,8 +252,8 @@ function App() {
                     <>
                       <p className="text-neutral-400 text-sm mb-4">
                           {pairingStep === "init" 
-                            ? `Enter a PIN to pair with ${pairingPeer?.hostname}. Proceed on the other device.` 
-                            : `Enter the PIN displayed on the other device (${incomingRequest?.peer_addr}).`
+                            ? `Enter a PIN to connect with ${pairingPeer?.hostname} and join its network.` 
+                            : `Enter the PIN displayed on ${incomingRequest?.peer_addr} to allow connection.`
                           }
                       </p>
                       
@@ -276,7 +276,7 @@ function App() {
                               onClick={submitPairing}
                               className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg transition-colors font-medium"
                           >
-                              {pairingStep === "init" ? "Send Request" : "Verify & Pair"}
+                              {pairingStep === "init" ? "Join Network" : "Verify & Connect"}
                           </button>
                       </div>
                     </>

@@ -12,7 +12,10 @@ use peer::Peer;
 use protocol::Message;
 use rand::Rng;
 use state::AppState;
-use storage::{load_device_id, load_trusted_peers, save_device_id, save_trusted_peers};
+use storage::{
+    load_cluster_key, load_device_id, load_known_peers, save_cluster_key, save_device_id,
+    save_known_peers,
+};
 use tauri::{Emitter, Manager};
 use transport::Transport;
 
@@ -50,6 +53,8 @@ async fn add_manual_peer(
 
     let id = format!("manual-{}", ip);
 
+    // Manual Entry: Add to Known Peers so it persists?
+    // And Add to Peermap for visibility.
     let peer = Peer {
         id: id.clone(),
         ip: addr,
@@ -63,6 +68,16 @@ async fn add_manual_peer(
     };
 
     state.add_peer(peer.clone());
+    
+    // Also save to known peers so it persists across restarts
+    {
+        let mut kp = state.known_peers.lock().unwrap();
+        if !kp.contains_key(&id) {
+            kp.insert(id.clone(), peer.clone());
+            save_known_peers(&app_handle, &kp);
+        }
+    }
+
     let _ = app_handle.emit("peer-update", &peer);
 
     Ok(())
@@ -86,20 +101,13 @@ async fn initiate_pairing(
     };
 
     // 2. Start SPAKE2
-    // For symmetric, we can just use "initiator" and "responder" identity, or device IDs interaction.
-    // Let's use "initiator" / "responder" as generic IDs for now, or the PIN itself is enough context.
-    // crypto::start_spake2 wants id_a and id_b.
-    // Let's use our device_id? We don't have it easily here without passing it securely.
-    // Symmetric start only cares about password usually?
-    // The wrapper start_spake2(password, id_a, id_b)
-
     let (spake_state, msg) =
         crypto::start_spake2(&pin, "initiator", "responder").map_err(|e| e.to_string())?;
 
     // 3. Store state
     {
         let mut pending = state.pending_handshakes.lock().unwrap();
-        pending.insert(peer_addr.to_string(), spake_state); // Store by address for handshake correlation
+        pending.insert(peer_addr.to_string(), spake_state); // Store by address
     }
 
     // 4. Send Message
@@ -132,12 +140,10 @@ async fn respond_to_pairing(
 ) -> Result<(), String> {
     // 1. Resolve Peer Address
     let target_addr: std::net::SocketAddr = if let Some(addr_str) = peer_addr {
-        // Use explicit overwrite if provided (from Observed IP)
         addr_str
             .parse()
             .map_err(|e| format!("Invalid Peer Address: {}", e))?
     } else if let Some(id) = &peer_id {
-        // Lookup by ID
         let peers = state.get_peers();
         if let Some(peer) = peers.get(id) {
             std::net::SocketAddr::new(peer.ip, peer.port)
@@ -148,82 +154,106 @@ async fn respond_to_pairing(
         return Err("Must provide either peer_id or peer_addr".to_string());
     };
 
-    // 2. Resolve Target ID (for Trust Store)
-    let target_id = if let Some(id) = device_id {
-        id
-    } else if let Some(id) = peer_id {
-        id
-    } else {
-        // If we don't have an ID, we can't trust them properly.
-        return Err("No Peer ID provided for trust storage".to_string());
-    };
+    let target_id = device_id.clone().unwrap_or_else(|| "unknown".to_string());
 
-    // 3. Start SPAKE2 (Responder Identity)
-    // IMPORTANT: If initiator used "initiator", responder used "responder".
-    // Or if symmetric, we just use different IDs.
+    // 2. Start SPAKE2 (Responder Identity)
     let (spake_state, msg_b) =
         crypto::start_spake2(&pin, "responder", "initiator").map_err(|e| e.to_string())?;
 
-    // 4. Finish Handshake immediately (as we have Msg A)
-    let shared_key = crypto::finish_spake2(spake_state, &request_msg)
+    // 3. Finish Handshake to get Session Key
+    let session_key = crypto::finish_spake2(spake_state, &request_msg)
         .map_err(|e| format!("Pairing Failed: {}", e))?;
 
-    println!("Pairing Success! Shared Key derived for {}.", target_id);
+    println!("Pairing Success! Session Key derived.");
 
-    // 5. Store Key (Trust this peer)
-    {
-        let mut trusted = state.trusted_keys.lock().unwrap();
-        trusted.insert(target_id.clone(), shared_key);
-        // Save to disk
-        save_trusted_peers(&app_handle, &trusted);
-
-        // Update Peer status in map OR Register new peer if unknown
-        {
-            let mut peers_guard = state.peers.lock().unwrap();
-
-            if let Some(peer) = peers_guard.get_mut(&target_id) {
-                // Existing peer
-                peer.is_trusted = true;
-                // Maybe update IP if it changed?
-                // peer.ip = target_addr.ip();
-                // peer.port = target_addr.port();
-            } else {
-                // New / Manual / NAT Peer
-                println!("Registering new trusted peer: {}", target_id);
-                let new_peer = Peer {
-                    id: target_id.clone(),
-                    ip: target_addr.ip(),
-                    port: target_addr.port(),
-                    hostname: format!("Peer ({})", target_addr.ip()), // Temp name
-                    last_seen: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    is_trusted: true,
-                };
-                peers_guard.insert(target_id.clone(), new_peer);
-            }
+    // 4. Ensure we have a Cluster Key to share
+    let cluster_key_bytes = {
+        let mut ck_lock = state.cluster_key.lock().unwrap();
+        if let Some(key) = ck_lock.as_ref() {
+            key.clone()
+        } else {
+            // Generate new Cluster Key
+            let new_key: [u8; 32] = rand::random();
+            *ck_lock = Some(new_key.to_vec());
+            // Save to disk
+            save_cluster_key(&app_handle, &new_key);
+            println!("Generated new Cluster Key.");
+            new_key.to_vec()
         }
+    };
 
-        // Emit update
-        if let Some(peer) = state.get_peers().get(&target_id) {
-            let _ = app_handle.emit("peer-update", &peer);
-        }
+    // 5. Encrypt Cluster Key with Session Key
+    let mut session_key_arr = [0u8; 32];
+    if session_key.len() != 32 {
+        return Err("Invalid session key length".to_string());
     }
+    session_key_arr.copy_from_slice(&session_key);
 
-    // 6. Send Response
+    let encrypted_cluster_key =
+        crypto::encrypt(&session_key_arr, &cluster_key_bytes).map_err(|e| e.to_string())?;
+
+    // 6. Send Response AND Welcome
     let local_id = { state.local_device_id.lock().unwrap().clone() };
 
+    // A. Send PairResponse
     let msg_struct = Message::PairResponse {
         msg: msg_b,
-        device_id: local_id,
+        device_id: local_id.clone(),
     };
-    let data = serde_json::to_vec(&msg_struct).map_err(|e| e.to_string())?;
-
+    let data_resp = serde_json::to_vec(&msg_struct).map_err(|e| e.to_string())?;
     transport
-        .send_message(target_addr, &data) // Respond to the Resolved Address
+        .send_message(target_addr, &data_resp)
         .await
         .map_err(|e| e.to_string())?;
+
+    // B. Send Welcome (with encrypted key and known peers)
+    let known_peers = {
+        let kp = state.known_peers.lock().unwrap();
+        kp.values().cloned().collect()
+    };
+
+    let welcome_struct = Message::Welcome {
+        encrypted_cluster_key,
+        known_peers,
+    };
+    let data_welcome = serde_json::to_vec(&welcome_struct).map_err(|e| e.to_string())?;
+
+    // Use a small sleep delay to likely ensure PairResponse arrives first?
+    // UDP/QUIC streams are independent.
+    // Ideally we'd await confirmation but we are "fire and forget" here for now.
+    // Realistically, the Initiator needs to receive PairResponse first to derive the Session Key.
+    // If Welcome arrives first, it will fail to find the session key.
+    // We can just rely on retry or assume 100ms is enough.
+    // Or better: Initiator should buffer Welcome if it arrives early. (Complicated for MVP).
+    // Let's add a small sleep here just in case.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    transport
+        .send_message(target_addr, &data_welcome)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    println!("Sent Welcome Packet to {}", target_addr);
+
+    // C. Add Target to Known Peers locally
+    {
+        let mut kp_lock = state.known_peers.lock().unwrap();
+        if !kp_lock.contains_key(&target_id) {
+            let p = Peer {
+                id: target_id.clone(),
+                ip: target_addr.ip(),
+                port: target_addr.port(),
+                hostname: format!("Peer ({})", target_addr.ip()),
+                last_seen: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                is_trusted: true,
+            };
+            kp_lock.insert(target_id, p);
+            save_known_peers(&app_handle, &kp_lock);
+        }
+    }
 
     Ok(())
 }
@@ -235,289 +265,240 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::new())
         .setup(|app| {
-            // Initialize QUIC Transport on random port
-            // Must be built within an async runtime context for Quinn
+            // Initialize QUIC Transport
             let transport = tauri::async_runtime::block_on(async { Transport::new(0) })
                 .expect("Failed to create transport");
 
             let port = transport.local_addr().expect("Failed to get port").port();
             println!("QUIC Transport listening on port {}", port);
 
-            // Load Trusted Peers
-            {
-                let trusted = load_trusted_peers(app.handle());
-                let setup_state = app.state::<AppState>();
-                let mut state_trusted = setup_state.trusted_keys.lock().unwrap();
-                *state_trusted = trusted;
-            }
+            let app_handle = app.handle();
 
-            // Store transport in state? For now just keep it alive by moving to a leaked global or app state
-            // But we need to keep it running.
-            // For MVP, we can spawn the server accept loop here.
-
-            let mut discovery = Discovery::new().expect("Failed to initialize discovery");
-
-            // Load (or generate) Device ID
-            let mut device_id = load_device_id(app.handle());
-            if device_id.is_empty() {
-                let run_id: u32 = rand::rng().random();
-                device_id = format!("ucp-{}", run_id);
-                save_device_id(app.handle(), &device_id);
-                println!("Generated new Device ID: {}", device_id);
-            } else {
-                println!("Loaded Device ID: {}", device_id);
-            }
-
-            // Store local ID in state
+            // Load State
             {
                 let state = app.state::<AppState>();
-                let mut id_lock = state.local_device_id.lock().unwrap();
-                *id_lock = device_id.clone();
-            }
 
-            // Register this device with the actual QUIC port
-            discovery
-                .register(&device_id, port)
-                .expect("Failed to register service");
+                // 1. Load Cluster Key
+                let mut ck_lock = state.cluster_key.lock().unwrap();
+                *ck_lock = load_cluster_key(app_handle);
 
-            // Start browsing for peers
-            let receiver = discovery.browse().expect("Failed to browse");
+                // 2. Load Known Peers
+                let mut kp_lock = state.known_peers.lock().unwrap();
+                *kp_lock = load_known_peers(app_handle);
 
-            // Move discovery to State to keep it alive
-            {
-                let state = app.state::<AppState>();
-                let mut d_lock = state.discovery.lock().unwrap();
-                *d_lock = Some(discovery);
-            }
-
-            let app_handle = app.handle().clone();
-            let state_ref = app.state::<AppState>();
-            let state_for_thread = (*state_ref).clone();
-
-            // Clones for discovery loop
-            let discovery_handle = app_handle.clone();
-            let discovery_state = state_for_thread.clone();
-
-            tauri::async_runtime::spawn(async move {
-                while let Ok(event) = receiver.recv_async().await {
-                    match event {
-                        mdns_sd::ServiceEvent::ServiceResolved(info) => {
-                            if let Some(ip) = info.get_addresses().iter().next() {
-                                let id = info
-                                    .get_property_val_str("id")
-                                    .unwrap_or("unknown")
-                                    .to_string();
-
-                                // Filter out self
-                                let local_id =
-                                    { discovery_state.local_device_id.lock().unwrap().clone() };
-                                if id == local_id {
-                                    continue;
-                                }
-
-                                let peer = Peer {
-                                    id: id.clone(),
-                                    ip: ip.to_string().parse().unwrap_or(std::net::IpAddr::V4(
-                                        std::net::Ipv4Addr::new(127, 0, 0, 1),
-                                    )),
-                                    port: info.get_port(),
-                                    hostname: info.get_hostname().to_string(),
-                                    last_seen: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                    is_trusted: {
-                                        let trusted = discovery_state.trusted_keys.lock().unwrap();
-                                        trusted.contains_key(&id)
-                                    },
-                                };
-
-                                println!("Added Peer: {:?}", peer);
-                                discovery_state.add_peer(peer.clone());
-                                let _ = discovery_handle.emit("peer-update", &peer);
-                            }
-                        }
-                        mdns_sd::ServiceEvent::ServiceRemoved(_ty, fullname) => {
-                            // Fullname is usually "InstanceName._service._udp.local."
-                            println!("Received ServiceRemoved for: {}", fullname);
-                            // Our instance name is the ID.
-                            let id = fullname.split('.').next().unwrap_or("unknown").to_string();
-
-                            println!("Peer Removed: {}", id);
-
-                            // Remove from state
-                            {
-                                let mut peers = discovery_state.peers.lock().unwrap();
-                                peers.remove(&id);
-                            }
-
-                            let _ = discovery_handle.emit("peer-remove", &id);
-                        }
-                        _ => {}
-                    }
+                // 3. Load Device ID
+                let mut device_id = load_device_id(app_handle);
+                if device_id.is_empty() {
+                    let run_id: u32 = rand::rng().random();
+                    device_id = format!("ucp-{}", run_id);
+                    save_device_id(app_handle, &device_id);
+                    println!("Generated new Device ID: {}", device_id);
+                } else {
+                    println!("Loaded Device ID: {}", device_id);
                 }
-            });
+                *state.local_device_id.lock().unwrap() = device_id.clone();
 
-            // Keep variables alive? Transport endpoint drops if not stored.
-            app.manage(transport.clone());
+                // 4. Register Discovery
+                let mut discovery = Discovery::new().expect("Failed to initialize discovery");
+                discovery
+                    .register(&device_id, port)
+                    .expect("Failed to register service");
+                let receiver = discovery.browse().expect("Failed to browse");
+                *state.discovery.lock().unwrap() = Some(discovery);
+
+                // Spawn Discovery Loop
+                let d_handle = app_handle.clone();
+                let d_state = (*state).clone();
+
+                tauri::async_runtime::spawn(async move {
+                    while let Ok(event) = receiver.recv_async().await {
+                        match event {
+                            mdns_sd::ServiceEvent::ServiceResolved(info) => {
+                                if let Some(ip) = info.get_addresses().iter().next() {
+                                    let id = info
+                                        .get_property_val_str("id")
+                                        .unwrap_or("unknown")
+                                        .to_string();
+
+                                    let local_id =
+                                        { d_state.local_device_id.lock().unwrap().clone() };
+                                    if id == local_id {
+                                        continue;
+                                    }
+
+                                    // Mark as trusted if we know them OR if we have the cluster key (implicit trust for everyone?)
+                                    // Visual indication: known peers = trusted.
+                                    let is_known = {
+                                        let kp = d_state.known_peers.lock().unwrap();
+                                        kp.contains_key(&id)
+                                    };
+
+                                    let peer = Peer {
+                                        id: id.clone(),
+                                        ip: ip.to_string().parse().unwrap_or(std::net::IpAddr::V4(
+                                            std::net::Ipv4Addr::new(127, 0, 0, 1),
+                                        )),
+                                        port: info.get_port(),
+                                        hostname: info.get_hostname().to_string(),
+                                        last_seen: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        is_trusted: is_known,
+                                    };
+
+                                    d_state.add_peer(peer.clone());
+                                    let _ = d_handle.emit("peer-update", &peer);
+                                }
+                            }
+                            mdns_sd::ServiceEvent::ServiceRemoved(_ty, fullname) => {
+                                let id =
+                                    fullname.split('.').next().unwrap_or("unknown").to_string();
+                                {
+                                    let mut peers = d_state.peers.lock().unwrap();
+                                    peers.remove(&id);
+                                }
+                                let _ = d_handle.emit("peer-remove", &id);
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
 
             // Clones for transport listener
-            let listener_handle = app_handle.clone();
-            let listener_state = state_for_thread.clone();
+            let listener_handle = app.handle().clone();
+            let listener_state = (*app.state::<AppState>()).clone();
 
-            // Start Listening for incoming sync
+            app.manage(transport.clone());
+
+            // Start Listening
             transport.start_listening(move |data, addr| {
                 println!("Received {} bytes from {}", data.len(), addr);
-                // Try to deserialize as Message
+
                 if let Ok(msg) = serde_json::from_slice::<Message>(&data) {
                     match msg {
-                        Message::Clipboard(text) => {
-                            println!("Received Clipboard message from {}", addr);
-                            clipboard::set_clipboard(text);
+                        Message::Clipboard(ciphertext) => {
+                            println!("Received Encrypted Clipboard from {}", addr);
+                            // Decrypt!
+                            let key_opt = {
+                                let ck = listener_state.cluster_key.lock().unwrap();
+                                ck.clone()
+                            };
+
+                            if let Some(key) = key_opt {
+                                let mut key_arr = [0u8; 32];
+                                if key.len() == 32 {
+                                    key_arr.copy_from_slice(&key);
+                                    match crypto::decrypt(&key_arr, &ciphertext) {
+                                        Ok(plaintext) => {
+                                            if let Ok(text) = String::from_utf8(plaintext) {
+                                                println!("Decrypted Clipboard: {}", text);
+                                                clipboard::set_clipboard(text);
+                                                // Only emit if needed? Backend sets OS clipboard.
+                                            }
+                                        }
+                                        Err(e) => eprintln!("Failed to decrypt clipboard: {}", e),
+                                    }
+                                }
+                            } else {
+                                eprintln!("Received clipboard but no Cluster Key set!");
+                            }
                         }
                         Message::PairRequest { msg, device_id } => {
                             println!("Received PairRequest from {} ({})", addr, device_id);
-                            // Find Peer ID by address? Or use the device_id in packet?
-                            // Packet device_id currently placeholder.
-                            // Ideally we use mdns discovery map to reverse lookup IP -> PeerID.
-                            // Or we just broadcast "pairing-request" with IP and let frontend match.
-                            // Let's assume frontend can match IP or we look it up.
-                            // For now, emit event with IP and Msg.
-
-                            // We need to pass the msg bytes to frontend so it can pass them back to respond_to_pairing
                             let _ = listener_handle.emit(
                                 "pairing-request",
                                 serde_json::json!({
-                                    "peer_addr": addr.to_string(), // Full SocketAddress (IP:PORT)
-                                    "device_id": device_id,       // Initiator ID
+                                    "peer_addr": addr.to_string(),
+                                    "device_id": device_id,
                                     "msg": msg
                                 }),
                             );
                         }
                         Message::PairResponse { msg, device_id } => {
                             println!("Received PairResponse from {} ({})", addr, device_id);
-                            // Initiator receives this.
-                            // 1. Retrieve pending state
-                            // We stored it by ID probably. or IP.
-                            // In initiate_pairing we stored by IP and ID.
-                            // Let's lookup by IP.
+                            // Finish Handshake
                             let state_opt = {
-                                let mut pending = listener_state.pending_handshakes.lock().unwrap();
-                                pending.remove(&addr.to_string()) // Take ownership
+                                let mut pending =
+                                    listener_state.pending_handshakes.lock().unwrap();
+                                pending.remove(&addr.to_string())
                             };
 
                             if let Some(spake_state) = state_opt {
-                                // 2. Finish
                                 match crypto::finish_spake2(spake_state, &msg) {
-                                    Ok(key) => {
-                                        println!("Pairing Completed! Key derived.");
-                                        // 3. Store Key
-                                        // We need PeerID. If we don't have it, we only have IP.
-                                        // We really need to know WHO we just paired with.
-                                        // We can lookup Peer by IP in peers list.
-                                        let mut trusted =
-                                            listener_state.trusted_keys.lock().unwrap();
-
-                                        // Lookup peer ID by IP
-                                        let peers = listener_state.get_peers();
-                                        // Iterate to find IP
-                                        let mut found_id = None;
-                                        for (p_id, p) in peers {
-                                            if p.ip == addr.ip() {
-                                                found_id = Some(p_id);
-                                                break;
-                                            }
-                                        }
-
-                                        if let Some(id) = found_id {
-                                            // CHECK: Is this a manual peer?
-                                            // The real ID is `device_id` (from packet).
-                                            // The `id` we found is from our map (maybe "manual-...").
-
-                                            let real_id = device_id.clone();
-                                            trusted.insert(real_id.clone(), key);
-                                            // Save to disk
-                                            save_trusted_peers(
-                                                listener_handle.app_handle(),
-                                                &trusted,
-                                            );
-
-                                            // Update Peer status in map
-                                            let mut final_peer_to_emit = None;
-
-                                            {
-                                                let mut peers_guard =
-                                                    listener_state.peers.lock().unwrap();
-
-                                                if id != real_id {
-                                                    // Rename / Replace
-                                                    if let Some(mut p) = peers_guard.remove(&id) {
-                                                        println!(
-                                                            "Promoting peer {} to {}",
-                                                            id, real_id
-                                                        );
-                                                        p.id = real_id.clone();
-                                                        p.is_trusted = true;
-                                                        p.hostname =
-                                                            p.hostname.replace("Manual", "Peer"); // Cleanup name?
-                                                        peers_guard
-                                                            .insert(real_id.clone(), p.clone());
-                                                        final_peer_to_emit = Some(p);
-
-                                                        // We should emit a remove for the old ID?
-                                                        let _ = listener_handle
-                                                            .emit("peer-remove", &id);
-                                                    }
-                                                } else {
-                                                    // Standard update
-                                                    if let Some(peer) = peers_guard.get_mut(&id) {
-                                                        peer.is_trusted = true;
-                                                    }
-                                                }
-                                            }
-
-                                            // Emit update
-                                            if let Some(peer) = final_peer_to_emit {
-                                                let _ = listener_handle.emit("peer-update", &peer);
-                                            } else if let Some(peer) =
-                                                listener_state.get_peers().get(&real_id)
-                                            // Use real_id here
-                                            {
-                                                let _ = listener_handle.emit("peer-update", &peer);
-                                            }
-
-                                            println!("Peer Trusted: {}", addr);
-                                        } else {
-                                            eprintln!(
-                                                "Unknown peer IP completed pairing: {}",
-                                                addr
-                                            );
-                                        }
+                                    Ok(session_key) => {
+                                        println!("Auth Success! Storing session key for Welcome packet...");
+                                        // Store session key to wait for Welcome
+                                        let mut sessions = listener_state.handshake_sessions.lock().unwrap();
+                                        sessions.insert(addr.to_string(), session_key);
                                     }
-                                    Err(e) => eprintln!("Pairing Verification Failed: {}", e),
+                                    Err(e) => eprintln!("Auth Failed: {}", e),
                                 }
                             } else {
-                                eprintln!(
-                                    "Received PairResponse but no pending handshake found for {}",
-                                    addr
-                                );
+                                eprintln!("No pending handshake for PairResponse from {}", addr);
                             }
                         }
-                    }
-                } else {
-                    // Fallback for backward compatibility or raw strings (optional)
-                    if let Ok(text) = String::from_utf8(data) {
-                        println!("Received legacy string from {}", addr);
-                        clipboard::set_clipboard(text);
+                        Message::Welcome {
+                            encrypted_cluster_key,
+                            known_peers,
+                        } => {
+                            println!("Received WELCOME from {}", addr);
+                            // Retrieve Session Key
+                            let session_key_opt = {
+                                let mut sessions = listener_state.handshake_sessions.lock().unwrap();
+                                sessions.remove(&addr.to_string())
+                            };
+
+                            if let Some(session_key) = session_key_opt {
+                                let mut session_key_arr = [0u8; 32];
+                                if session_key.len() == 32 {
+                                    session_key_arr.copy_from_slice(&session_key);
+                                    
+                                    // Decrypt Cluster Key
+                                    match crypto::decrypt(&session_key_arr, &encrypted_cluster_key) {
+                                        Ok(cluster_key) => {
+                                            println!("Cluster Key Decrypted! Joining Network...");
+                                            // 1. Save Cluster Key
+                                            {
+                                                let mut ck = listener_state.cluster_key.lock().unwrap();
+                                                *ck = Some(cluster_key.clone());
+                                                save_cluster_key(listener_handle.app_handle(), &cluster_key);
+                                            }
+
+                                            // 2. Merge Known Peers
+                                            {
+                                                let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                                                for peer in known_peers {
+                                                    // Don't overwrite if exists? Or merge?
+                                                    // Trust the welcomer.
+                                                    kp_lock.insert(peer.id.clone(), peer);
+                                                }
+                                                // Save known peers
+                                                save_known_peers(listener_handle.app_handle(), &kp_lock);
+                                            }
+
+                                            // 3. Emit Update (Refresh UI)
+                                            // Maybe re-read peers?
+                                            // We could emit a "network-joined" event?
+                                            println!("Successfully joined network!");
+                                            // Just emit current peer status
+                                            // TODO: Refresh frontend peer list status from is_trusted=false to true
+                                        }
+                                        Err(e) => eprintln!("Failed to decrypt Cluster Key: {}", e),
+                                    }
+                                }
+                            } else {
+                                eprintln!("Received Welcome but no session key found (packet ordering issue or auth failed?)");
+                            }
+                        }
                     }
                 }
             });
 
             // Start Clipboard Monitor
             let transport_for_clipboard = transport.clone();
-            // state_ref is borrowed from app. app is still valid here.
-            // But we need AppState (inner)
-            let state_for_clipboard = (*state_ref).clone();
+            let state_for_clipboard = (*app.state::<AppState>()).clone();
 
             clipboard::start_monitor(
                 app.handle().clone(),
@@ -538,14 +519,9 @@ pub fn run() {
         .expect("error while running tauri application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                println!("App Exit Requested - Cleaning up...");
-                // Explicitly drop discovery to trigger Unregister
                 let state = app_handle.state::<AppState>();
                 let mut d_lock = state.discovery.lock().unwrap();
                 if let Some(d) = d_lock.take() {
-                    // This will call Drop for Discovery
-                    // We can also call a method if we wanted, but Drop is fine.
-                    println!("Dropping Discovery Service...");
                     drop(d);
                 }
             }
