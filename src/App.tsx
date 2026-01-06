@@ -121,7 +121,7 @@ function App() {
       
       try {
           if (pairingStep === "init" && pairingPeer) {
-              await invoke("initiate_pairing", { peerId: pairingPeer.id, pin });
+              await invoke("start_pairing", { peerId: pairingPeer.id, pin });
               alert("Pairing Request Sent! Ask the other user to verify.");
               setShowPairingModal(false);
           } else if (pairingStep === "respond") {
