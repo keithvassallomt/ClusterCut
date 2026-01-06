@@ -439,6 +439,12 @@ pub fn run() {
                                     let network_name_prop = info
                                         .get_property_val_str("n")
                                         .map(|s| s.to_string());
+                                    
+                                    if let Some(n) = &network_name_prop {
+                                        println!("Discovered peer {} with network name: {}", id, n);
+                                    } else {
+                                        println!("Discovered peer {} WITHOUT network name (properties: {:?})", id, info.get_properties());
+                                    }
 
                                     let peer = Peer {
                                         id: id.clone(),

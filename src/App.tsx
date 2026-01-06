@@ -45,6 +45,7 @@ function App() {
     invoke<string>("get_network_name").then(name => setMyNetworkName(name));
 
     const unlistenPeer = listen<Peer>("peer-update", (event) => {
+      console.log("Peer Update Received:", event.payload);
       // If we just paired, re-fetch network name as it might have changed!
       if (event.payload.is_trusted) {
           invoke<string>("get_network_name").then(name => setMyNetworkName(name));
