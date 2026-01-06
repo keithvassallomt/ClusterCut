@@ -1,5 +1,6 @@
 use crate::peer::Peer;
 use names::Generator;
+use rand::Rng;
 use std::collections::HashMap;
 use std::fs;
 use tauri::{path::BaseDirectory, AppHandle, Manager};
@@ -36,6 +37,11 @@ pub fn save_network_name(app: &AppHandle, name: &str) {
     let path_resolver = app.path();
     let path = match path_resolver.resolve("network_name", BaseDirectory::AppConfig) {
         Ok(p) => p,
+        Err(_) => return,
+    };
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(path, name);
 }
@@ -180,4 +186,49 @@ pub fn save_device_id(app: &AppHandle, id: &str) {
     }
 
     let _ = fs::write(path, id);
+}
+
+pub fn load_network_pin(app: &AppHandle) -> String {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("network_pin", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(_) => return String::from("000000"),
+    };
+
+    if path.exists() {
+        if let Ok(pin) = fs::read_to_string(&path) {
+            if !pin.trim().is_empty() {
+                return pin;
+            }
+        }
+    }
+
+    // Generate new PIN
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let pin: String = (0..6)
+        .map(|_| {
+            let idx = rand::rng().random_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect();
+
+    println!("Generated New Network PIN: {}", pin);
+    save_network_pin(app, &pin);
+    pin
+}
+
+pub fn save_network_pin(app: &AppHandle, pin: &str) {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("network_pin", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to resolve network_pin path: {}", e);
+            return;
+        }
+    };
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, pin);
 }

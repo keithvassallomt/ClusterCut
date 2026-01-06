@@ -14,7 +14,7 @@ use rand::Rng;
 use state::AppState;
 use storage::{
     load_cluster_key, load_device_id, load_known_peers, load_network_name, load_network_pin,
-    save_cluster_key, save_device_id, save_known_peers, save_network_name, save_network_pin,
+    save_cluster_key, save_device_id, save_known_peers, save_network_name,
 };
 use tauri::{Emitter, Manager};
 use transport::Transport;
@@ -348,282 +348,212 @@ pub fn run() {
                 println!("Received {} bytes from {}", data.len(), addr);
 
                 if let Ok(msg) = serde_json::from_slice::<Message>(&data) {
-                    match msg {
-                        Message::Clipboard(ciphertext) => {
-                            println!("Received Encrypted Clipboard from {}", addr);
-                            // Decrypt!
-                            let key_opt = {
-                                let ck = listener_state.cluster_key.lock().unwrap();
-                                ck.clone()
-                            };
+                    let listener_handle = listener_handle.clone();
+                    let listener_state = listener_state.clone();
+                    let transport_inside = transport_inside.clone();
 
-                            if let Some(key) = key_opt {
-                                let mut key_arr = [0u8; 32];
-                                if key.len() == 32 {
-                                    key_arr.copy_from_slice(&key);
-                                    match crypto::decrypt(&key_arr, &ciphertext) {
-                                        Ok(plaintext) => {
-                                            if let Ok(text) = String::from_utf8(plaintext) {
-                                                // 1. Deduplication Check
-                                                {
-                                                    let mut last = listener_state.last_clipboard_content.lock().unwrap();
-                                                    if *last == text {
-                                                        println!("Ignoring duplicate clipboard content caused by loop/echo.");
-                                                        return; // Stop processing
+                    tauri::async_runtime::spawn(async move {
+                        match msg {
+                            Message::Clipboard(ciphertext) => {
+                                println!("Received Encrypted Clipboard from {}", addr);
+                                let key_opt = {
+                                    listener_state.cluster_key.lock().unwrap().clone()
+                                };
+
+                                if let Some(key) = key_opt {
+                                    let mut key_arr = [0u8; 32];
+                                    if key.len() == 32 {
+                                        key_arr.copy_from_slice(&key);
+                                        match crypto::decrypt(&key_arr, &ciphertext).map_err(|e| e.to_string()) {
+                                            Ok(plaintext) => {
+                                                if let Ok(text) = String::from_utf8(plaintext) {
+                                                    // Loop Check
+                                                    {
+                                                        let mut last = listener_state.last_clipboard_content.lock().unwrap();
+                                                        if *last == text { return; }
+                                                        *last = text.clone();
                                                     }
-                                                    *last = text.clone();
-                                                }
-
-                                                println!("Decrypted Clipboard: {}", text);
-                                                clipboard::set_clipboard(text.clone());
-
-                                                // 2. RELAY / RE-BROADCAST (Mesh Flooding)
-                                                // Used to bridge peers that can't route to each other (e.g. VPN <-> Local)
-                                                // Re-encrypt and send to everyone else.
-                                                // Note: We need a fresh nonce, so we call encrypt again.
-                                                let state_relay = listener_state.clone();
-                                                let transport_relay = transport_for_ack.clone();
-                                                let sender_addr = addr;
-                                                let relay_text = text.clone();
-                                                // 2. RELAY / RE-BROADCAST (Mesh Flooding)
-                                                // Used to bridge peers that can't route to each other (e.g. VPN <-> Local)
-                                                // Encrypt once (new nonce) and broadcast to all others.
-                                                let state_relay = listener_state.clone();
-                                                let transport_relay = transport_for_ack.clone();
-                                                let sender_addr = addr;
-                                                let relay_key_arr = key_arr; // Byte array is Copy/Send
-                                                
-                                                // Encrypt synchronously to avoid Send issues with Box<dyn StdError>
-                                                // and to be more efficient (encrypt once, send many).
-                                                if let Ok(relay_ciphertext) = crypto::encrypt(&relay_key_arr, text.as_bytes()) {
-                                                    let relay_data = serde_json::to_vec(&Message::Clipboard(relay_ciphertext)).unwrap_or_default();
                                                     
-                                                    tauri::async_runtime::spawn(async move {
-                                                       let peers = state_relay.get_peers();
-                                                       for p in peers.values() {
+                                                    println!("Decrypted Clipboard: {}", text);
+                                                    clipboard::set_clipboard(text.clone());
+                                                    let _ = listener_handle.emit("clipboard-change", &text);
+
+                                                    // Relay
+                                                    let state_relay = listener_state.clone();
+                                                    let transport_relay = transport_inside.clone(); 
+                                                    let sender_addr = addr;
+                                                    let relay_text = text.clone();
+                                                    let relay_key_arr = key_arr; 
+                                                    
+                                                    // Re-encrypt for relay (fresh nonce)
+                                                    if let Ok(relay_ciphertext) = crypto::encrypt(&relay_key_arr, relay_text.as_bytes()).map_err(|e| e.to_string()) {
+                                                        let relay_data = serde_json::to_vec(&Message::Clipboard(relay_ciphertext)).unwrap_or_default();
+                                                        let peers = state_relay.get_peers();
+                                                        for p in peers.values() {
                                                             let p_addr = std::net::SocketAddr::new(p.ip, p.port);
-                                                            // Don't echo back to sender
-                                                            if p_addr == sender_addr {
-                                                                continue;
-                                                            }
-                                                            println!("Relaying clipboard to {}", p_addr);
+                                                            if p_addr == sender_addr { continue; }
                                                             let _ = transport_relay.send_message(p_addr, &relay_data).await;
-                                                       }
-                                                    });
-                                                } else {
-                                                    eprintln!("Failed to encrypt for relay");
+                                                        }
+                                                    }
                                                 }
                                             }
+                                            Err(e) => eprintln!("Failed to decrypt clipboard: {}", e),
                                         }
-                                        Err(e) => eprintln!("Failed to decrypt clipboard: {}", e),
                                     }
                                 }
-                            } else {
-                                eprintln!("Received clipboard but no Cluster Key set!");
                             }
-                        }
-                        Message::PairRequest { msg, device_id } => {
-                            println!("Received PairRequest from {} ({}). Authenticating...", addr, device_id);
-                            
-                            // Automated Verification (Network PIN)
-                            let local_id = listener_state.local_device_id.lock().unwrap().clone();
-                            let pin = listener_state.network_pin.lock().unwrap().clone();
-                            
-                            match crypto::start_spake2(&pin, &local_id, &device_id) {
-                                Ok((spake_state, response_msg)) => {
-                                    // 1. Send PairResponse
-                                    let resp_struct = Message::PairResponse {
-                                        msg: response_msg,
-                                        device_id: local_id.clone(),
-                                    };
-                                    let resp_data = serde_json::to_vec(&resp_struct).unwrap();
-                                    
-                                    if let Ok(_) = transport_inside.send_message(addr, &resp_data).await {
-                                         // 2. Finish SPAKE2+ to get Session Key
-                                         match crypto::finish_spake2(spake_state, &msg) {
-                                             Ok(session_key) => {
-                                                 println!("Authentication Success for {}! Sending Welcome...", device_id);
-                                                 
-                                                 // 3. Encrypt Cluster Key with Session Key
-                                                 let cluster_key_opt = listener_state.cluster_key.lock().unwrap().clone();
-                                                 
-                                                 if let Some(cluster_key) = cluster_key_opt {
-                                                     let mut session_key_arr = [0u8; 32];
-                                                     if session_key.len() == 32 {
-                                                         session_key_arr.copy_from_slice(&session_key);
-                                                         
-                                                         if let Ok(encrypted_ck) = crypto::encrypt(&session_key_arr, &cluster_key) {
-                                                             let known_peers = listener_state.known_peers.lock().unwrap().values().cloned().collect();
-                                                             let network_name = listener_state.network_name.lock().unwrap().clone();
-                                                             
-                                                             let welcome = Message::Welcome {
-                                                                 encrypted_cluster_key: encrypted_ck,
-                                                                 known_peers,
-                                                                 network_name
-                                                             };
-                                                             
-                                                             let welcome_data = serde_json::to_vec(&welcome).unwrap();
-                                                             let _ = transport_inside.send_message(addr, &welcome_data).await;
+                            Message::PairRequest { msg, device_id } => {
+                                println!("Received PairRequest from {} ({}). Authenticating...", addr, device_id);
+                                let local_id = listener_state.local_device_id.lock().unwrap().clone();
+                                let pin = listener_state.network_pin.lock().unwrap().clone();
+                                
+                                match crypto::start_spake2(&pin, &local_id, &device_id).map_err(|e| e.to_string()) {
+                                    Ok((spake_state, response_msg)) => {
+                                        let resp_struct = Message::PairResponse {
+                                            msg: response_msg,
+                                            device_id: local_id.clone(),
+                                        };
+                                        if let Ok(resp_data) = serde_json::to_vec(&resp_struct) {
+                                            if transport_inside.send_message(addr, &resp_data).await.map_err(|e| e.to_string()).is_ok() {
+                                                 match crypto::finish_spake2(spake_state, &msg).map_err(|e| e.to_string()) {
+                                                     Ok(session_key) => {
+                                                         println!("Authentication Success for {}!", device_id);
+                                                         // Encrypt Cluster Key
+                                                         let cluster_key_opt = {
+                                                             listener_state.cluster_key.lock().unwrap().clone()
+                                                         };
+                                                         if let Some(cluster_key) = cluster_key_opt {
+                                                             let mut session_key_arr = [0u8; 32];
+                                                             if session_key.len() == 32 {
+                                                                 session_key_arr.copy_from_slice(&session_key);
+                                                                 if let Ok(encrypted_ck) = crypto::encrypt(&session_key_arr, &cluster_key).map_err(|e| e.to_string()) {
+                                                                     let known_peers = listener_state.known_peers.lock().unwrap().values().cloned().collect();
+                                                                     let network_name = listener_state.network_name.lock().unwrap().clone();
+                                                                     let welcome = Message::Welcome {
+                                                                         encrypted_cluster_key: encrypted_ck,
+                                                                         known_peers,
+                                                                         network_name: network_name.clone()
+                                                                     };
+                                                                     if let Ok(welcome_data) = serde_json::to_vec(&welcome) {
+                                                                         let _ = transport_inside.send_message(addr, &welcome_data).await;
+                                                                         
+                                                                         // Trust them
+                                                                         let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                                                                         let p = crate::peer::Peer {
+                                                                             id: device_id.clone(),
+                                                                             ip: addr.ip(),
+                                                                             port: addr.port(),
+                                                                             hostname: format!("Peer ({})", addr.ip()), 
+                                                                             last_seen: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                                                             is_trusted: true,
+                                                                             is_manual: false,
+                                                                             network_name: Some(network_name),
+                                                                         };
+                                                                         kp_lock.insert(device_id.clone(), p.clone());
+                                                                         save_known_peers(listener_handle.app_handle(), &kp_lock);
+                                                                         listener_state.add_peer(p.clone());
+                                                                         let _ = listener_handle.emit("peer-update", &p);
+                                                                     }
+                                                                 }
+                                                             }
                                                          }
                                                      }
+                                                     Err(e) => eprintln!("Auth Failed: {}", e),
                                                  }
-                                             }
-                                             Err(e) => eprintln!("Authentication Failed for {}: {}", device_id, e),
-                                         }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => eprintln!("SPAKE2 Error: {}", e),
+                                }
+                            }
+                            Message::PairResponse { msg, device_id } => {
+                                println!("Received PairResponse from {} ({})", addr, device_id);
+                                let spake_state = {
+                                    let mut pending = listener_state.pending_handshakes.lock().unwrap();
+                                    pending.remove(&addr.to_string())
+                                };
+                                if let Some(state) = spake_state {
+                                    match crypto::finish_spake2(state, &msg).map_err(|e| e.to_string()) {
+                                        Ok(session_key) => {
+                                            println!("Auth Success (Initiator)! Waiting for Welcome...");
+                                            let mut sessions = listener_state.handshake_sessions.lock().unwrap();
+                                            sessions.insert(addr.to_string(), session_key);
+                                        }
+                                        Err(e) => eprintln!("Auth Failed: {}", e),
                                     }
                                 }
-                                Err(e) => eprintln!("Failed to start SPAKE2: {}", e),
                             }
-                        }
-                        Message::PairResponse { msg, device_id } => {
-                            println!("Received PairResponse from {} ({})", addr, device_id);
-                            // Finish Handshake
-                            let state_opt = {
-                                let mut pending =
-                                    listener_state.pending_handshakes.lock().unwrap();
-                                pending.remove(&addr.to_string())
-                            };
-
-                            if let Some(spake_state) = state_opt {
-                                match crypto::finish_spake2(spake_state, &msg) {
-                                    Ok(session_key) => {
-                                        println!("Auth Success! Storing session key for Welcome packet...");
-                                        // Store session key to wait for Welcome
-                                        let mut sessions = listener_state.handshake_sessions.lock().unwrap();
-                                        sessions.insert(addr.to_string(), session_key);
-                                    }
-                                    Err(e) => eprintln!("Auth Failed: {}", e),
-                                }
-                            } else {
-                                eprintln!("No pending handshake for PairResponse from {}", addr);
-                            }
-                        }
-                        Message::Welcome {
-                            encrypted_cluster_key,
-                            known_peers,
-                            network_name,
-                        } => {
-                            println!("Received WELCOME from {}", addr);
-                            // Decrypt Cluster Key
-                            // ... (session key logic)
-                            let key_lookup = {
-                                let sessions = listener_state.handshake_sessions.lock().unwrap();
-                                sessions.get(&addr.to_string()).cloned()
-                            };
-
-                            if let Some(session_key) = key_lookup {
-                                let mut session_key_arr = [0u8; 32];
-                                if session_key.len() == 32 {
-                                    session_key_arr.copy_from_slice(&session_key);
-                                    
-                                    // Decrypt Cluster Key
-                                    match crypto::decrypt(&session_key_arr, &encrypted_cluster_key) {
-                                        Ok(cluster_key) => {
-                                            println!("Cluster Key Decrypted! Joining Network: {}", network_name);
-                                            // 1. Save Cluster Key
-                                            {
-                                                let mut ck = listener_state.cluster_key.lock().unwrap();
-                                                *ck = Some(cluster_key.clone());
-                                                save_cluster_key(listener_handle.app_handle(), &cluster_key);
-                                            }
-                                            
-                                            // 2. Adopt Network Name
-                                            {
-                                                let mut nn = listener_state.network_name.lock().unwrap();
-                                                *nn = network_name.clone();
-                                                save_network_name(listener_handle.app_handle(), &network_name);
-                                            }
-
-                                            // 2b. Re-register mDNS to broadcast new Network Name
-                                            {
+                            Message::Welcome { encrypted_cluster_key, known_peers, network_name } => {
+                                println!("Received WELCOME from {}", addr);
+                                let session_key = {
+                                    let sessions = listener_state.handshake_sessions.lock().unwrap();
+                                    sessions.get(&addr.to_string()).cloned()
+                                };
+                                if let Some(sk) = session_key {
+                                    let mut sk_arr = [0u8; 32];
+                                    if sk.len() == 32 {
+                                        sk_arr.copy_from_slice(&sk);
+                                        match crypto::decrypt(&sk_arr, &encrypted_cluster_key).map_err(|e| e.to_string()) {
+                                            Ok(cluster_key) => {
+                                                println!("Joined Network: {}", network_name);
+                                                // Save Keys & Name
+                                                {
+                                                    let mut ck = listener_state.cluster_key.lock().unwrap();
+                                                    *ck = Some(cluster_key.clone());
+                                                    save_cluster_key(listener_handle.app_handle(), &cluster_key);
+                                                    let mut nn = listener_state.network_name.lock().unwrap();
+                                                    *nn = network_name.clone();
+                                                    save_network_name(listener_handle.app_handle(), &network_name);
+                                                }
+                                                // Re-register mDNS
                                                 let device_id = listener_state.local_device_id.lock().unwrap().clone();
                                                 let port = transport_inside.local_addr().map(|a| a.port()).unwrap_or(0);
-                                                if port > 0 {
-                                                     if let Some(discovery) = listener_state.discovery.lock().unwrap().as_mut() {
-                                                          println!("Re-registering mDNS with new network name: {}", network_name);
-                                                          let _ = discovery.register(&device_id, &network_name, port);
-                                                     }
+                                                if let Some(discovery) = listener_state.discovery.lock().unwrap().as_mut() {
+                                                     let _ = discovery.register(&device_id, &network_name, port);
                                                 }
-                                            }
-
-                                            // 3. Merge Known Peers (AND Update Runtime)
-                                            {
+                                                // Merge Peers
                                                 let mut kp_lock = listener_state.known_peers.lock().unwrap();
                                                 let mut runtime_peers = listener_state.peers.lock().unwrap();
-                                                
                                                 for peer in known_peers {
-                                                    // Add to Persistent
                                                     kp_lock.insert(peer.id.clone(), peer.clone());
-                                                    
-                                                    // Update Runtime + UI
-                                                    // Since the Welcome packet now contains only ONLINE peers, we can safely add them all.
-                                                    // This ensures VPN peers learn about mDNS peers (transitive visibility).
                                                     if !runtime_peers.contains_key(&peer.id) {
                                                         runtime_peers.insert(peer.id.clone(), peer.clone());
                                                         let _ = listener_handle.emit("peer-update", &peer);
                                                     }
                                                 }
-                                                // Save known peers
                                                 save_known_peers(listener_handle.app_handle(), &kp_lock);
-                                            }
-
-                                            // 4. Trust the Gateway (Sender)
-                                            {
-                                                let mut runtime_peers = listener_state.peers.lock().unwrap();
-                                                let sender_ip = addr.ip();
-                                                let mut gateway_id = None;
-
+                                                
+                                                // Trust Gateway
                                                 for (id, peer) in runtime_peers.iter_mut() {
-                                                    if peer.ip == sender_ip {
+                                                    if peer.ip == addr.ip() {
                                                         peer.is_trusted = true;
                                                         peer.network_name = Some(network_name.clone());
-                                                        gateway_id = Some(id.clone());
-                                                        // Update UI immediately for this peer
                                                         let _ = listener_handle.emit("peer-update", &*peer);
-                                                        println!("Marked Gateway {} as Trusted", id);
+                                                        // Update known peers for gateway too
+                                                        kp_lock.insert(id.clone(), peer.clone());
                                                         break;
                                                     }
                                                 }
-                                                
-                                                if let Some(gid) = gateway_id {
-                                                     if let Some(peer) = runtime_peers.get(&gid) {
-                                                         let mut kp_lock = listener_state.known_peers.lock().unwrap();
-                                                         kp_lock.insert(gid, peer.clone());
-                                                         save_known_peers(listener_handle.app_handle(), &kp_lock);
-                                                     }
-                                                }
+                                                save_known_peers(listener_handle.app_handle(), &kp_lock);
                                             }
-
-                                            println!("Successfully joined network!");
+                                            Err(e) => eprintln!("Decryption Error: {}", e),
                                         }
-                                        Err(e) => eprintln!("Failed to decrypt Cluster Key: {}", e),
                                     }
                                 }
-                            } else {
-                                eprintln!("Received Welcome but no session key found");
+                            }
+                            Message::PeerDiscovery(mut peer) => {
+                                println!("Received PeerDiscovery for {}", peer.hostname);
+                                peer.is_manual = true; 
+                                {
+                                     let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                                     kp_lock.insert(peer.id.clone(), peer.clone());
+                                     save_known_peers(listener_handle.app_handle(), &kp_lock);
+                                     listener_state.add_peer(peer.clone());
+                                     let _ = listener_handle.emit("peer-update", &peer);
+                                }
                             }
                         }
-                        Message::PeerDiscovery(mut peer) => {
-                             println!("Received Gossip about peer {} ({})", peer.hostname, peer.ip);
-                             // If it's gossiped, it means it's a Manual peer from someone else's perspective.
-                             // We should treat it as manual too, so we persist and see it.
-                             peer.is_manual = true; 
-
-                             // Add to Known Peers and Runtime
-                             {
-                                 let mut kp_lock = listener_state.known_peers.lock().unwrap();
-                                 let mut runtime_peers = listener_state.peers.lock().unwrap();
-                                 
-                                 // Update Persistent
-                                 kp_lock.insert(peer.id.clone(), peer.clone());
-                                 save_known_peers(listener_handle.app_handle(), &kp_lock);
-                                 
-                                 // Update Runtime + UI
-                                 runtime_peers.insert(peer.id.clone(), peer.clone());
-                                 let _ = listener_handle.emit("peer-update", &peer);
-                             }
-                        }
-                    }
+                    });
                 }
             });
 
@@ -644,10 +574,6 @@ pub fn run() {
             get_peers,
             add_manual_peer,
             start_pairing,
-            start_pairing,
-            delete_peer,
-            get_network_name,
-            get_network_pin
             delete_peer,
             get_network_name,
             get_network_pin
