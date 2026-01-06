@@ -13,8 +13,8 @@ use protocol::Message;
 use rand::Rng;
 use state::AppState;
 use storage::{
-    load_cluster_key, load_device_id, load_known_peers, load_network_name, save_cluster_key,
-    save_device_id, save_known_peers, save_network_name,
+    load_cluster_key, load_device_id, load_known_peers, load_network_name, load_network_pin,
+    save_cluster_key, save_device_id, save_known_peers, save_network_name, save_network_pin,
 };
 use tauri::{Emitter, Manager};
 use transport::Transport;
@@ -57,8 +57,13 @@ fn greet(name: &str) -> String {
 }
 
 #[tauri::command]
-fn get_network_name(state: tauri::State<AppState>) -> String {
+fn get_network_name(state: tauri::State<'_, AppState>) -> String {
     state.network_name.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_network_pin(state: tauri::State<'_, AppState>) -> String {
+    state.network_pin.lock().unwrap().clone()
 }
 
 #[tauri::command]
@@ -200,163 +205,7 @@ async fn start_pairing(
     Ok(())
 }
 
-#[tauri::command]
-async fn respond_to_pairing(
-    peer_id: Option<String>,
-    peer_addr: Option<String>,
-    device_id: Option<String>,
-    pin: String,
-    request_msg: Vec<u8>,
-    state: tauri::State<'_, AppState>,
-    transport: tauri::State<'_, Transport>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    // 1. Resolve Peer Address
-    let target_addr: std::net::SocketAddr = if let Some(addr_str) = peer_addr {
-        addr_str
-            .parse()
-            .map_err(|e| format!("Invalid Peer Address: {}", e))?
-    } else if let Some(id) = &peer_id {
-        let peers = state.get_peers();
-        if let Some(peer) = peers.get(id) {
-            std::net::SocketAddr::new(peer.ip, peer.port)
-        } else {
-            return Err("Peer not found in list".to_string());
-        }
-    } else {
-        return Err("Must provide either peer_id or peer_addr".to_string());
-    };
 
-    let target_id = device_id.clone().unwrap_or_else(|| "unknown".to_string());
-
-    // 2. Start SPAKE2 (Responder Identity)
-    let (spake_state, msg_b) =
-        crypto::start_spake2(&pin, "ucp-connect", "ucp-connect").map_err(|e| e.to_string())?;
-
-    // 3. Finish Handshake to get Session Key
-    let session_key = crypto::finish_spake2(spake_state, &request_msg)
-        .map_err(|e| format!("Pairing Failed: {}", e))?;
-
-    println!("Pairing Success! Session Key derived.");
-
-    // 4. Ensure we have a Cluster Key to share
-    let cluster_key_bytes = {
-        let mut ck_lock = state.cluster_key.lock().unwrap();
-        if let Some(key) = ck_lock.as_ref() {
-            key.clone()
-        } else {
-            // Generate new Cluster Key
-            let new_key: [u8; 32] = rand::random();
-            *ck_lock = Some(new_key.to_vec());
-            // Save to disk
-            save_cluster_key(&app_handle, &new_key);
-            println!("Generated new Cluster Key.");
-            new_key.to_vec()
-        }
-    };
-
-    // 5. Encrypt Cluster Key with Session Key
-    let mut session_key_arr = [0u8; 32];
-    if session_key.len() != 32 {
-        return Err("Invalid session key length".to_string());
-    }
-    session_key_arr.copy_from_slice(&session_key);
-
-    let encrypted_cluster_key =
-        crypto::encrypt(&session_key_arr, &cluster_key_bytes).map_err(|e| e.to_string())?;
-
-    // 6. Send Response AND Welcome
-    let local_id = { state.local_device_id.lock().unwrap().clone() };
-
-    // A. Send PairResponse
-    let msg_struct = Message::PairResponse {
-        msg: msg_b,
-        device_id: local_id.clone(),
-    };
-    let data_resp = serde_json::to_vec(&msg_struct).map_err(|e| e.to_string())?;
-    transport
-        .send_message(target_addr, &data_resp)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // B. Send Welcome (with encrypted key and known peers)
-    // B. Send Welcome (with encrypted key and known peers)
-    // Send only RUNTIME peers (currently online) so the new joiner doesn't get flooded with ghosts.
-    let known_peers = {
-        let peers = state.peers.lock().unwrap();
-        peers.values().cloned().collect()
-    };
-    
-    let current_network_name = {
-        state.network_name.lock().unwrap().clone()
-    };
-
-    let welcome_struct = Message::Welcome {
-        encrypted_cluster_key,
-        known_peers,
-        network_name: current_network_name,
-    };
-    let data_welcome = serde_json::to_vec(&welcome_struct).map_err(|e| e.to_string())?;
-
-    // Small delay to ensure order
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    transport
-        .send_message(target_addr, &data_welcome)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    println!("Sent Welcome Packet to {}", target_addr);
-
-    // C. Add Target to Known Peers locally
-    {
-        let mut kp_lock = state.known_peers.lock().unwrap();
-        // ALWAYS update the peer info on successful pairing!
-        // This ensures ip/port updates and is_manual flag is set correctly.
-        let p = Peer {
-            id: target_id.clone(),
-            ip: target_addr.ip(),
-            port: target_addr.port(),
-            hostname: format!("Peer ({})", target_addr.ip()), 
-            last_seen: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            is_trusted: true,
-            // If we don't know them via mDNS (runtime peers), treat as manual so we remember them.
-            // Also, if they were ALREADY manual, keep them manual.
-            is_manual: {
-                let runtime = state.peers.lock().unwrap();
-                if let Some(existing) = kp_lock.get(&target_id) {
-                    if existing.is_manual {
-                        true
-                    } else {
-                        !runtime.contains_key(&target_id)
-                    }
-                } else {
-                    !runtime.contains_key(&target_id)
-                }
-            },
-            network_name: {
-               // If we are responding, we assign OUR network name to them? 
-               // No, we adopt them into OUR network.
-               // But this Peer struct is "who they represent".
-               // If they joined us, they belong to our network now.
-               state.network_name.lock().unwrap().clone().into()
-            },
-        };
-        kp_lock.insert(target_id.clone(), p.clone());
-        save_known_peers(&app_handle, &kp_lock);
-        
-        // Add to runtime and Gossip!
-        state.add_peer(p.clone());
-        let _ = app_handle.emit("peer-update", &p);
-        
-        gossip_peer(&p, &state, &transport, Some(target_addr));
-    }
-
-    Ok(())
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -402,6 +251,11 @@ pub fn run() {
                 // 3b. Load Network Name (for mDNS)
                 let network_name = load_network_name(app_handle);
                 *state.network_name.lock().unwrap() = network_name.clone();
+
+                // 3c. Load Network PIN
+                let network_pin = load_network_pin(app_handle);
+                *state.network_pin.lock().unwrap() = network_pin.clone();
+                println!("Network PIN: {}", network_pin);
 
                 // 4. Register Discovery
                 let mut discovery = Discovery::new().expect("Failed to initialize discovery");
@@ -569,15 +423,57 @@ pub fn run() {
                             }
                         }
                         Message::PairRequest { msg, device_id } => {
-                            println!("Received PairRequest from {} ({})", addr, device_id);
-                            let _ = listener_handle.emit(
-                                "pairing-request",
-                                serde_json::json!({
-                                    "peer_addr": addr.to_string(),
-                                    "device_id": device_id,
-                                    "msg": msg
-                                }),
-                            );
+                            println!("Received PairRequest from {} ({}). Authenticating...", addr, device_id);
+                            
+                            // Automated Verification (Network PIN)
+                            let local_id = listener_state.local_device_id.lock().unwrap().clone();
+                            let pin = listener_state.network_pin.lock().unwrap().clone();
+                            
+                            match crypto::start_spake2(&pin, &local_id, &device_id) {
+                                Ok((spake_state, response_msg)) => {
+                                    // 1. Send PairResponse
+                                    let resp_struct = Message::PairResponse {
+                                        msg: response_msg,
+                                        device_id: local_id.clone(),
+                                    };
+                                    let resp_data = serde_json::to_vec(&resp_struct).unwrap();
+                                    
+                                    if let Ok(_) = transport_inside.send_message(addr, &resp_data).await {
+                                         // 2. Finish SPAKE2+ to get Session Key
+                                         match crypto::finish_spake2(spake_state, &msg) {
+                                             Ok(session_key) => {
+                                                 println!("Authentication Success for {}! Sending Welcome...", device_id);
+                                                 
+                                                 // 3. Encrypt Cluster Key with Session Key
+                                                 let cluster_key_opt = listener_state.cluster_key.lock().unwrap().clone();
+                                                 
+                                                 if let Some(cluster_key) = cluster_key_opt {
+                                                     let mut session_key_arr = [0u8; 32];
+                                                     if session_key.len() == 32 {
+                                                         session_key_arr.copy_from_slice(&session_key);
+                                                         
+                                                         if let Ok(encrypted_ck) = crypto::encrypt(&session_key_arr, &cluster_key) {
+                                                             let known_peers = listener_state.known_peers.lock().unwrap().values().cloned().collect();
+                                                             let network_name = listener_state.network_name.lock().unwrap().clone();
+                                                             
+                                                             let welcome = Message::Welcome {
+                                                                 encrypted_cluster_key: encrypted_ck,
+                                                                 known_peers,
+                                                                 network_name
+                                                             };
+                                                             
+                                                             let welcome_data = serde_json::to_vec(&welcome).unwrap();
+                                                             let _ = transport_inside.send_message(addr, &welcome_data).await;
+                                                         }
+                                                     }
+                                                 }
+                                             }
+                                             Err(e) => eprintln!("Authentication Failed for {}: {}", device_id, e),
+                                         }
+                                    }
+                                }
+                                Err(e) => eprintln!("Failed to start SPAKE2: {}", e),
+                            }
                         }
                         Message::PairResponse { msg, device_id } => {
                             println!("Received PairResponse from {} ({})", addr, device_id);
@@ -748,9 +644,13 @@ pub fn run() {
             get_peers,
             add_manual_peer,
             start_pairing,
-            respond_to_pairing,
+            start_pairing,
             delete_peer,
-            get_network_name
+            get_network_name,
+            get_network_pin
+            delete_peer,
+            get_network_name,
+            get_network_pin
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -23,12 +23,13 @@ function App() {
   const [activeTab, setActiveTab] = useState<"devices" | "history">("devices");
   const [myNetworkName, setMyNetworkName] = useState("Loading...");
 
+  const [networkPin, setNetworkPin] = useState("...");
+
   /* Pairing State */
   const [pairingPeer, setPairingPeer] = useState<Peer | null>(null);
-  const [incomingRequest, setIncomingRequest] = useState<{ peer_addr: string; device_id: string; msg: number[] } | null>(null);
   const [pin, setPin] = useState("");
   const [showPairingModal, setShowPairingModal] = useState(false);
-  const [pairingStep, setPairingStep] = useState<"init" | "respond" | "waiting">("init");
+  const [isConnecting, setIsConnecting] = useState(false);
 
   // Keep ref in sync
   useEffect(() => {
@@ -41,14 +42,16 @@ function App() {
         setPeers(Object.values(peerMap));
     });
     
-    // Fetch Network Name
+    // Fetch Network Name & PIN
     invoke<string>("get_network_name").then(name => setMyNetworkName(name));
+    invoke<string>("get_network_pin").then(pin => setNetworkPin(pin));
 
     const unlistenPeer = listen<Peer>("peer-update", (event) => {
       console.log("Peer Update Received:", event.payload);
-      // If we just paired, re-fetch network name as it might have changed!
+      // If we just paired, re-fetch network name/pin as it might have changed!
       if (event.payload.is_trusted) {
           invoke<string>("get_network_name").then(name => setMyNetworkName(name));
+          invoke<string>("get_network_pin").then(pin => setNetworkPin(pin));
       }
 
       setPeers((prev) => {
@@ -61,19 +64,6 @@ function App() {
     const unlistenClipboard = listen<string>("clipboard-change", (event) => {
       setClipboardHistory((prev) => [event.payload, ...prev].slice(0, 10)); // Keep last 10
     });
-
-    const unlistenPairing = listen<{ peer_addr: string; device_id: string; msg: number[] }>("pairing-request", (event) => {
-        console.log("Received pairing request", event.payload);
-        setIncomingRequest(event.payload);
-        setPairingStep("respond");
-        setShowPairingModal(true);
-        
-        // Try to match known peer
-        // Try match by IP within address?
-        const ip = event.payload.peer_addr.split(":")[0];
-        const peer = peersRef.current.find(p => p.ip === ip || p.id === event.payload.device_id);
-        if (peer) setPairingPeer(peer);
-    });
     
     const unlistenRemove = listen<string>("peer-remove", (event) => {
         setPeers((prev) => prev.filter(p => p.id !== event.payload));
@@ -82,15 +72,14 @@ function App() {
     return () => {
       unlistenPeer.then((f) => f());
       unlistenClipboard.then((f) => f());
-      unlistenPairing.then((f) => f());
       unlistenRemove.then((f) => f());
     };
   }, []); // Stable listener!
 
   const startPairing = (peer: Peer) => {
       setPairingPeer(peer);
-      setPairingStep("init");
       setPin("");
+      setIsConnecting(false);
       setShowPairingModal(true);
   };
 
@@ -117,37 +106,22 @@ function App() {
   };
 
   const submitPairing = async () => {
-      if (!pin) return;
+      if (!pin || !pairingPeer) return;
+      setIsConnecting(true);
       
       try {
-          if (pairingStep === "init" && pairingPeer) {
-              await invoke("start_pairing", { peerId: pairingPeer.id, pin });
-              alert("Pairing Request Sent! Ask the other user to verify.");
-              setShowPairingModal(false);
-          } else if (pairingStep === "respond") {
-              // We need the peer ID. If we found it, great. If not (unknown IP), we might fail.
-              // For now assuming we found it via IP or user knows.
-              
-              const targetId = pairingPeer?.id || null;
-              
-              if (incomingRequest) {
-                  await invoke("respond_to_pairing", { 
-                      peerId: targetId, 
-                      peerAddr: incomingRequest.peer_addr,
-                      deviceId: incomingRequest.device_id,
-                      pin, 
-                      requestMsg: incomingRequest.msg 
-                  });
-                  alert("Pairing Verified! You are now connected.");
-                  setShowPairingModal(false);
-                  setIncomingRequest(null);
-                  setPin("");
-              }
-          }
+          await invoke("start_pairing", { peerId: pairingPeer.id, pin });
+          // Note: Backend processes response automatically. 
+          // We can assume if no error thrown, request sent.
+          // Wait for peer update?
+          setTimeout(() => {
+               setShowPairingModal(false);
+               setIsConnecting(false);
+          }, 2000);
       } catch (e) {
           alert("Pairing Failed: " + String(e));
+          setIsConnecting(false);
       }
-
   };
 
   // derived state for UI
@@ -199,9 +173,12 @@ function App() {
                 {/* My Network Section */}
                 <div>
                     <div className="flex items-center justify-between mb-2">
-                        <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">
-                            My Network: <span className="text-blue-400">{myNetworkName}</span>
-                        </h2>
+                        <div className="flex flex-col">
+                            <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">
+                                My Network: <span className="text-blue-400">{myNetworkName}</span>
+                            </h2>
+                            <span className="text-[10px] text-neutral-600 font-mono tracking-widest mt-0.5">PIN: {networkPin}</span>
+                        </div>
                         <button onClick={addManualPeer} className="text-neutral-500 hover:text-white transition-colors" title="Add Manual Peer">
                             <PlusCircle size={16} />
                         </button>
@@ -227,7 +204,7 @@ function App() {
                                          onClick={(e) => { e.stopPropagation(); deletePeer(peer.id); }}
                                          className="p-1.5 text-neutral-500 hover:text-red-400 bg-neutral-700/50 hover:bg-neutral-700 rounded-md transition-colors opacity-0 group-hover:opacity-100"
                                          title="Forget Device"
-                                    >
+                                     >
                                         <Trash2 size={16} />
                                     </button>
                                 </div>
@@ -334,38 +311,28 @@ function App() {
           <div className="absolute inset-0 bg-black/80 flex items-center justify-center p-4 z-50 backdrop-blur-sm">
               <div className="bg-neutral-800 border border-neutral-700 rounded-xl p-6 w-full max-w-sm shadow-2xl">
                   <h3 className="text-lg font-bold mb-2">
-                      {pairingStep === "init" ? "Connect to Device" : 
-                       pairingStep === "waiting" ? "Waiting..." : "Connection Request"}
+                      {isConnecting ? "Connecting..." : "Join Network"}
                   </h3>
                   
-                  {pairingStep === "waiting" ? (
+                  {isConnecting ? (
                       <div className="text-center py-4">
+                          <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
                           <p className="text-neutral-400 text-sm mb-4">
-                              Request sent to {pairingPeer?.hostname}.<br/>
-                              Please check the other device to approve.
+                              Verifying PIN with {pairingPeer?.hostname}...
                           </p>
-                           <button 
-                               onClick={() => setShowPairingModal(false)}
-                               className="px-4 py-2 bg-neutral-700 hover:bg-neutral-600 rounded-lg transition-colors text-sm"
-                           >
-                               Close
-                          </button>
                       </div>
                   ) : (
                     <>
                       <p className="text-neutral-400 text-sm mb-4">
-                          {pairingStep === "init" 
-                            ? `Enter a PIN to connect with ${pairingPeer?.hostname} and join its network.` 
-                            : `Enter the PIN displayed on ${incomingRequest?.peer_addr} to allow connection.`
-                          }
+                          Enter the PIN displayed on <strong>{pairingPeer?.hostname}</strong> or any other device in that network.
                       </p>
                       
                       <input 
                           type="text" 
-                          placeholder="Enter PIN (e.g. 1234)" 
-                          className="w-full bg-neutral-900 border border-neutral-700 rounded-lg px-4 py-3 mb-4 outline-none focus:border-blue-500 font-mono text-center text-xl tracking-widest"
+                          placeholder="ABC123" 
+                          className="w-full bg-neutral-900 border border-neutral-700 rounded-lg px-4 py-3 mb-4 outline-none focus:border-blue-500 font-mono text-center text-xl tracking-widest uppercase"
                           value={pin}
-                          onChange={e => setPin(e.target.value)}
+                          onChange={e => setPin(e.target.value.toUpperCase())}
                       />
                       
                       <div className="flex gap-2">
@@ -379,7 +346,7 @@ function App() {
                               onClick={submitPairing}
                               className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg transition-colors font-medium"
                           >
-                              {pairingStep === "init" ? "Join Network" : "Verify & Connect"}
+                              Join Network
                           </button>
                       </div>
                     </>

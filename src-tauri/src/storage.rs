@@ -36,14 +36,6 @@ pub fn save_network_name(app: &AppHandle, name: &str) {
     let path_resolver = app.path();
     let path = match path_resolver.resolve("network_name", BaseDirectory::AppConfig) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to resolve network_name path: {}", e);
-            return;
-        }
-    };
-
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(path, name);
 }

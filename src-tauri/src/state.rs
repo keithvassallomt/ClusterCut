@@ -23,6 +23,8 @@ pub struct AppState {
     pub last_clipboard_content: Arc<Mutex<String>>,
     // Human Readable Network Name
     pub network_name: Arc<Mutex<String>>,
+    // Network PIN (6-char alphanumeric, for auto-joining)
+    pub network_pin: Arc<Mutex<String>>,
 }
 
 impl AppState {
@@ -37,6 +39,7 @@ impl AppState {
             discovery: Arc::new(Mutex::new(None)),
             last_clipboard_content: Arc::new(Mutex::new(String::new())),
             network_name: Arc::new(Mutex::new(String::new())),
+            network_pin: Arc::new(Mutex::new(String::new())),
         }
     }
 
