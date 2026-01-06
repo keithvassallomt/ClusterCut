@@ -102,7 +102,7 @@ pub fn save_known_peers(app: &AppHandle, peers: &HashMap<String, Peer>) {
 
     match serde_json::to_string_pretty(peers) {
         Ok(json) => {
-            if let Err(e) = fs::write(path, json) {
+            if let Err(e) = fs::write(&path, json) {
                 eprintln!("Failed to write known peers file: {}", e);
             } else {
                 println!("Saved known peers to disk at {:?}", path);
