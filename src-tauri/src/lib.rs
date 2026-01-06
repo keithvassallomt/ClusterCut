@@ -455,6 +455,7 @@ pub fn run() {
                                                                          save_known_peers(listener_handle.app_handle(), &kp_lock);
                                                                          listener_state.add_peer(p.clone());
                                                                          let _ = listener_handle.emit("peer-update", &p);
+                                                                         gossip_peer(&p, &listener_state, &transport_inside, Some(addr));
                                                                      }
                                                                  }
                                                              }
@@ -523,10 +524,11 @@ pub fn run() {
                                                 let mut runtime_peers = listener_state.peers.lock().unwrap();
                                                 for peer in known_peers {
                                                     kp_lock.insert(peer.id.clone(), peer.clone());
-                                                    if !runtime_peers.contains_key(&peer.id) {
-                                                        runtime_peers.insert(peer.id.clone(), peer.clone());
-                                                        let _ = listener_handle.emit("peer-update", &peer);
-                                                    }
+                                                    
+                                                    // Always update runtime peer to ensure Trust is reflected
+                                                    // (Even if mDNS discovered it first as untrusted)
+                                                    runtime_peers.insert(peer.id.clone(), peer.clone());
+                                                    let _ = listener_handle.emit("peer-update", &peer);
                                                 }
                                                 save_known_peers(listener_handle.app_handle(), &kp_lock);
                                                 
