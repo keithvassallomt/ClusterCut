@@ -250,8 +250,8 @@ function App() {
                                         </p>
                                         <div className="flex -space-x-2 mt-2">
                                             {netPeers.slice(0, 3).map(p => (
-                                                <div key={p.id} className="w-6 h-6 rounded-full bg-neutral-700 border border-neutral-800 flex items-center justify-center text-[10px] text-neutral-300" title={p.hostname}>
-                                                    {p.hostname[0]}
+                                                <div key={p.id} className="w-8 h-8 rounded-full bg-neutral-700 border-2 border-neutral-800 flex items-center justify-center text-neutral-400" title={p.hostname}>
+                                                    <Monitor size={14} />
                                                 </div>
                                             ))}
                                             {netPeers.length > 3 && (
