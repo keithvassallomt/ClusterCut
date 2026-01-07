@@ -187,7 +187,7 @@ function App() {
             <div className="w-3 h-3 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></div>
             <h1 className="font-bold text-lg tracking-tight">UCP</h1>
         </div>
-        <div className="flex gap-1 bg-neutral-700/50 p-1 rounded-lg">
+        <div className="flex gap-1 bg-neutral-700/50 p-1 rounded-lg no-drag">
             <button 
                 onClick={() => setActiveTab("devices")}
                 className={clsx("p-1.5 rounded-md transition-all", activeTab === "devices" ? "bg-neutral-600 shadow-sm" : "hover:bg-neutral-700/50")}
