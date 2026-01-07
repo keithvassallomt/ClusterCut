@@ -137,6 +137,38 @@ async fn add_manual_peer(
 }
 
 #[tauri::command]
+async fn leave_network(
+    state: tauri::State<'_, AppState>,
+    transport: tauri::State<'_, Transport>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let local_id = state.local_device_id.lock().unwrap().clone();
+    
+    // 1. Broadcast "Self-Removal" to Network
+    let removal_msg = Message::PeerRemoval(local_id.clone());
+    let data = serde_json::to_vec(&removal_msg).unwrap_or_default();
+    
+    let peers_snapshot = state.get_peers();
+    for (id, p) in peers_snapshot.iter() {
+         if *id == local_id { continue; }
+         
+         let addr = std::net::SocketAddr::new(p.ip, p.port);
+         let transport_clone = (*transport).clone();
+         let data_vec = data.clone();
+         
+         tauri::async_runtime::spawn(async move {
+             let _ = transport_clone.send_message(addr, &data_vec).await;
+         });
+    }
+    
+    // 2. Perform Factory Reset Locally
+    let port = transport.local_addr().map(|a| a.port()).unwrap_or(0);
+    perform_factory_reset(&app_handle, &state, port);
+    
+    Ok(())
+}
+
+#[tauri::command]
 async fn delete_peer(
     peer_id: String,
     state: tauri::State<'_, AppState>,
@@ -229,7 +261,39 @@ async fn start_pairing(
     Ok(())
 }
 
-
+// Helper to wipe state and restart network identity
+fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppState, port: u16) {
+    // 1. Reset Config on Disk
+    reset_network_state(app_handle);
+    
+    // 2. Clear Runtime State & Generate New Identity
+    {
+        let mut kp = state.known_peers.lock().unwrap();
+        kp.clear();
+        let mut peers = state.peers.lock().unwrap();
+        peers.clear();
+        let mut ck = state.cluster_key.lock().unwrap();
+        *ck = None;
+        
+        // Generate new Name & PIN
+        let new_name = load_network_name(app_handle);
+        let new_pin = load_network_pin(app_handle);
+        
+        *state.network_name.lock().unwrap() = new_name.clone();
+        *state.network_pin.lock().unwrap() = new_pin.clone();
+        
+        println!("Reset to New Network: {} (PIN: {})", new_name, new_pin);
+        
+        // Re-register mDNS with new name
+        let local_id = state.local_device_id.lock().unwrap().clone();
+        if let Some(discovery) = state.discovery.lock().unwrap().as_mut() {
+             let _ = discovery.register(&local_id, &new_name, port);
+        }
+    }
+    
+    // 3. Notify Frontend
+    let _ = app_handle.emit("network-reset", ());
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -591,21 +655,11 @@ pub fn run() {
                                 
                                 if target_id == local_id {
                                     println!("I have been removed from the network! resetting state...");
-                                    // 1. Reset Config
-                                    reset_network_state(listener_handle.app_handle());
-                                    
-                                    // 2. Clear Runtime State
-                                    {
-                                        let mut kp = listener_state.known_peers.lock().unwrap();
-                                        kp.clear();
-                                        let mut peers = listener_state.peers.lock().unwrap();
-                                        peers.clear();
-                                        let mut ck = listener_state.cluster_key.lock().unwrap();
-                                        *ck = None;
-                                    }
-                                    
-                                    // 3. Notify Frontend
-                                    let _ = listener_handle.emit("network-reset", ());
+                                    perform_factory_reset(
+                                        &listener_handle,
+                                        &listener_state,
+                                        transport_inside.local_addr().map(|a| a.port()).unwrap_or(0)
+                                    );
                                 } else {
                                     // Remove the peer
                                     {
@@ -644,6 +698,7 @@ pub fn run() {
             add_manual_peer,
             start_pairing,
             delete_peer,
+            leave_network,
             get_network_name,
             get_network_pin
         ])

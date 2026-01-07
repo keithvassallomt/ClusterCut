@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { Monitor, Copy, History, ShieldCheck, PlusCircle, Trash2 } from "lucide-react";
+import { Monitor, Copy, History, ShieldCheck, PlusCircle, Trash2, LogOut } from "lucide-react";
 import clsx from "clsx";
 
 interface Peer {
@@ -137,6 +137,20 @@ function App() {
       }
   };
 
+
+
+  const handleLeaveNetwork = async () => {
+    if (!confirm("Are you sure you want to leave this network? This will reset your device identity.")) return;
+    
+    try {
+        await invoke("leave_network");
+        // network-reset event will reload the page
+    } catch (e) {
+        console.error("Failed to leave network:", e);
+        alert("Failed to leave network: " + e);
+    }
+  };
+
   // derived state for UI
   const myPeers = peers.filter(p => p.is_trusted);
   const untrustedPeers = peers.filter(p => !p.is_trusted);
@@ -179,6 +193,14 @@ function App() {
                 className={clsx("p-1.5 rounded-md transition-all", activeTab === "history" ? "bg-neutral-600 shadow-sm" : "hover:bg-neutral-700/50")}
             >
                 <History size={18} className={activeTab === "history" ? "text-white" : "text-neutral-400"} />
+            </button>
+            <div className="w-px h-6 bg-neutral-600/50 mx-1"></div>
+            <button 
+                onClick={handleLeaveNetwork}
+                className="p-1.5 rounded-md hover:bg-red-500/20 text-neutral-400 hover:text-red-400 transition-colors"
+                title="Leave Network"
+            >
+                <LogOut size={18} />
             </button>
         </div>
       </header>
