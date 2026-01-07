@@ -281,6 +281,10 @@ fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppState, port: 
         let mut ck = state.cluster_key.lock().unwrap();
         *ck = None;
         
+        // Clear Handshake State
+        state.pending_handshakes.lock().unwrap().clear();
+        state.handshake_sessions.lock().unwrap().clear();
+        
         // Generate new Name & PIN
         let new_name = load_network_name(app_handle);
         let new_pin = load_network_pin(app_handle);
