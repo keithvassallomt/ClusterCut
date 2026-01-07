@@ -140,10 +140,16 @@ function App() {
 
 
   const handleLeaveNetwork = async () => {
-    if (!confirm("Are you sure you want to leave this network? This will reset your device identity.")) return;
+    console.log("Leave Network Button Clicked");
+    if (!confirm("Are you sure you want to leave this network? This will reset your device identity.")) {
+        console.log("User cancelled leave network");
+        return;
+    }
     
+    console.log("User confirmed leave network. Invoking command...");
     try {
         await invoke("leave_network");
+        console.log("Command invoked successfully.");
         // network-reset event will reload the page
     } catch (e) {
         console.error("Failed to leave network:", e);
