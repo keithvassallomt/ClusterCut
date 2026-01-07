@@ -271,7 +271,13 @@ fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppState, port: 
         let mut kp = state.known_peers.lock().unwrap();
         kp.clear();
         let mut peers = state.peers.lock().unwrap();
-        peers.clear();
+        // Don't clear peers! mDNS has already discovered them. 
+        // Just mark them as untrusted so they show up in "Nearby Networks".
+        for p in peers.values_mut() {
+            p.is_trusted = false;
+            // Note: their network_name remains whatever it was (e.g. "OldNetwork").
+            // Since our network_name changes below, they will rightfully be Foreign.
+        }
         let mut ck = state.cluster_key.lock().unwrap();
         *ck = None;
         
