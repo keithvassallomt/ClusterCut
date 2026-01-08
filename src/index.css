@@ -2,41 +2,54 @@
 @tailwind components;
 @tailwind utilities;
 
+/* --- Base: cross-platform "native" feel (WinUI / macOS-ish) --- */
 :root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
-
+  /* Let the OS decide form controls + scrollbars where supported */
   color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
 
-  font-synthesis: none;
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial,
+    "Apple Color Emoji", "Segoe UI Emoji";
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  /* App layout */
+  background: transparent;
+}
+
+html,
+body,
+#root {
+  height: 100%;
 }
 
 body {
   margin: 0;
-  display: flex;
-  place-items: center;
-  min-width: 320px;
-  min-height: 100vh;
+  /* The mock UI manages its own background; keep body neutral */
+  background: transparent;
 }
 
+/* --- Helpers for frameless titlebar regions (Tauri/Electron style) --- */
 @layer utilities {
   .glass {
-    background: rgba(255, 255, 255, 0.05);
+    background: rgba(255, 255, 255, 0.06);
     backdrop-filter: blur(10px);
-    border: 1px solid rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.10);
   }
 
   .drag-region {
     -webkit-app-region: drag;
   }
-  
+
   .no-drag {
     -webkit-app-region: no-drag;
+  }
+
+  /* Better truncation defaults for long clipboard entries */
+  .line-clamp-3 {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
 }

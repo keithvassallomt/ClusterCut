@@ -58,6 +58,11 @@ fn greet(name: &str) -> String {
 }
 
 #[tauri::command]
+fn get_device_id(state: tauri::State<'_, AppState>) -> String {
+    state.local_device_id.lock().unwrap().clone()
+}
+
+#[tauri::command]
 fn get_network_name(state: tauri::State<'_, AppState>) -> String {
     state.network_name.lock().unwrap().clone()
 }
@@ -710,7 +715,8 @@ pub fn run() {
             delete_peer,
             leave_network,
             get_network_name,
-            get_network_pin
+            get_network_pin,
+            get_device_id
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

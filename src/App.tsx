@@ -1,8 +1,13 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { Monitor, Copy, History, ShieldCheck, PlusCircle, Trash2, LogOut } from "lucide-react";
+import { 
+  Monitor, Copy, History, ShieldCheck, PlusCircle, Trash2, LogOut, 
+  Settings, Wifi, WifiOff, Lock, Unlock, AlertTriangle, checkCircle2, Info, CheckCircle2 
+} from "lucide-react";
 import clsx from "clsx";
+
+/* --- Types --- */
 
 interface Peer {
   id: string;
@@ -13,52 +18,266 @@ interface Peer {
   is_trusted: boolean;
   is_manual?: boolean;
   network_name?: string;
+  platform?: string; // Backend doesn't send this yet, will mock or infer
 }
 
-function App() {
-  const [peers, setPeers] = useState<Peer[]>([]);
-  const peersRef = useRef<Peer[]>([]); // Ref to access peers inside stable listeners
-  
-  const [clipboardHistory, setClipboardHistory] = useState<string[]>([]);
-  const [activeTab, setActiveTab] = useState<"devices" | "history">("devices");
-  const [myNetworkName, setMyNetworkName] = useState("Loading...");
+type View = "devices" | "history" | "settings";
+type AppState = "zero" | "connected";
 
+type NearbyNetwork = {
+  networkName: string;
+  devices: { id: string; status: "online" | "offline" }[];
+};
+
+type HistoryItem = {
+    id: string;
+    origin: "local" | "remote";
+    device: string;
+    ts: string;
+    text: string;
+};
+
+/* --- Helper Components (from Design) --- */
+
+function Badge({
+  tone = "neutral",
+  children,
+}: {
+  tone?: "neutral" | "good" | "warn" | "bad";
+  children: React.ReactNode;
+}) {
+  const classes =
+    tone === "good"
+      ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/25"
+      : tone === "warn"
+      ? "bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/25"
+      : tone === "bad"
+      ? "bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/25"
+      : "bg-zinc-500/10 text-zinc-700 dark:text-zinc-300 border-zinc-500/20";
+
+  return (
+    <span className={clsx("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium", classes)}>
+      {children}
+    </span>
+  );
+}
+
+function SectionHeader({
+  icon,
+  title,
+  subtitle,
+  right,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  subtitle?: string;
+  right?: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="flex items-start gap-3">
+        <div className="mt-0.5 inline-flex h-9 w-9 items-center justify-center rounded-xl bg-zinc-900/5 dark:bg-white/5">
+          {icon}
+        </div>
+        <div>
+          <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">{title}</div>
+          {subtitle ? <div className="text-xs text-zinc-600 dark:text-zinc-400">{subtitle}</div> : null}
+        </div>
+      </div>
+      {right ? <div className="flex items-center gap-2">{right}</div> : null}
+    </div>
+  );
+}
+
+function Card({ children, className }: { children: React.ReactNode; className?: string }) {
+  return (
+    <div
+      className={clsx(
+        "rounded-2xl border border-zinc-900/10 bg-white/70 shadow-sm backdrop-blur dark:border-white/10 dark:bg-zinc-900/40",
+        className
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Button({
+  variant = "default",
+  size = "md",
+  iconLeft,
+  iconRight,
+  children,
+  className,
+  ...props
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: "default" | "primary" | "ghost" | "danger";
+  size?: "sm" | "md";
+  iconLeft?: React.ReactNode;
+}) {
+  const base =
+    "inline-flex select-none items-center justify-center gap-2 rounded-xl font-medium transition focus:outline-none focus:ring-2 focus:ring-emerald-500/40 disabled:opacity-50 disabled:cursor-not-allowed";
+  const sizes = size === "sm" ? "h-9 px-3 text-sm" : "h-11 px-4 text-sm";
+  const variants =
+    variant === "primary"
+      ? "bg-emerald-600 text-white hover:bg-emerald-700"
+      : variant === "danger"
+      ? "bg-rose-600 text-white hover:bg-rose-700"
+      : variant === "ghost"
+      ? "bg-transparent hover:bg-zinc-900/5 dark:hover:bg-white/5 text-zinc-800 dark:text-zinc-100"
+      : "bg-zinc-900/5 hover:bg-zinc-900/10 text-zinc-900 dark:bg-white/5 dark:hover:bg-white/10 dark:text-zinc-50";
+
+  return (
+    <button className={clsx(base, sizes, variants, "min-w-[44px]", className)} {...props}>
+      {iconLeft}
+      <span>{children}</span>
+      {iconRight}
+    </button>
+  );
+}
+
+function IconButton({
+  label,
+  onClick,
+  children,
+  variant = "ghost",
+}: {
+  label: string;
+  onClick?: () => void;
+  children: React.ReactNode;
+  variant?: "ghost" | "default";
+}) {
+  return (
+    <button
+      aria-label={label}
+      onClick={onClick}
+      className={clsx(
+        "no-drag inline-flex h-11 w-11 items-center justify-center rounded-xl transition focus:outline-none focus:ring-2 focus:ring-emerald-500/40",
+        variant === "default"
+          ? "bg-zinc-900/5 hover:bg-zinc-900/10 dark:bg-white/5 dark:hover:bg-white/10"
+          : "hover:bg-zinc-900/5 dark:hover:bg-white/5"
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Field({
+  label,
+  value,
+  mono = false,
+  action,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3 rounded-2xl border border-zinc-900/10 bg-white/60 p-4 dark:border-white/10 dark:bg-white/5">
+      <div className="min-w-0">
+        <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">{label}</div>
+        <div className={clsx("mt-1 truncate text-sm font-semibold text-zinc-900 dark:text-zinc-50", mono && "font-mono tracking-wide")}>
+          {value}
+        </div>
+      </div>
+      {action ? <div className="shrink-0">{action}</div> : null}
+    </div>
+  );
+}
+
+function Modal({
+  open,
+  title,
+  subtitle,
+  children,
+  footer,
+  onClose,
+}: {
+  open: boolean;
+  title: string;
+  subtitle?: string;
+  children: React.ReactNode;
+  footer: React.ReactNode;
+  onClose: () => void;
+}) {
+  if (!open) return null;
+
+  return (
+    <div className="no-drag fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-4 backdrop-blur-sm md:items-center">
+      <div className="w-full max-w-lg overflow-hidden rounded-3xl border border-white/10 bg-white shadow-2xl dark:bg-zinc-950">
+        <div className="flex items-start justify-between gap-3 p-5">
+          <div>
+            <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">{title}</div>
+            {subtitle ? <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">{subtitle}</div> : null}
+          </div>
+          <IconButton label="Close" onClick={onClose}>
+            <span className="text-xl leading-none text-zinc-500">×</span>
+          </IconButton>
+        </div>
+        <div className="px-5 pb-5">{children}</div>
+        <div className="flex flex-col gap-2 border-t border-zinc-900/10 bg-zinc-50 p-4 dark:border-white/10 dark:bg-zinc-900/30 md:flex-row md:items-center md:justify-end">
+          {footer}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* --- Main App Component --- */
+
+export default function App() {
+  /* Logic & State from Old App */
+  const [peers, setPeers] = useState<Peer[]>([]);
+  const peersRef = useRef<Peer[]>([]);
+  
+  const [clipboardHistory, setClipboardHistory] = useState<HistoryItem[]>([]);
+  const [activeView, setActiveView] = useState<View>("devices");
+  const [myNetworkName, setMyNetworkName] = useState("Loading...");
+  const [myDeviceId, setMyDeviceId] = useState("Loading..."); // TODO: Fetch in backend
   const [networkPin, setNetworkPin] = useState("...");
 
-  /* Pairing State */
-  const [pairingPeer, setPairingPeer] = useState<Peer | null>(null);
-  const [pin, setPin] = useState("");
-  const [showPairingModal, setShowPairingModal] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
+  /* Modal State */
+  const [joinOpen, setJoinOpen] = useState(false);
+  const [joinTarget, setJoinTarget] = useState<string>("");
+  const [joinPin, setJoinPin] = useState("");
+  const [joinBusy, setJoinBusy] = useState(false);
+  const [pairingPeerId, setPairingPeerId] = useState<string | null>(null);
+
+  const [leaveOpen, setLeaveOpen] = useState(false);
 
   // Keep ref in sync
   useEffect(() => {
       peersRef.current = peers;
   }, [peers]);
 
+  // Initial Data Fetch
   useEffect(() => {
-    // Initial fetch
+    // 1. Peers
     invoke<Record<string, Peer>>("get_peers").then((peerMap) => {
         setPeers(Object.values(peerMap));
     });
     
-    // Fetch Network Name & PIN
+    // 2. Metadata
     invoke<string>("get_network_name").then(name => setMyNetworkName(name));
     invoke<string>("get_network_pin").then(pin => setNetworkPin(pin));
+    invoke<string>("get_device_id").then(id => setMyDeviceId(id));
   }, []);
 
-  // Ensure PIN matches the displayed Network Name
+  // Poll/Update PIN when network name changes
   useEffect(() => {
     invoke<string>("get_network_pin").then(pin => setNetworkPin(pin));
   }, [myNetworkName]);
 
+  // Listeners
   useEffect(() => {
     const unlistenPeer = listen<Peer>("peer-update", (event) => {
-      console.log("Peer Update Received:", event.payload);
-      // If we just paired, re-fetch network name/pin as it might have changed!
+      // If we just paired (trusted), refresh metadata
       if (event.payload.is_trusted) {
           invoke<string>("get_network_name").then(name => setMyNetworkName(name));
           invoke<string>("get_network_pin").then(pin => setNetworkPin(pin));
+          setJoinOpen(false); // Close modal on success
       }
 
       setPeers((prev) => {
@@ -69,7 +288,14 @@ function App() {
     });
 
     const unlistenClipboard = listen<string>("clipboard-change", (event) => {
-      setClipboardHistory((prev) => [event.payload, ...prev].slice(0, 10)); // Keep last 10
+      const newItem: HistoryItem = {
+          id: Math.random().toString(36).substring(7),
+          origin: "remote", // TODO: Distinguish local/remote from event? local changes handled by watcher?
+          device: "Remote Peer", // TODO: Event should include sender ID
+          ts: "Just now",
+          text: event.payload
+      };
+      setClipboardHistory((prev) => [newItem, ...prev].slice(0, 50));
     });
     
     const unlistenRemove = listen<string>("peer-remove", (event) => {
@@ -77,7 +303,7 @@ function App() {
     });
 
     const unlistenReset = listen("network-reset", () => {
-        alert("You have been removed from the network.\nThe application will now reset.");
+        // Reload app to reset state
         window.location.reload();
     });
 
@@ -87,321 +313,484 @@ function App() {
       unlistenRemove.then((f) => f());
       unlistenReset.then((f) => f());
     };
-  }, []); // Stable listener!
+  }, []);
 
-  const startPairing = (peer: Peer) => {
-      setPairingPeer(peer);
-      setPin("");
-      setIsConnecting(false);
-      setShowPairingModal(true);
+  /* Handlers */
+
+  const startJoinFlow = (networkName: string, targetPeerId: string) => {
+      setJoinTarget(networkName);
+      setPairingPeerId(targetPeerId);
+      setJoinPin("");
+      setJoinBusy(false);
+      setJoinOpen(true);
   };
 
-  const addManualPeer = async () => {
-      const input = prompt("Enter Peer Address (IP:PORT)", "");
-      if (!input) return;
+  const submitJoin = async () => {
+      if (!joinPin || !pairingPeerId) return;
+      setJoinBusy(true);
       
       try {
-          await invoke("add_manual_peer", { ip: input });
-      } catch (e) {
-          alert("Failed to add peer: " + String(e));
-      }
-  };
-
-  const deletePeer = async (id: string) => {
-      if (!confirm("Are you sure you want to forget this device?")) return;
-      try {
-          await invoke("delete_peer", { peerId: id });
-          // Optimistic update
-          setPeers((prev) => prev.filter(p => p.id !== id));
-      } catch (e) {
-          alert("Failed to delete peer: " + String(e));
-      }
-  };
-
-  const submitPairing = async () => {
-      if (!pin || !pairingPeer) return;
-      setIsConnecting(true);
-      
-      try {
-          await invoke("start_pairing", { peerId: pairingPeer.id, pin });
-          // Note: Backend processes response automatically. 
-          // We can assume if no error thrown, request sent.
-          // Wait for peer update?
+          await invoke("start_pairing", { peerId: pairingPeerId, pin: joinPin });
+          // Note: Backend handles the rest. We wait for peer-update event to close modal.
+          // Timeout safety
           setTimeout(() => {
-               setShowPairingModal(false);
-               setIsConnecting(false);
-          }, 2000);
+              setJoinBusy(false);
+          }, 5000);
       } catch (e) {
-          alert("Pairing Failed: " + String(e));
-          setIsConnecting(false);
+          alert("Pairing request failed: " + String(e));
+          setJoinBusy(false);
       }
   };
 
-
-
-  const handleLeaveNetwork = async () => {
-    console.log("Leave Network Button Clicked");
-    if (!confirm("Are you sure you want to leave this network? This will reset your device identity.")) {
-        console.log("User cancelled leave network");
-        return;
-    }
-    
-    console.log("User confirmed leave network. Invoking command...");
+  const confirmLeaveNetwork = async () => {
+    setLeaveOpen(false);
     try {
         await invoke("leave_network");
-        console.log("Command invoked successfully.");
-        // network-reset event will reload the page
     } catch (e) {
-        console.error("Failed to leave network:", e);
         alert("Failed to leave network: " + e);
     }
   };
 
-  // derived state for UI
+  const deletePeer = async (id: string) => {
+    if (!confirm("Kick/Ban this device from the network?")) return;
+    try {
+        await invoke("delete_peer", { peerId: id });
+        setPeers((prev) => prev.filter(p => p.id !== id));
+    } catch (e) {
+        alert("Failed to delete peer: " + String(e));
+    }
+  };
+
+  const copyToClipboard = (text: string) => {
+      // In Tauri we can write to clipboard via backend or frontend API
+      // Using generic navigator.clipboard for simplicity if allowed context
+      navigator.clipboard.writeText(text);
+  };
+
+  /* Derived State */
   const myPeers = peers.filter(p => p.is_trusted);
   const untrustedPeers = peers.filter(p => !p.is_trusted);
+  const isConnected = myPeers.length > 0; // Heuristic: If we have trusted peers, we are in a 'real' cluster
+
+  // Group untrusted by network name
+  const nearbyNetworks: NearbyNetwork[] = [];
+  const grouped: Record<string, Peer[]> = {};
   
-  // Group untrusted peers by network name
-  const otherNetworks: Record<string, Peer[]> = {};
-  const unknownPeers: Peer[] = [];
-
   untrustedPeers.forEach(p => {
-      // Don't show my own network in "Nearby Networks"
-      if (p.network_name && p.network_name === myNetworkName) {
-           return;
-      }
-
-      if (p.network_name) {
-          if (!otherNetworks[p.network_name]) otherNetworks[p.network_name] = [];
-          otherNetworks[p.network_name].push(p);
-      } else {
-          unknownPeers.push(p);
-      }
+      // Skip own network
+      if (p.network_name === myNetworkName) return;
+      
+      const name = p.network_name || "Unidentified";
+      if (!grouped[name]) grouped[name] = [];
+      grouped[name].push(p);
   });
 
+  Object.entries(grouped).forEach(([name, devices]) => {
+      nearbyNetworks.push({
+          networkName: name,
+          devices: devices.map(d => ({ 
+              id: d.id, 
+              // Map backend 'last_seen' to status? current backend removes ancient peers so assume online if present
+              status: "online" 
+          }))
+      });
+  });
+
+  /* Theme Setup */
+  // TODO: System preference detection
+  const rootThemeClass = "dark"; // Defaulting to dark for now, or check OS
+
   return (
-    <div className="flex flex-col h-screen w-screen bg-neutral-900 text-white overflow-hidden font-sans relative">
-      {/* Header */}
-      <header className="flex items-center justify-between px-4 py-3 bg-neutral-800 border-b border-neutral-700 select-none drag-region">
-        <div className="flex items-center gap-2">
-            <div className="w-3 h-3 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></div>
-            <h1 className="font-bold text-lg tracking-tight">UCP</h1>
-        </div>
-        <div className="flex gap-1 bg-neutral-700/50 p-1 rounded-lg no-drag">
-            <button 
-                onClick={() => setActiveTab("devices")}
-                className={clsx("p-1.5 rounded-md transition-all", activeTab === "devices" ? "bg-neutral-600 shadow-sm" : "hover:bg-neutral-700/50")}
-            >
-                <Monitor size={18} className={activeTab === "devices" ? "text-white" : "text-neutral-400"} />
-            </button>
-            <button 
-                onClick={() => setActiveTab("history")}
-                className={clsx("p-1.5 rounded-md transition-all", activeTab === "history" ? "bg-neutral-600 shadow-sm" : "hover:bg-neutral-700/50")}
-            >
-                <History size={18} className={activeTab === "history" ? "text-white" : "text-neutral-400"} />
-            </button>
-            <div className="w-px h-6 bg-neutral-600/50 mx-1"></div>
-            <button 
-                onClick={handleLeaveNetwork}
-                className="p-1.5 rounded-md hover:bg-red-500/20 text-neutral-400 hover:text-red-400 transition-colors"
-                title="Leave Network"
-            >
-                <LogOut size={18} />
-            </button>
-        </div>
-      </header>
+    <div className={clsx(rootThemeClass, "min-h-screen w-full bg-[radial-gradient(1200px_circle_at_0%_0%,rgba(16,185,129,0.10),transparent_60%),radial-gradient(1000px_circle_at_100%_0%,rgba(59,130,246,0.10),transparent_55%),radial-gradient(900px_circle_at_50%_100%,rgba(99,102,241,0.10),transparent_50%)] dark:bg-[radial-gradient(1200px_circle_at_0%_0%,rgba(16,185,129,0.12),transparent_60%),radial-gradient(1000px_circle_at_100%_0%,rgba(59,130,246,0.10),transparent_55%),radial-gradient(900px_circle_at_50%_100%,rgba(244,63,94,0.10),transparent_50%)]")}>
+      <div className="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-4 py-6 md:px-6">
+        {/* Custom titlebar drag region */}
+        <div className="drag-region h-[30px] w-full rounded-t-3xl" />
 
-      {/* Content */}
-      <main className="flex-1 overflow-y-auto p-4">
-        {activeTab === "devices" && (
+        {/* Header */}
+        <Card className="no-drag overflow-hidden">
+          <div className="flex flex-col gap-3 p-4 md:flex-row md:items-center md:justify-between">
+            <div className="flex items-center gap-3">
+              <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-600 text-white shadow-sm">
+                <ShieldCheck className="h-5 w-5" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">UCP</div>
+                  {isConnected ? (
+                    <Badge tone="good">
+                      <span className="inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+                      Connected
+                    </Badge>
+                  ) : (
+                    <Badge tone="warn">
+                      <span className="inline-flex h-2 w-2 rounded-full bg-amber-500" />
+                      Singleton / Ready
+                    </Badge>
+                  )}
+                </div>
+                <div className="mt-0.5 text-xs text-zinc-600 dark:text-zinc-400">
+                  {isConnected 
+                      ? `Secure Cluster: ${myNetworkName}` 
+                      : "Share your PIN to link devices."}
+                </div>
+              </div>
+            </div>
 
-            <div className="space-y-6">
-                {/* My Network Section */}
-                <div>
-                    <div className="flex items-center justify-between mb-2">
-                        <div className="flex flex-col">
-                            <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">
-                                My Network: <span className="text-blue-400">{myNetworkName}</span>
-                            </h2>
-                            <span className="text-[10px] text-neutral-600 font-mono tracking-widest mt-0.5">PIN: {networkPin}</span>
-                        </div>
-                        <button onClick={addManualPeer} className="text-neutral-500 hover:text-white transition-colors" title="Add Manual Peer">
-                            <PlusCircle size={16} />
-                        </button>
+            <div className="flex flex-wrap items-center gap-2 md:justify-end">
+              <div className="inline-flex rounded-2xl border border-zinc-900/10 bg-white/60 p-1 dark:border-white/10 dark:bg-white/5">
+                <button
+                  className={clsx(
+                    "no-drag inline-flex h-10 items-center gap-2 rounded-xl px-3 text-sm font-medium transition",
+                    activeView === "devices"
+                      ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-950 dark:text-zinc-50"
+                      : "text-zinc-600 hover:bg-zinc-900/5 dark:text-zinc-300 dark:hover:bg-white/5"
+                  )}
+                  onClick={() => setActiveView("devices")}
+                >
+                  <MonitorIcon />
+                  Devices
+                </button>
+                <button
+                  className={clsx(
+                    "no-drag inline-flex h-10 items-center gap-2 rounded-xl px-3 text-sm font-medium transition",
+                    activeView === "history"
+                      ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-950 dark:text-zinc-50"
+                      : "text-zinc-600 hover:bg-zinc-900/5 dark:text-zinc-300 dark:hover:bg-white/5"
+                  )}
+                  onClick={() => setActiveView("history")}
+                >
+                  <History className="h-4 w-4" />
+                  History
+                </button>
+              </div>
+
+              <IconButton label="Settings" onClick={() => setActiveView("settings")} variant="default">
+                <Settings className="h-5 w-5 text-zinc-700 dark:text-zinc-200" />
+              </IconButton>
+
+              <Button
+                variant="danger"
+                iconLeft={<LogOut className="h-4 w-4" />}
+                onClick={() => setLeaveOpen(true)}
+                className="no-drag"
+              >
+                Leave
+              </Button>
+            </div>
+          </div>
+        </Card>
+
+        {/* Content */}
+        <div className="mt-5">
+           {/* In the design, this was a grid with sidebar. For simplicity we can just render the Main Panel full width for now, or match the sidebar structure if desired. Let's keep it simple full width since the sidebar was mostly Demo Controls */}
+           <div className="no-drag">
+             {activeView === "devices" ? (
+               <DevicesView
+                 isConnected={isConnected}
+                 myNetworkName={myNetworkName}
+                 myDeviceId={myDeviceId}
+                 networkPin={networkPin}
+                 peers={myPeers}
+                 nearby={nearbyNetworks}
+                 onJoin={(netName) => {
+                     // Find a peer in that network to join
+                     const group = grouped[netName];
+                     if (group && group.length > 0) {
+                         startJoinFlow(netName, group[0].id);
+                     }
+                 }}
+                 onDeletePeer={deletePeer}
+               />
+             ) : activeView === "history" ? (
+               <HistoryView items={clipboardHistory} onCopy={copyToClipboard} />
+             ) : (
+               <SettingsView />
+             )}
+           </div>
+        </div>
+
+        {/* Modals */}
+        <Modal
+          open={joinOpen}
+          onClose={() => setJoinOpen(false)}
+          title={`Join “${joinTarget}”`}
+          subtitle="Enter the 6-character Network PIN shown on any device in that cluster."
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => setJoinOpen(false)}>
+                Cancel
+              </Button>
+              <Button variant="primary" onClick={submitJoin} disabled={joinBusy || joinPin.trim().length < 6} iconLeft={<PlusCircle className="h-4 w-4" />}>
+                {joinBusy ? "Joining…" : "Join network"}
+              </Button>
+            </>
+          }
+        >
+          <div className="space-y-3">
+            <div className="rounded-2xl border border-zinc-900/10 bg-zinc-50 p-4 dark:border-white/10 dark:bg-white/5">
+              <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Network PIN</div>
+              <input
+                className="mt-2 h-12 w-full rounded-2xl border border-zinc-900/10 bg-white px-4 font-mono text-lg tracking-[0.25em] text-zinc-900 outline-none focus:ring-2 focus:ring-emerald-500/40 dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-50"
+                placeholder="••••••"
+                value={joinPin}
+                onChange={(e) => setJoinPin(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6))}
+                autoFocus
+              />
+            </div>
+          </div>
+        </Modal>
+
+        <Modal
+          open={leaveOpen}
+          onClose={() => setLeaveOpen(false)}
+          title="Leave network?"
+          subtitle="This wipes this device’s identity, keys, and trusted peers (factory reset)."
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => setLeaveOpen(false)}>
+                Cancel
+              </Button>
+              <Button variant="danger" onClick={confirmLeaveNetwork} iconLeft={<AlertTriangle className="h-4 w-4" />}>
+                Leave & reset
+              </Button>
+            </>
+          }
+        >
+          <div className="space-y-3">
+            <div className="rounded-2xl border border-rose-500/20 bg-rose-500/10 p-4 text-sm text-rose-800 dark:text-rose-200">
+               Action is irreversible. You will need a PIN to rejoin.
+            </div>
+          </div>
+        </Modal>
+      </div>
+    </div>
+  );
+}
+
+/* --- Views --- */
+
+function DevicesView({
+  isConnected,
+  myNetworkName,
+  myDeviceId,
+  networkPin,
+  peers,
+  nearby,
+  onJoin,
+  onDeletePeer,
+}: {
+  isConnected: boolean;
+  myNetworkName: string;
+  myDeviceId: string;
+  networkPin: string;
+  peers: Peer[];
+  nearby: NearbyNetwork[];
+  onJoin: (networkName: string) => void;
+  onDeletePeer: (id: string) => void;
+}) {
+
+  return (
+    <div className="space-y-5">
+      {/* My device / identity */}
+      <Card className="p-5">
+        <SectionHeader
+          icon={<ShieldCheck className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />}
+          title="My device"
+          subtitle="Share your PIN to admit a new device into your secure cluster."
+          right={
+            <Badge tone={isConnected ? "good" : "warn"}>
+              {isConnected ? (
+                <>
+                  <Lock className="h-3.5 w-3.5" /> Trusted cluster
+                </>
+              ) : (
+                <>
+                  <Unlock className="h-3.5 w-3.5" /> Not paired
+                </>
+              )}
+            </Badge>
+          }
+        />
+
+        <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
+          <Field label="My Network Name" value={myNetworkName} mono action={<CopyMini text={myNetworkName} />} />
+          <Field label="My Device ID" value={myDeviceId} mono action={<CopyMini text={myDeviceId} />} />
+          <Field
+            label="Network PIN"
+            value={networkPin}
+            mono
+            action={
+              <Button variant="primary" size="sm" iconLeft={<Copy className="h-4 w-4" />} onClick={() => navigator.clipboard.writeText(networkPin)}>
+                Copy
+              </Button>
+            }
+          />
+        </div>
+      </Card>
+
+      {/* Trusted peers */}
+      <Card className="p-5">
+        <SectionHeader
+          icon={<Lock className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />}
+          title="Trusted peers"
+          subtitle="Devices in your secure cluster."
+          right={
+            <Badge tone="good">
+              <CheckCircle2 className="h-3.5 w-3.5" /> Safe zone
+            </Badge>
+          }
+        />
+
+        {peers.length === 0 ? (
+          <div className="mt-4 rounded-2xl border border-zinc-900/10 bg-zinc-50 p-4 text-sm text-zinc-700 dark:border-white/10 dark:bg-white/5 dark:text-zinc-300">
+            No other devices in this cluster.
+          </div>
+        ) : (
+          <div className="mt-4 space-y-2">
+            {peers.map((p) => (
+              <div
+                key={p.id}
+                className="flex flex-col gap-3 rounded-2xl border border-zinc-900/10 bg-white/60 p-4 dark:border-white/10 dark:bg-white/5 md:flex-row md:items-center md:justify-between"
+              >
+                <div className="flex items-center gap-3">
+                  <div className={clsx("flex h-10 w-10 items-center justify-center rounded-2xl", "bg-emerald-500/15")}>
+                    <Wifi className="h-5 w-5 text-emerald-600 dark:text-emerald-300" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">{p.hostname || p.id}</div>
+                      <Badge tone="good">online</Badge>
                     </div>
-                    <div className="space-y-2">
-                        {myPeers.length === 0 ? (
-                            <div className="p-4 rounded-xl border border-dashed border-neutral-700 text-center text-neutral-500 text-sm">
-                                You are the only device in this network.
-                            </div>
-                        ) : (
-                            myPeers.map(peer => (
-                                <div key={peer.id} className="group flex items-center justify-between p-3 bg-neutral-800/50 hover:bg-neutral-800 border border-neutral-700/50 hover:border-emerald-500/30 rounded-xl transition-all">
-                                    <div className="flex items-center gap-3">
-                                        <div className="w-10 h-10 flex items-center justify-center bg-emerald-500/10 text-emerald-400 rounded-lg">
-                                            <ShieldCheck size={20} />
-                                        </div>
-                                        <div>
-                                            <div className="font-medium text-sm text-neutral-200">{peer.hostname}</div>
-                                            <div className="text-xs text-neutral-500 font-mono">{peer.ip}</div>
-                                        </div>
-                                    </div>
-                                    <button
-                                         onClick={(e) => { e.stopPropagation(); deletePeer(peer.id); }}
-                                         className="p-1.5 text-neutral-500 hover:text-red-400 bg-neutral-700/50 hover:bg-neutral-700 rounded-md transition-colors opacity-0 group-hover:opacity-100"
-                                         title="Forget Device"
-                                     >
-                                        <Trash2 size={16} />
-                                    </button>
-                                </div>
-                            ))
-                        )}
-                    </div>
+                    <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">{p.ip}</div>
+                  </div>
                 </div>
 
-                {/* Other Networks Section */}
-                {Object.keys(otherNetworks).length > 0 && (
-                    <div>
-                        <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-2">Nearby Networks</h2>
-                        <div className="grid gap-3">
-                            {Object.entries(otherNetworks).map(([netName, netPeers]) => (
-                                <div key={netName} className="p-4 bg-neutral-800 border border-neutral-700 rounded-xl flex items-center justify-between">
-                                    <div>
-                                        <h3 className="font-bold text-white text-lg">{netName}</h3>
-                                        <p className="text-sm text-neutral-400">
-                                            {netPeers.length} device{netPeers.length !== 1 ? 's' : ''} available
-                                        </p>
-                                        <div className="flex -space-x-2 mt-2">
-                                            {netPeers.slice(0, 3).map(p => (
-                                                <div key={p.id} className="w-8 h-8 rounded-full bg-neutral-700 border-2 border-neutral-800 flex items-center justify-center text-neutral-400" title={p.hostname}>
-                                                    <Monitor size={14} />
-                                                </div>
-                                            ))}
-                                            {netPeers.length > 3 && (
-                                                <div className="w-6 h-6 rounded-full bg-neutral-700 border border-neutral-800 flex items-center justify-center text-[10px] text-neutral-300">
-                                                    +{netPeers.length - 3}
-                                                </div>
-                                            )}
-                                        </div>
-                                    </div>
-                                    <button 
-                                        onClick={() => startPairing(netPeers[0])} // Use first peer as gateway
-                                        className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-medium text-sm transition-colors"
-                                    >
-                                        Join
-                                    </button>
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-                )}
-
-                {/* Unknown / Direct Section */}
-                {unknownPeers.length > 0 && (
-                     <div>
-                        <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-2">Unidentified Devices</h2>
-                        <div className="space-y-2">
-                            {unknownPeers.map(peer => (
-                                <div key={peer.id} className="flex items-center justify-between p-3 bg-neutral-800/30 border border-neutral-700/30 rounded-xl">
-                                    <div className="flex items-center gap-3">
-                                        <div className="w-10 h-10 flex items-center justify-center bg-neutral-700 text-neutral-400 rounded-lg">
-                                            <Monitor size={20} />
-                                        </div>
-                                        <div>
-                                            <div className="font-medium text-sm text-neutral-200">{peer.hostname}</div>
-                                            <div className="text-xs text-neutral-500 font-mono">{peer.ip}</div>
-                                        </div>
-                                    </div>
-                                    <button 
-                                        onClick={() => startPairing(peer)}
-                                        className="px-3 py-1.5 bg-neutral-700 hover:bg-neutral-600 text-xs rounded-md transition-colors"
-                                    >
-                                        Connect
-                                    </button>
-                                </div>
-                            ))}
-                        </div>
-                     </div>
-                )}
-            </div>
-        )}
-
-        {activeTab === "history" && (
-             <div className="space-y-3">
-                <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-2">Clipboard History</h2>
-                {clipboardHistory.length === 0 ? (
-                    <div className="text-center py-10 text-neutral-500 text-sm">History is empty</div>
-                ) : (
-                    clipboardHistory.map((item, i) => (
-                        <div key={i} className="flex gap-3 p-3 bg-neutral-800/50 border border-neutral-700/50 rounded-xl">
-                            <Copy size={16} className="text-neutral-500 mt-1 shrink-0" />
-                            <p className="text-sm text-neutral-300 font-mono break-all line-clamp-3">{item}</p>
-                        </div>
-                    ))
-                )}
-             </div>
-        )}
-      </main>
-
-      {/* Footer Status */}
-      <footer className="px-4 py-2 bg-neutral-900 border-t border-neutral-800 text-xs text-neutral-500 flex justify-between items-center">
-        <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-            <span>Discovery Active</span>
-        </div>
-        <span>v0.1.0</span>
-      </footer>
-
-      {/* Pairing Modal */}
-      {showPairingModal && (
-          <div className="absolute inset-0 bg-black/80 flex items-center justify-center p-4 z-50 backdrop-blur-sm">
-              <div className="bg-neutral-800 border border-neutral-700 rounded-xl p-6 w-full max-w-sm shadow-2xl">
-                  <h3 className="text-lg font-bold mb-2">
-                      {isConnecting ? "Connecting..." : "Join Network"}
-                  </h3>
-                  
-                  {isConnecting ? (
-                      <div className="text-center py-4">
-                          <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-                          <p className="text-neutral-400 text-sm mb-4">
-                              Verifying PIN with {pairingPeer?.hostname}...
-                          </p>
-                      </div>
-                  ) : (
-                    <>
-                      <p className="text-neutral-400 text-sm mb-4">
-                          Enter the PIN displayed on <strong>{pairingPeer?.hostname}</strong> or any other device in that network.
-                      </p>
-                      
-                      <input 
-                          type="text" 
-                          placeholder="ABC123" 
-                          className="w-full bg-neutral-900 border border-neutral-700 rounded-lg px-4 py-3 mb-4 outline-none focus:border-blue-500 font-mono text-center text-xl tracking-widest uppercase"
-                          value={pin}
-                          onChange={e => setPin(e.target.value.toUpperCase())}
-                      />
-                      
-                      <div className="flex gap-2">
-                          <button 
-                              onClick={() => setShowPairingModal(false)}
-                              className="flex-1 px-4 py-2 bg-neutral-700 hover:bg-neutral-600 rounded-lg transition-colors"
-                          >
-                              Cancel
-                          </button>
-                          <button 
-                              onClick={submitPairing}
-                              className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg transition-colors font-medium"
-                          >
-                              Join Network
-                          </button>
-                      </div>
-                    </>
-                  )}
+                <div className="flex items-center justify-end gap-2">
+                  <Button size="sm" variant="ghost" iconLeft={<Copy className="h-4 w-4" />} onClick={() => navigator.clipboard.writeText(p.id)}>
+                    Copy ID
+                  </Button>
+                  <IconButton label="Kick / Ban" onClick={() => onDeletePeer(p.id)}>
+                    <Trash2 className="h-5 w-5 text-rose-600" />
+                  </IconButton>
+                </div>
               </div>
+            ))}
           </div>
+        )}
+      </Card>
+
+      {/* Nearby networks */}
+      {nearby.length > 0 && (
+          <Card className="p-5">
+            <SectionHeader
+              icon={<Unlock className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />}
+              title="Nearby networks"
+              subtitle="Other UCP clusters on your LAN."
+            />
+
+            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
+              {nearby.map((n) => (
+                <div key={n.networkName} className="rounded-2xl border border-zinc-900/10 bg-white/60 p-4 dark:border-white/10 dark:bg-white/5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">{n.networkName}</div>
+                      <div className="mt-1 flex flex-wrap gap-2 text-xs text-zinc-600 dark:text-zinc-400">
+                        {n.devices.map((d) => (
+                          <span key={d.id} className="inline-flex items-center gap-1">
+                            <span className="inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+                            {d.id.substring(0,8)}...
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    <Button
+                      variant="primary"
+                      iconLeft={<PlusCircle className="h-4 w-4" />}
+                      onClick={() => onJoin(n.networkName)}
+                      className="no-drag"
+                    >
+                      Join
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
       )}
     </div>
   );
 }
 
-export default App;
+function HistoryView({ items, onCopy }: { items: HistoryItem[]; onCopy: (txt: string) => void }) {
+  return (
+    <div className="space-y-5">
+      <Card className="p-5">
+        <SectionHeader
+          icon={<Copy className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />}
+          title="Clipboard history"
+          subtitle="Recent entries."
+        //   right={<Button variant="danger" size="sm" iconLeft={<Trash2 className="h-4 w-4" />}>Clear</Button>}
+        />
+
+        <div className="mt-4 space-y-2">
+          {items.map((it) => (
+            <div
+              key={it.id}
+              className="rounded-2xl border border-zinc-900/10 bg-white/60 p-4 dark:border-white/10 dark:bg-white/5"
+            >
+              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge tone={it.origin === "remote" ? "good" : "neutral"}>
+                      {it.origin === "remote" ? (
+                        <>
+                          <Lock className="h-3.5 w-3.5" /> {it.device}
+                        </>
+                      ) : (
+                        <>
+                          <Info className="h-3.5 w-3.5" /> Local copy
+                        </>
+                      )}
+                    </Badge>
+                    <span className="text-xs text-zinc-500 dark:text-zinc-400">{it.ts}</span>
+                  </div>
+                  <div className="mt-2 line-clamp-3 whitespace-pre-wrap text-sm text-zinc-900 dark:text-zinc-50">{it.text}</div>
+                </div>
+
+                <div className="flex items-center justify-end gap-2">
+                  <Button size="sm" variant="primary" iconLeft={<Copy className="h-4 w-4" />} onClick={() => onCopy(it.text)}>
+                    Copy
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function SettingsView() {
+  return (
+    <div className="p-4 text-center text-zinc-500">
+        Settings are coming soon.
+    </div>
+  );
+}
+
+
+/* --- Tiny Icons --- */
+
+function MonitorIcon() {
+  return <Monitor className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />;
+}
+
+function CopyMini({ text }: { text: string }) {
+  return (
+    <IconButton label="Copy" onClick={() => navigator.clipboard.writeText(text)} variant="default">
+      <Copy className="h-5 w-5 text-zinc-700 dark:text-zinc-200" />
+    </IconButton>
+  );
+}
