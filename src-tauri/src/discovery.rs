@@ -37,19 +37,25 @@ impl Discovery {
 
         // Hostname usually needs to be unique on the network, but we'll base it on device ID for now.
         // Format: device_id.local.
-        let hostname = format!("{}.local.", device_id);
+        let m_hostname = format!("{}.local.", device_id);
+
+        // Get actual system hostname for UI display
+        let system_hostname = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "Unknown Device".to_string());
 
         // Properties can be used to send public key fingerprint or other metadata
         let properties = [
             ("version", "0.1.0"),
             ("id", device_id),
-            ("n", network_name), // n = network name
+            ("n", network_name),     // n = network name
+            ("h", &system_hostname), // h = visible hostname
         ];
 
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
             device_id,
-            &hostname,
+            &m_hostname,
             &ip.to_string(),
             port,
             &properties[..],

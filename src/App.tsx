@@ -25,7 +25,7 @@ type View = "devices" | "history" | "settings";
 
 type NearbyNetwork = {
   networkName: string;
-  devices: { id: string; status: "online" | "offline" }[];
+  devices: { id: string; hostname?: string; status: "online" | "offline" }[];
 };
 
 type HistoryItem = {
@@ -236,7 +236,7 @@ export default function App() {
   const [clipboardHistory, setClipboardHistory] = useState<HistoryItem[]>([]);
   const [activeView, setActiveView] = useState<View>("devices");
   const [myNetworkName, setMyNetworkName] = useState("Loading...");
-  const [myDeviceId, setMyDeviceId] = useState("Loading..."); // TODO: Fetch in backend
+  const [myHostname, setMyHostname] = useState("Loading...");
   const [networkPin, setNetworkPin] = useState("...");
 
   /* Modal State */
@@ -263,7 +263,7 @@ export default function App() {
     // 2. Metadata
     invoke<string>("get_network_name").then(name => setMyNetworkName(name));
     invoke<string>("get_network_pin").then(pin => setNetworkPin(pin));
-    invoke<string>("get_device_id").then(id => setMyDeviceId(id));
+    invoke<string>("get_hostname").then(h => setMyHostname(h));
   }, []);
 
   // Poll/Update PIN when network name changes
@@ -425,7 +425,7 @@ export default function App() {
                   ) : (
                     <Badge tone="warn">
                       <span className="inline-flex h-2 w-2 rounded-full bg-amber-500" />
-                      Singleton / Ready
+                      No Peers
                     </Badge>
                   )}
                 </div>
@@ -469,13 +469,14 @@ export default function App() {
                 <Settings className="h-5 w-5 text-zinc-700 dark:text-zinc-200" />
               </IconButton>
 
+              <div className="h-8 w-px bg-zinc-900/10 dark:bg-white/10 mx-1" />
+
               <Button
                 variant="danger"
-                iconLeft={<LogOut className="h-4 w-4" />}
                 onClick={() => setLeaveOpen(true)}
-                className="no-drag"
+                className="no-drag w-11 px-0"
               >
-                Leave
+                 <LogOut className="h-4 w-4" />
               </Button>
             </div>
           </div>
@@ -489,7 +490,7 @@ export default function App() {
                <DevicesView
                  isConnected={isConnected}
                  myNetworkName={myNetworkName}
-                 myDeviceId={myDeviceId}
+                 myHostname={myHostname}
                  networkPin={networkPin}
                  peers={myPeers}
                  nearby={nearbyNetworks}
@@ -529,7 +530,7 @@ export default function App() {
         >
           <div className="space-y-3">
             <div className="rounded-2xl border border-zinc-900/10 bg-zinc-50 p-4 dark:border-white/10 dark:bg-white/5">
-              <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Network PIN</div>
+              <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Cluster PIN</div>
               <input
                 className="mt-2 h-12 w-full rounded-2xl border border-zinc-900/10 bg-white px-4 font-mono text-lg tracking-[0.25em] text-zinc-900 outline-none focus:ring-2 focus:ring-emerald-500/40 dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-50"
                 placeholder="••••••"
@@ -573,7 +574,7 @@ export default function App() {
 function DevicesView({
   isConnected,
   myNetworkName,
-  myDeviceId,
+  myHostname,
   networkPin,
   peers,
   nearby,
@@ -582,7 +583,7 @@ function DevicesView({
 }: {
   isConnected: boolean;
   myNetworkName: string;
-  myDeviceId: string;
+  myHostname: string;
   networkPin: string;
   peers: Peer[];
   nearby: NearbyNetwork[];
@@ -596,7 +597,7 @@ function DevicesView({
       <Card className="p-5">
         <SectionHeader
           icon={<ShieldCheck className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />}
-          title="My device"
+          title={`My Device (${myHostname})`}
           subtitle="Share your PIN to admit a new device into your secure cluster."
           right={
             <Badge tone={isConnected ? "good" : "warn"}>
@@ -613,11 +614,10 @@ function DevicesView({
           }
         />
 
-        <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
-          <Field label="My Network Name" value={myNetworkName} mono action={<CopyMini text={myNetworkName} />} />
-          <Field label="My Device ID" value={myDeviceId} mono action={<CopyMini text={myDeviceId} />} />
+        <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
+          <Field label="My Cluster" value={myNetworkName} mono action={<CopyMini text={myNetworkName} />} />
           <Field
-            label="Network PIN"
+            label="Cluster PIN"
             value={networkPin}
             mono
             action={
@@ -633,7 +633,7 @@ function DevicesView({
       <Card className="p-5">
         <SectionHeader
           icon={<Lock className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />}
-          title="Trusted peers"
+          title="My Cluster"
           subtitle="Devices in your secure cluster."
           right={
             <Badge tone="good">
@@ -685,7 +685,7 @@ function DevicesView({
           <Card className="p-5">
             <SectionHeader
               icon={<Unlock className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />}
-              title="Nearby networks"
+              title="Nearby Clusters"
               subtitle="Other UCP clusters on your LAN."
             />
 
@@ -699,7 +699,7 @@ function DevicesView({
                         {n.devices.map((d) => (
                           <span key={d.id} className="inline-flex items-center gap-1">
                             <span className="inline-flex h-2 w-2 rounded-full bg-emerald-500" />
-                            {d.id.substring(0,8)}...
+                             {d.hostname || d.id.substring(0,8) + "..."}
                           </span>
                         ))}
                       </div>

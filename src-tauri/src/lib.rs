@@ -73,6 +73,13 @@ fn get_network_pin(state: tauri::State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
+fn get_hostname() -> String {
+    hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "Unknown".to_string())
+}
+
+#[tauri::command]
 fn get_peers(state: tauri::State<AppState>) -> std::collections::HashMap<String, Peer> {
     state.get_peers()
 }
@@ -402,13 +409,20 @@ pub fn run() {
                                     let kp = d_state.known_peers.lock().unwrap();
                                     let is_known = kp.contains_key(&id);
 
+                                    // Extract hostname from property or fallback to mDNS hostname
+                                    let hostname_prop = info
+                                        .get_property_val_str("h")
+                                        .or_else(|| info.get_property_val_str("hostname"))
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| info.get_hostname().to_string());
+
                                     let peer = Peer {
                                         id: id.clone(),
                                         ip: ip.to_string().parse().unwrap_or(std::net::IpAddr::V4(
                                             std::net::Ipv4Addr::new(127, 0, 0, 1),
                                         )),
                                         port: info.get_port(),
-                                        hostname: info.get_hostname().to_string(),
+                                        hostname: hostname_prop,
                                         last_seen: std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
@@ -716,7 +730,8 @@ pub fn run() {
             leave_network,
             get_network_name,
             get_network_pin,
-            get_device_id
+            get_device_id,
+            get_hostname
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
