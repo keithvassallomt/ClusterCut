@@ -1,9 +1,9 @@
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { 
   Monitor, Copy, History, ShieldCheck, PlusCircle, Trash2, LogOut, 
-  Settings, Wifi, WifiOff, Lock, Unlock, AlertTriangle, checkCircle2, Info, CheckCircle2 
+  Settings, Wifi, Lock, Unlock, AlertTriangle, Info, CheckCircle2 
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -22,7 +22,6 @@ interface Peer {
 }
 
 type View = "devices" | "history" | "settings";
-type AppState = "zero" | "connected";
 
 type NearbyNetwork = {
   networkName: string;
@@ -38,6 +37,7 @@ type HistoryItem = {
 };
 
 /* --- Helper Components (from Design) --- */
+// ... (Badge, SectionHeader, Card omitted as they are fine, just fixing Button props below)
 
 function Badge({
   tone = "neutral",
@@ -114,6 +114,7 @@ function Button({
   variant?: "default" | "primary" | "ghost" | "danger";
   size?: "sm" | "md";
   iconLeft?: React.ReactNode;
+  iconRight?: React.ReactNode;
 }) {
   const base =
     "inline-flex select-none items-center justify-center gap-2 rounded-xl font-medium transition focus:outline-none focus:ring-2 focus:ring-emerald-500/40 disabled:opacity-50 disabled:cursor-not-allowed";
