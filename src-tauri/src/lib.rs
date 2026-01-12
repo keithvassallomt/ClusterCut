@@ -824,37 +824,42 @@ pub fn run() {
                                      }
                                      
                                      // If we don't know them at all, reply!
+                                     // If we don't know them at all, reply!
                                      if !kp_lock.contains_key(&peer.id) {
                                          should_reply = true;
-                                     } else {
-                                         // If we DO know them, preserve OUR trust state!
-                                         // If we DO know them, preserve OUR trust state!
-                                         // The heartbeat usually sends is_trusted: false (self-report), 
-                                         // but we shouldn't downgrade a trusted peer just because they said so.
-                                         if let Some(existing) = kp_lock.get(&peer.id) {
-                                             peer.is_trusted = existing.is_trusted;
-                                             // Also preserve network name if the heartbeat didn't provide one (though it usually does)
-                                             if peer.network_name.is_none() {
-                                                  peer.network_name = existing.network_name.clone();
+                                     }
+
+                                     // Trust Arbitration
+                                     // Rule: Trust is strictly based on Key Possession (Signature).
+                                     // If signature is valid -> Trust (Grant or Renew).
+                                     // If signature is invalid/missing -> Distrust (Revoke or Ignore).
+                                     
+                                     let mut is_signature_valid = false;
+                                     if let Some(sig) = &peer.signature {
+                                         if let Some(key_vec) = listener_state.cluster_key.lock().unwrap().as_ref() {
+                                             if key_vec.len() == 32 {
+                                                 let mut key_arr = [0u8; 32];
+                                                 key_arr.copy_from_slice(key_vec);
+                                                 if verify_signature(&key_arr, &peer.id, sig) {
+                                                     is_signature_valid = true;
+                                                 }
                                              }
                                          }
                                      }
                                      
-                                     // Signature Verification (Auto-Trust)
-                                     // If they provided a valid signature proving they have the Cluster Key, trust them!
-                                     if !peer.is_trusted {
-                                         if let Some(sig) = &peer.signature {
-                                             if let Some(key_vec) = listener_state.cluster_key.lock().unwrap().as_ref() {
-                                                 if key_vec.len() == 32 {
-                                                     let mut key_arr = [0u8; 32];
-                                                     key_arr.copy_from_slice(key_vec);
-                                                     if verify_signature(&key_arr, &peer.id, sig) {
-                                                         println!("Verified Signature for {}! Auto-trusting.", peer.id);
-                                                         peer.is_trusted = true;
-                                                     }
-                                                 }
+                                     if is_signature_valid {
+                                         // Valid Signature: We TRUST this peer.
+                                         println!("Verified Signature for {}! Trust maintained/granted.", peer.id);
+                                         peer.is_trusted = true;
+                                     } else {
+                                         // Invalid/Missing Signature: We DO NOT TRUST this peer.
+                                         // If we previously trusted them, this REVOKES trust (e.g. they reset/left).
+                                         if let Some(existing) = kp_lock.get(&peer.id) {
+                                             if existing.is_trusted {
+                                                println!("Revoking Trust for {}: Invalid/Missing Signature.", peer.id);
                                              }
                                          }
+                                         peer.is_trusted = false;
                                      }
 
                                      // Insert the Real Peer (Update info even if known)
