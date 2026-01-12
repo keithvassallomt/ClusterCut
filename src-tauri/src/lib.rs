@@ -753,7 +753,10 @@ pub fn run() {
                                 // TRUST THE PACKET SOURCE for IP/Port (fixes 0.0.0.0 issue)
                                 peer.ip = addr.ip();
                                 peer.port = addr.port();
+                                peer.last_seen = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
                                 peer.is_manual = true; 
+                                
+                                let mut should_reply = false;
                                 {
                                      let mut kp_lock = listener_state.known_peers.lock().unwrap();
                                      // If we don't know them, OR if we only know them as a manual placeholder...
@@ -765,9 +768,15 @@ pub fn run() {
                                          kp_lock.remove(&manual_id);
                                          listener_state.peers.lock().unwrap().remove(&manual_id);
                                          let _ = listener_handle.emit("peer-remove", &manual_id);
+                                         should_reply = true; // We initiated this connection via placeholder, so we should finish the handshake
                                      }
                                      
-                                     // Insert the Real Peer
+                                     // If we don't know them at all, reply!
+                                     if !kp_lock.contains_key(&peer.id) {
+                                         should_reply = true;
+                                     }
+                                     
+                                     // Insert the Real Peer (Update info even if known)
                                      kp_lock.insert(peer.id.clone(), peer.clone());
                                      save_known_peers(listener_handle.app_handle(), &kp_lock);
                                      listener_state.add_peer(peer.clone());
@@ -775,27 +784,30 @@ pub fn run() {
                                 }
                                 
                                 // Send OUR info back so they can update their placeholder!
-                                let local_id = listener_state.local_device_id.lock().unwrap().clone();
-                                let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
-                                
-                                let my_peer = Peer {
-                                    id: local_id,
-                                    // payload IP is 0.0.0.0 if bound to all, but receiver will fix it using addr.ip() as above!
-                                    ip: transport_inside.local_addr().unwrap().ip(),
-                                    port: transport_inside.local_addr().unwrap().port(),
-                                    hostname,
-                                    last_seen: 0,
-                                    is_trusted: false, // We aren't trusted yet
-                                    is_manual: true,
-                                    network_name: Some(listener_state.network_name.lock().unwrap().clone()),
-                                };
-                                
-                                let msg = Message::PeerDiscovery(my_peer);
-                                let data = serde_json::to_vec(&msg).unwrap_or_default();
-                                // Send back to sender
-                                tauri::async_runtime::spawn(async move {
-                                    let _ = transport_inside.send_message(addr, &data).await;
-                                });
+                                if should_reply {
+                                    println!("Sending Discovery Reply to {}", addr);
+                                    let local_id = listener_state.local_device_id.lock().unwrap().clone();
+                                    let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
+                                    
+                                    let my_peer = Peer {
+                                        id: local_id,
+                                        // payload IP is 0.0.0.0 if bound to all, but receiver will fix it using addr.ip() as above!
+                                        ip: transport_inside.local_addr().unwrap().ip(),
+                                        port: transport_inside.local_addr().unwrap().port(),
+                                        hostname,
+                                        last_seen: 0,
+                                        is_trusted: false, // We aren't trusted yet
+                                        is_manual: true,
+                                        network_name: Some(listener_state.network_name.lock().unwrap().clone()),
+                                    };
+                                    
+                                    let msg = Message::PeerDiscovery(my_peer);
+                                    let data = serde_json::to_vec(&msg).unwrap_or_default();
+                                    // Send back to sender
+                                    tauri::async_runtime::spawn(async move {
+                                        let _ = transport_inside.send_message(addr, &data).await;
+                                    });
+                                }
                             }
                             Message::PeerRemoval(target_id) => {
                                 println!("Received PeerRemoval for {}", target_id);
@@ -837,6 +849,88 @@ pub fn run() {
                 state_for_clipboard,
                 transport_for_clipboard,
             );
+
+            // Background Task: Heartbeat (Keep Manual Peers Alive)
+            let hb_handle = app.handle().clone();
+            let hb_state = (*app.state::<AppState>()).clone();
+            let hb_transport = transport.clone();
+
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    
+                    let peers: Vec<Peer> = {
+                        let kp = hb_state.known_peers.lock().unwrap();
+                        kp.values().cloned().collect()
+                    };
+
+                    if peers.is_empty() { continue; }
+
+                    let local_id = hb_state.local_device_id.lock().unwrap().clone();
+                    let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
+                    let network_name = hb_state.network_name.lock().unwrap().clone();
+
+                    // Self Peer (for payload)
+                    let my_peer = Peer {
+                        id: local_id,
+                        ip: hb_transport.local_addr().unwrap().ip(),
+                        port: hb_transport.local_addr().unwrap().port(),
+                        hostname,
+                        last_seen: 0,
+                        is_trusted: false, 
+                        is_manual: true,
+                        network_name: Some(network_name),
+                    };
+                    
+                    let msg = Message::PeerDiscovery(my_peer);
+                    let data = serde_json::to_vec(&msg).unwrap_or_default();
+
+                    for p in peers {
+                        // Don't ping self (shouldn't be in list, but sanity check)
+                        let addr = std::net::SocketAddr::new(p.ip, p.port);
+                        
+                        // We skip sending if wait, we want to broadcast to everyone we know.
+                        let _ = hb_transport.send_message(addr, &data).await;
+                    }
+                }
+            });
+
+            // Background Task: Pruning (Remove Stale Untrusted Peers)
+            let prune_handle = app.handle().clone();
+            let prune_state = (*app.state::<AppState>()).clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                    let timeout = 60; // 60 seconds timeout
+
+                    let mut params_to_remove = Vec::new();
+                    
+                    {
+                        let peers = prune_state.get_peers();
+                        for (id, p) in peers {
+                            // Only prune UNTRUSTED peers (Nearby Clusters)
+                            // Trusted peers we might want to keep as "Offline" (future work)
+                            if !p.is_trusted && (now - p.last_seen > timeout) {
+                                println!("Pruning stale peer: {} ({}) - Last seen {}s ago", p.hostname, id, now - p.last_seen);
+                                params_to_remove.push(id);
+                            }
+                        }
+                    }
+
+                    if !params_to_remove.is_empty() {
+                         let mut peers_lock = prune_state.peers.lock().unwrap();
+                         let mut kp_lock = prune_state.known_peers.lock().unwrap();
+                         
+                         for id in params_to_remove {
+                             peers_lock.remove(&id);
+                             kp_lock.remove(&id);
+                             let _ = prune_handle.emit("peer-remove", &id);
+                         }
+                         save_known_peers(prune_handle.app_handle(), &kp_lock);
+                    }
+                }
+            });
 
             Ok(())
         })
