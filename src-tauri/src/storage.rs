@@ -237,7 +237,7 @@ pub fn reset_network_state(app: &AppHandle) {
     let path_resolver = app.path();
     // Include the actual filenames used by load/save
     let config_files = [
-        "cluster_key",
+        "cluster_key.bin",
         "network_name",
         "network_pin",
         "known_peers.json",
