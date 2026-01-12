@@ -247,6 +247,10 @@ export default function App() {
   const [pairingPeerId, setPairingPeerId] = useState<string | null>(null);
 
   const [leaveOpen, setLeaveOpen] = useState(false);
+  
+  const [addManualOpen, setAddManualOpen] = useState(false);
+  const [manualIp, setManualIp] = useState("");
+  const [manualBusy, setManualBusy] = useState(false);
 
   // Keep ref in sync
   useEffect(() => {
@@ -366,6 +370,20 @@ export default function App() {
       // In Tauri we can write to clipboard via backend or frontend API
       // Using generic navigator.clipboard for simplicity if allowed context
       navigator.clipboard.writeText(text);
+  };
+
+  const submitManualPeer = async () => {
+      if (!manualIp) return;
+      setManualBusy(true);
+      try {
+          await invoke("add_manual_peer", { ip: manualIp });
+          setAddManualOpen(false);
+          setManualIp("");
+      } catch (e) {
+          alert("Failed: " + e);
+      } finally {
+          setManualBusy(false);
+      }
   };
 
   /* Derived State */
@@ -503,6 +521,7 @@ export default function App() {
                      }
                  }}
                  onDeletePeer={deletePeer}
+                 onAddManual={() => setAddManualOpen(true)}
                />
              ) : activeView === "history" ? (
                <HistoryView items={clipboardHistory} onCopy={copyToClipboard} />
@@ -565,6 +584,40 @@ export default function App() {
             </div>
           </div>
         </Modal>
+
+        <Modal
+          open={addManualOpen}
+          onClose={() => setAddManualOpen(false)}
+          title="Add Remote Peer"
+          subtitle="Enter an IP address or CIDR range (e.g. 192.168.1.0/24) to scan."
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => setAddManualOpen(false)}>
+                Cancel
+              </Button>
+              <Button variant="primary" onClick={submitManualPeer} disabled={manualBusy || !manualIp} iconLeft={<PlusCircle className="h-4 w-4" />}>
+                {manualBusy ? "Scanning..." : "Add"}
+              </Button>
+            </>
+          }
+        >
+          <div className="space-y-3">
+             <div className="rounded-2xl border border-zinc-900/10 bg-zinc-50 p-4 dark:border-white/10 dark:bg-white/5">
+               <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">IP Address / CIDR</div>
+               <input
+                 className="mt-2 h-12 w-full rounded-2xl border border-zinc-900/10 bg-white px-4 text-zinc-900 outline-none focus:ring-2 focus:ring-emerald-500/40 dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-50"
+                 placeholder="e.g. 10.8.0.5 or 192.168.1.0/24"
+                 value={manualIp}
+                 onChange={(e) => setManualIp(e.target.value)}
+                 autoFocus
+                 onKeyDown={(e) => e.key === "Enter" && submitManualPeer()}
+               />
+               <div className="mt-2 text-xs text-zinc-500">
+                  Target must be running UCP on the default port (4654).
+               </div>
+             </div>
+          </div>
+        </Modal>
       </div>
     </div>
   );
@@ -581,6 +634,7 @@ function DevicesView({
   nearby,
   onJoin,
   onDeletePeer,
+  onAddManual,
 }: {
   isConnected: boolean;
   myNetworkName: string;
@@ -590,6 +644,7 @@ function DevicesView({
   nearby: NearbyNetwork[];
   onJoin: (networkName: string) => void;
   onDeletePeer: (id: string) => void;
+  onAddManual: () => void;
 }) {
 
   return (
@@ -695,6 +750,11 @@ function DevicesView({
                 icon={<Unlock className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />}
                 title="Nearby Clusters"
                 subtitle="Other UCP clusters."
+                right={
+                  <Button size="sm" iconLeft={<PlusCircle className="h-4 w-4" />} onClick={onAddManual}>
+                    Add Remote
+                  </Button>
+                }
               />
           </div>
 

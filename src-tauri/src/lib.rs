@@ -91,61 +91,132 @@ fn get_local_ip() -> String {
         .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
+use ipnetwork::IpNetwork;
+
+// Helper to probe a specific IP/Port
+async fn probe_ip(
+    ip: std::net::IpAddr,
+    port: u16,
+    state: AppState,
+    transport: Transport,
+    app_handle: tauri::AppHandle,
+) {
+    let addr = std::net::SocketAddr::new(ip, port);
+    
+    // Attempt connection loop (simple probe)
+    // Transport::send_message initiates a connection. 
+    // We send a lightweight "PeerDiscovery" with our own info.
+    // If it succeeds, we add them as Untrusted. 
+    
+    // Wait... if we send 'PeerDiscovery', they will receive it and add US.
+    // But how do we add THEM?
+    // We don't get a response from send_message other than Ok/Err.
+    // We need a request/response. 
+    // Or we rely on them reacting to our PeerDiscovery by connecting back? 
+    // Let's implement a 'Hello' ping. 
+
+    let local_id = state.local_device_id.lock().unwrap().clone();
+    let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
+    
+    // Send OUR info so they can add us.
+    let my_peer = Peer {
+        id: local_id.clone(),
+        ip: transport.local_addr().unwrap().ip(),
+        port: transport.local_addr().unwrap().port(),
+        hostname,
+        last_seen: 0,
+        is_trusted: false, // We don't know if we are trusted yet
+        is_manual: true,
+        network_name: None,
+    };
+
+    let msg = Message::PeerDiscovery(my_peer);
+    let data = serde_json::to_vec(&msg).unwrap_or_default();
+    
+    println!("Probing {}...", addr);
+    
+    // We don't want to block too long.
+    match tokio::time::timeout(std::time::Duration::from_secs(2), transport.send_message(addr, &data)).await {
+        Ok(Ok(_)) => {
+            println!("Probe to {} SUCCESS!", addr);
+            // We connected! Add them as a temporary manual peer.
+            // We don't know their ID yet, so use "manual-<IP>".
+            let id = format!("manual-{}", ip);
+             let peer = Peer {
+                id: id.clone(),
+                ip,
+                port,
+                hostname: format!("Manual ({})", ip),
+                last_seen: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                is_trusted: false, // Untrusted! User must Join.
+                is_manual: true,
+                network_name: Some("Found!".to_string()),
+            };
+
+            state.add_peer(peer.clone());
+            {
+                 let mut kp = state.known_peers.lock().unwrap();
+                 kp.insert(id.clone(), peer.clone());
+                 save_known_peers(&app_handle, &kp);
+            }
+            let _ = app_handle.emit("peer-update", &peer);
+        }
+        _ => {
+            // println!("Probe to {} failed or timed out.", addr);
+        }
+    }
+}
+
 #[tauri::command]
 async fn add_manual_peer(
-    ip: String,
+    ip: String, // Can be IP or CIDR
     state: tauri::State<'_, AppState>,
     transport: tauri::State<'_, Transport>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    // Parse IP:PORT or just IP (Try SocketAddr first, then IP)
-    let (addr, port) = if let Ok(sock) = ip.parse::<std::net::SocketAddr>() {
-        (sock.ip(), sock.port())
-    } else {
-        // Just IP?
-        if let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() {
-            (ip_addr, 0)
-        } else {
-            return Err("Invalid IP address or format (use IP or IP:PORT)".to_string());
-        }
-    };
-
-    if port == 0 {
-        return Err("Please specify IP:PORT (e.g., 192.168.1.5:4567)".to_string());
-    }
-
-    let id = format!("manual-{}", ip);
-
-    let peer = Peer {
-        id: id.clone(),
-        ip: addr,
-        port,
-        hostname: format!("Manual ({})", ip),
-        last_seen: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        is_trusted: true,
-        is_manual: true,
-        network_name: None, // Manual peers don't annouce it via IP add
-    };
-    state.add_peer(peer.clone());
     
-    // Save to known peers
-    {
-        let mut kp = state.known_peers.lock().unwrap();
-        if !kp.contains_key(&id) {
-            kp.insert(id.clone(), peer.clone());
-            save_known_peers(&app_handle, &kp);
+    // 1. Try parsing as CIDR
+    if let Ok(net) = ip.parse::<IpNetwork>() {
+        println!("Scanning range: {}", net);
+        let ips: Vec<std::net::IpAddr> = net.iter().collect();
+        
+        // Scan in small batches with concurrency
+        let batch_size = 50; 
+        for chunk in ips.chunks(batch_size) {
+            let mut tasks = Vec::new();
+            for ip_addr in chunk {
+                 let s = (*state).clone();
+                 let t = (*transport).clone();
+                 let a = app_handle.clone();
+                 let addr = *ip_addr;
+                 
+                 // Skip own IP
+                 if let Ok(local) = t.local_addr() {
+                     if local.ip() == addr { continue; }
+                 }
+                 
+                 tasks.push(tauri::async_runtime::spawn(async move {
+                     probe_ip(addr, 4654, s, t, a).await; // Fixed Port 4654
+                 }));
+            }
+            futures::future::join_all(tasks).await;
         }
+        Ok(())
+    } else {
+         // 2. Try parsing as normal IP or SocketAddr
+        // If just IP, assume port 4654.
+        let (addr, port) = if let Ok(sock) = ip.parse::<std::net::SocketAddr>() {
+            (sock.ip(), sock.port())
+        } else if let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() {
+            (ip_addr, 4654)
+        } else {
+             return Err("Invalid Format. Use IP, IP:PORT, or CIDR (e.g. 192.168.1.0/24)".to_string());
+        };
+
+        // For single IP, PROBE IT.
+        probe_ip(addr, port, (*state).clone(), (*transport).clone(), app_handle).await;
+        Ok(())
     }
-
-    let _ = app_handle.emit("peer-update", &peer);
-
-    // Gossip this new manual peer to others!
-    gossip_peer(&peer, &state, &transport, None);
-
-    Ok(())
 }
 
 #[tauri::command]
@@ -324,9 +395,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::new())
         .setup(|app| {
-            // Initialize QUIC Transport
-            let transport = tauri::async_runtime::block_on(async { Transport::new(0) })
-                .expect("Failed to create transport");
+// Initialize QUIC Transport (Fixed Port 4654 for Discovery, or random fallback)
+            let transport = tauri::async_runtime::block_on(async { 
+                match Transport::new(4654) {
+                    Ok(t) => Ok(t),
+                    Err(e) => {
+                        println!("Failed to bind port 4654 ({}). Falling back to random port.", e);
+                        Transport::new(0)
+                    }
+                }
+            }).expect("Failed to create transport");
 
             let port = transport.local_addr().expect("Failed to get port").port();
             println!("QUIC Transport listening on port {}", port);
