@@ -397,7 +397,8 @@ export default function App() {
   
   untrustedPeers.forEach(p => {
       // Skip own network
-      if (p.network_name === myNetworkName) return;
+      // if (p.network_name === myNetworkName) return;
+
       
       const name = p.network_name || "Unidentified";
       if (!grouped[name]) grouped[name] = [];

@@ -19,6 +19,7 @@ use storage::{
 };
 use tauri::{Emitter, Manager};
 use transport::Transport;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 // Helper to broadcast a new peer to all known peers (Gossip)
 fn gossip_peer(
@@ -93,6 +94,43 @@ fn get_local_ip() -> String {
 
 use ipnetwork::IpNetwork;
 
+// Signature Helpers
+fn generate_signature(key: &[u8; 32], id: &str) -> Option<String> {
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let payload = format!("{}:{}", id, ts);
+    if let Ok(encrypted) = crypto::encrypt(key, payload.as_bytes()) {
+        return Some(BASE64.encode(encrypted));
+    }
+    None
+}
+
+fn verify_signature(key: &[u8; 32], id: &str, signature: &str) -> bool {
+    if let Ok(encrypted) = BASE64.decode(signature) {
+         if let Ok(decrypted) = crypto::decrypt(key, &encrypted) {
+             if let Ok(payload) = String::from_utf8(decrypted) {
+                 // Payload: "ID:TIMESTAMP"
+                 let parts: Vec<&str> = payload.split(':').collect();
+                 if parts.len() == 2 {
+                     if parts[0] == id {
+                         if let Ok(ts) = parts[1].parse::<u64>() {
+                             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                             // Allow 60s skew/replay window
+                             if now >= ts && (now - ts) < 60 {
+                                 return true;
+                             }
+                             // Also allow minor clock drift (future timestamp)? 
+                             if ts > now && (ts - now) < 10 {
+                                 return true;
+                             }
+                         }
+                     }
+                 }
+             }
+         }
+    }
+    false
+}
+
 // Helper to probe a specific IP/Port
 async fn probe_ip(
     ip: std::net::IpAddr,
@@ -117,6 +155,16 @@ async fn probe_ip(
 
     let local_id = state.local_device_id.lock().unwrap().clone();
     let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
+    let network_name = state.network_name.lock().unwrap().clone();
+
+    let mut signature = None;
+    if let Some(key_vec) = state.cluster_key.lock().unwrap().as_ref() {
+        if key_vec.len() == 32 {
+            let mut key_arr = [0u8; 32];
+            key_arr.copy_from_slice(key_vec);
+            signature = generate_signature(&key_arr, &local_id);
+        }
+    }
     
     // Send OUR info so they can add us.
     let my_peer = Peer {
@@ -127,7 +175,8 @@ async fn probe_ip(
         last_seen: 0,
         is_trusted: false, // We don't know if we are trusted yet
         is_manual: true,
-        network_name: None,
+        network_name: Some(network_name),
+        signature,
     };
 
     let msg = Message::PeerDiscovery(my_peer);
@@ -151,6 +200,7 @@ async fn probe_ip(
                 is_trusted: false, // Untrusted! User must Join.
                 is_manual: true,
                 network_name: Some("Found!".to_string()),
+                signature: None,
             };
 
             state.add_peer(peer.clone());
@@ -510,6 +560,7 @@ pub fn run() {
                                         is_trusted: is_known,
                                         is_manual: false, // Discovered via mDNS
                                         network_name: network_name_prop,
+                                        signature: None,
                                     };
 
                                     d_state.add_peer(peer.clone());
@@ -648,6 +699,7 @@ pub fn run() {
                                                                              is_trusted: true,
                                                                              is_manual: false,
                                                                              network_name: Some(network_name),
+                                                                             signature: None,
                                                                          };
                                                                          kp_lock.insert(device_id.clone(), p.clone());
                                                                          save_known_peers(listener_handle.app_handle(), &kp_lock);
@@ -776,6 +828,7 @@ pub fn run() {
                                          should_reply = true;
                                      } else {
                                          // If we DO know them, preserve OUR trust state!
+                                         // If we DO know them, preserve OUR trust state!
                                          // The heartbeat usually sends is_trusted: false (self-report), 
                                          // but we shouldn't downgrade a trusted peer just because they said so.
                                          if let Some(existing) = kp_lock.get(&peer.id) {
@@ -787,6 +840,23 @@ pub fn run() {
                                          }
                                      }
                                      
+                                     // Signature Verification (Auto-Trust)
+                                     // If they provided a valid signature proving they have the Cluster Key, trust them!
+                                     if !peer.is_trusted {
+                                         if let Some(sig) = &peer.signature {
+                                             if let Some(key_vec) = listener_state.cluster_key.lock().unwrap().as_ref() {
+                                                 if key_vec.len() == 32 {
+                                                     let mut key_arr = [0u8; 32];
+                                                     key_arr.copy_from_slice(key_vec);
+                                                     if verify_signature(&key_arr, &peer.id, sig) {
+                                                         println!("Verified Signature for {}! Auto-trusting.", peer.id);
+                                                         peer.is_trusted = true;
+                                                     }
+                                                 }
+                                             }
+                                         }
+                                     }
+
                                      // Insert the Real Peer (Update info even if known)
                                      kp_lock.insert(peer.id.clone(), peer.clone());
                                      save_known_peers(listener_handle.app_handle(), &kp_lock);
@@ -799,6 +869,16 @@ pub fn run() {
                                     println!("Sending Discovery Reply to {}", addr);
                                     let local_id = listener_state.local_device_id.lock().unwrap().clone();
                                     let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
+                                    let network_name = listener_state.network_name.lock().unwrap().clone();
+                                    
+                                    let mut signature = None;
+                                    if let Some(key_vec) = listener_state.cluster_key.lock().unwrap().as_ref() {
+                                        if key_vec.len() == 32 {
+                                            let mut key_arr = [0u8; 32];
+                                            key_arr.copy_from_slice(key_vec);
+                                            signature = generate_signature(&key_arr, &local_id);
+                                        }
+                                    }
                                     
                                     let my_peer = Peer {
                                         id: local_id,
@@ -809,7 +889,8 @@ pub fn run() {
                                         last_seen: 0,
                                         is_trusted: false, // We aren't trusted yet
                                         is_manual: true,
-                                        network_name: Some(listener_state.network_name.lock().unwrap().clone()),
+                                        network_name: Some(network_name),
+                                        signature,
                                     };
                                     
                                     let msg = Message::PeerDiscovery(my_peer);
@@ -881,6 +962,15 @@ pub fn run() {
                     let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
                     let network_name = hb_state.network_name.lock().unwrap().clone();
 
+                    let mut signature = None;
+                    if let Some(key_vec) = hb_state.cluster_key.lock().unwrap().as_ref() {
+                        if key_vec.len() == 32 {
+                            let mut key_arr = [0u8; 32];
+                            key_arr.copy_from_slice(key_vec);
+                            signature = generate_signature(&key_arr, &local_id);
+                        }
+                    }
+
                     // Self Peer (for payload)
                     let my_peer = Peer {
                         id: local_id,
@@ -891,6 +981,7 @@ pub fn run() {
                         is_trusted: false, 
                         is_manual: true,
                         network_name: Some(network_name),
+                        signature,
                     };
                     
                     let msg = Message::PeerDiscovery(my_peer);

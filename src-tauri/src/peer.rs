@@ -12,4 +12,7 @@ pub struct Peer {
     // Network Name (discovered via mDNS)
     #[serde(default)]
     pub network_name: Option<String>,
+    // Cluster Authentication Signature (Base64)
+    #[serde(default)]
+    pub signature: Option<String>,
 } // timestamp for pruning old peers
