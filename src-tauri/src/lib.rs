@@ -533,14 +533,19 @@ async fn start_pairing(
 
 // Helper to wipe state and restart network identity
 fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppState, port: u16) {
-    // 1. Reset Config on Disk
-    reset_network_state(app_handle);
-    
     // 2. Clear Runtime State & Generate New Identity
     {
+        // ACQUIRE LOCKS FIRST
+        // This prevents background tasks (like Pruning or Heartbeat) from 
+        // reading/writing stale state while we are resetting.
         let mut kp = state.known_peers.lock().unwrap();
-        kp.clear();
         let mut peers = state.peers.lock().unwrap();
+        
+        // 1. Reset Config on Disk
+        // Now safe because we hold the locks that background tasks would need to write back.
+        reset_network_state(app_handle);
+
+        kp.clear();
         // Don't clear peers! mDNS has already discovered them. 
         // Just mark them as untrusted so they show up in "Nearby Networks".
         for p in peers.values_mut() {
