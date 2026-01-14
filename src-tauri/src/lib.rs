@@ -1147,8 +1147,10 @@ pub fn run() {
                     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                     
                     let peers: Vec<Peer> = {
-                        let kp = hb_state.known_peers.lock().unwrap();
-                        kp.values().cloned().collect()
+                        // FIX: Heartbeat ALL runtime peers, not just known (connected) ones.
+                        // This prevents pruning of discovered-but-not-yet-trusted peers.
+                        let peers_map = hb_state.get_peers();
+                        peers_map.values().cloned().collect()
                     };
 
                     if peers.is_empty() { continue; }
