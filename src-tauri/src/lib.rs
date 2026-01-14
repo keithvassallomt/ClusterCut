@@ -19,6 +19,7 @@ use storage::{
 };
 use tauri::{Emitter, Manager};
 use transport::Transport;
+use tauri_plugin_notification::NotificationExt;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 // Helper to broadcast a new peer to all known peers (Gossip)
@@ -309,6 +310,17 @@ async fn probe_ip(
                  save_known_peers(&app_handle, &kp);
             }
             let _ = app_handle.emit("peer-update", &peer);
+
+            // Trigger Notification
+            {
+                if state.settings.lock().unwrap().notifications.device_join {
+                    let _ = app_handle.notification()
+                        .builder()
+                        .title("New Device Found")
+                        .body(format!("{} has joined the network", peer.hostname))
+                        .show();
+                }
+            }
         }
         _ => {
             // println!("Probe to {} failed or timed out.", addr);
@@ -546,6 +558,7 @@ pub fn run() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState::new())
         .setup(|app| {
 // Initialize QUIC Transport (Fixed Port 4654 for Discovery, or random fallback)
@@ -684,6 +697,17 @@ pub fn run() {
 
                                     d_state.add_peer(peer.clone());
                                     let _ = d_handle.emit("peer-update", &peer);
+
+                                    // Trigger Notification
+                                    {
+                                        if d_state.settings.lock().unwrap().notifications.device_join {
+                                           let _ = d_handle.notification()
+                                               .builder()
+                                               .title("New Device Found")
+                                               .body(format!("{} has joined the network", peer.hostname))
+                                               .show();
+                                        }
+                                    }
                                     // Lock drops here
                                 }
                             }

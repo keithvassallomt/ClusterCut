@@ -40,4 +40,5 @@ names = "0.14.0"
 hostname = "0.4"
 ipnetwork = "0.21.1"
 futures = "0.3.31"
+tauri-plugin-notification = "2.3.3"
 
