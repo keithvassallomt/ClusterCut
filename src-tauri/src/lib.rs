@@ -997,11 +997,30 @@ pub fn run() {
                             }
                             Message::PeerDiscovery(mut peer) => {
                                 println!("Received PeerDiscovery for {}", peer.hostname);
+                                
+                                // 0. Self Filter (Issue C)
+                                let local_id = listener_state.local_device_id.lock().unwrap().clone();
+                                if peer.id == local_id {
+                                    return;
+                                }
+
                                 // TRUST THE PACKET SOURCE for IP/Port (fixes 0.0.0.0 issue)
                                 peer.ip = addr.ip();
                                 peer.port = addr.port();
                                 peer.last_seen = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                                peer.is_manual = true; 
+                                
+                                // 1. Fix is_manual Logic (Issue A)
+                                // Do NOT unconditionally set is_manual = true.
+                                // If we already know them, preserve the flag. If new, default to FALSE (Auto) unless explicitly Manual.
+                                {
+                                    let kp = listener_state.known_peers.lock().unwrap();
+                                    if let Some(existing) = kp.get(&peer.id) {
+                                         peer.is_manual = existing.is_manual;
+                                    } else {
+                                         // New peer via Gossip/Heartbeat -> Assume Auto Discovered
+                                         peer.is_manual = false; 
+                                    }
+                                }
                                 
                                 let mut should_reply = false;
                                 {
@@ -1015,10 +1034,11 @@ pub fn run() {
                                          kp_lock.remove(&manual_id);
                                          listener_state.peers.lock().unwrap().remove(&manual_id);
                                          let _ = listener_handle.emit("peer-remove", &manual_id);
-                                         should_reply = true; // We initiated this connection via placeholder, so we should finish the handshake
+                                         should_reply = true; 
+                                         // If we had a manual placeholder, it means User Added IP -> So this IS manual
+                                         peer.is_manual = true;
                                      }
                                      
-                                     // If we don't know them at all, reply!
                                      // If we don't know them at all, reply!
                                      if !kp_lock.contains_key(&peer.id) {
                                          should_reply = true;
@@ -1026,9 +1046,6 @@ pub fn run() {
 
                                      // Trust Arbitration
                                      // Rule: Trust is strictly based on Key Possession (Signature).
-                                     // If signature is valid -> Trust (Grant or Renew).
-                                     // If signature is invalid/missing -> Distrust (Revoke or Ignore).
-                                     
                                      let mut is_signature_valid = false;
                                      if let Some(sig) = &peer.signature {
                                          if let Some(key_vec) = listener_state.cluster_key.lock().unwrap().as_ref() {
@@ -1048,7 +1065,6 @@ pub fn run() {
                                          peer.is_trusted = true;
                                      } else {
                                          // Invalid/Missing Signature: We DO NOT TRUST this peer.
-                                         // If we previously trusted them, this REVOKES trust (e.g. they reset/left).
                                          if let Some(existing) = kp_lock.get(&peer.id) {
                                              if existing.is_trusted {
                                                 println!("Revoking Trust for {}: Invalid/Missing Signature.", peer.id);
@@ -1057,11 +1073,24 @@ pub fn run() {
                                          peer.is_trusted = false;
                                      }
 
-                                     // Insert the Real Peer (Update info even if known)
-                                     kp_lock.insert(peer.id.clone(), peer.clone());
-                                     save_known_peers(listener_handle.app_handle(), &kp_lock);
+                                     // 2. Persistence Logic (Issue B)
+                                     // Update Runtime State ALWAYS
                                      listener_state.add_peer(peer.clone());
                                      let _ = listener_handle.emit("peer-update", &peer);
+
+                                     if peer.is_trusted || peer.is_manual {
+                                         // PERSIST only if Trusted or explicitly Manual
+                                         kp_lock.insert(peer.id.clone(), peer.clone());
+                                         save_known_peers(listener_handle.app_handle(), &kp_lock);
+                                     } else {
+                                         // Untrusted Auto-Discovered -> Memory Only.
+                                         // If it WAS persisted (e.g. formerly trusted), REMOVE it from disk.
+                                         if kp_lock.contains_key(&peer.id) {
+                                             println!("Removing untrusted auto-peer {} from persistence.", peer.id);
+                                             kp_lock.remove(&peer.id);
+                                             save_known_peers(listener_handle.app_handle(), &kp_lock);
+                                         }
+                                     }
                                 }
                                 
                                 // Send OUR info back so they can update their placeholder!
