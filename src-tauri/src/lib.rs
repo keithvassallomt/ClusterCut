@@ -1285,6 +1285,15 @@ pub fn run() {
                                     return;
                                 }
 
+                                // FIX: Cancel pending removal if we receive a Heartbeat!
+                                // If mDNS said "Service Removed" but we just got a packet from them, they are NOT gone.
+                                {
+                                    let mut pending = listener_state.pending_removals.lock().unwrap();
+                                    if pending.remove(&peer.id).is_some() {
+                                        tracing::info!("[Discovery] Cancelled pending removal for {} due to Heartbeat/Packet.", peer.id);
+                                    }
+                                }
+
                                 // TRUST THE PACKET SOURCE for IP/Port (fixes 0.0.0.0 issue)
                                 peer.ip = addr.ip();
                                 peer.port = addr.port();
