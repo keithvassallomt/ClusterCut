@@ -165,6 +165,26 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
 }
 
 pub fn set_clipboard(app: &AppHandle, text: String) {
+    // First, check if the clipboard already contains this exact text.
+    // This prevents a race condition on macOS where:
+    // 1. User copies text -> ClusterCut broadcasts it
+    // 2. Remote peer receives and relays back
+    // 3. We receive our own content and call set_clipboard
+    // 4. arboard's clearContents() + writeObjects() is NOT atomic
+    // 5. Between clear and write, the pasteboard is empty
+    // 6. User tries to paste -> nothing there!
+    //
+    // By checking BEFORE writing, we avoid the unnecessary clear+write cycle.
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+
+    match app.clipboard().read_text() {
+        Ok(current) if current == text => {
+            tracing::debug!("Clipboard already contains this text, skipping write to avoid race condition");
+            return;
+        }
+        _ => {}
+    }
+
     let text_clone = text.clone();
 
     // Mark this content as "to be ignored" by the monitor
@@ -174,27 +194,9 @@ pub fn set_clipboard(app: &AppHandle, text: String) {
     }
 
     // Use Tauri Clipboard Plugin (Main Thread Safe)
-    use tauri_plugin_clipboard_manager::ClipboardExt;
     if let Err(e) = app.clipboard().write_text(text.clone()) {
         tracing::error!("Failed to set clipboard via Tauri Plugin: {}", e);
     } else {
         tracing::debug!("Successfully set local clipboard content via Tauri Plugin.");
-
-        // VERIFICATION: Read back to ensure it stuck
-        thread::sleep(Duration::from_millis(100));
-        match app.clipboard().read_text() {
-            Ok(read_val) => {
-                if read_val == text {
-                    tracing::debug!("VERIFICATION: Clipboard write confirmed.");
-                } else {
-                    tracing::warn!(
-                        "VERIFICATION FAILED: Expected '{}', got '{}'",
-                        text,
-                        read_val
-                    );
-                }
-            }
-            Err(e) => tracing::error!("VERIFICATION ERROR: Could not read clipboard: {}", e),
-        }
     }
 }

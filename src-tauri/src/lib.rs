@@ -1056,13 +1056,26 @@ pub fn run() {
                                                      return;
                                                 };
 
+                                                // Self-sender check: Don't process our own clipboard messages
+                                                // This can happen in relay scenarios or network loops
+                                                {
+                                                    let my_hostname = get_hostname_internal();
+                                                    if sender == my_hostname {
+                                                        tracing::debug!("Ignoring clipboard message from self (sender={})", sender);
+                                                        return;
+                                                    }
+                                                }
+
                                                 // Loop Check
                                                 {
                                                     let mut last = listener_state.last_clipboard_content.lock().unwrap();
-                                                    if *last == text { return; }
+                                                    if *last == text {
+                                                        tracing::debug!("Ignoring clipboard message - content matches last_clipboard_content");
+                                                        return;
+                                                    }
                                                     *last = text.clone();
                                                 }
-                                                
+
                                                 // Check Auto-Receive Setting
                                                 tracing::debug!("Decrypted Clipboard from {}: {}...", sender, if text.len() > 20 { &text[0..20] } else { &text }); // Truncate for log
                                                 
