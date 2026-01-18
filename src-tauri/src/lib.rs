@@ -813,7 +813,7 @@ pub fn run() {
                 let mut device_id = load_device_id(app_handle);
                 if device_id.is_empty() {
                     let run_id: u32 = rand::thread_rng().gen();
-                    device_id = format!("ucp-{}", run_id);
+                    device_id = format!("clustercut-{}", run_id);
                     save_device_id(app_handle, &device_id);
                     tracing::info!("Generated new Device ID: {}", device_id);
                 } else {

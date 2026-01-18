@@ -23,7 +23,7 @@ impl Transport {
     }
 
     pub async fn send_message(&self, addr: SocketAddr, data: &[u8]) -> Result<(), Box<dyn Error>> {
-        let connection = self.endpoint.connect(addr, "ucp-local")?.await?;
+        let connection = self.endpoint.connect(addr, "clustercut-transport")?.await?;
         let (mut send, _recv) = connection.open_bi().await?; // Rename recv to _recv
 
         send.write_all(data).await?;
@@ -100,7 +100,7 @@ impl Transport {
 }
 
 fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
-    let cert = generate_simple_self_signed(vec!["ucp-local".into()])?;
+    let cert = generate_simple_self_signed(vec!["clustercut-transport".into()])?;
     Ok((cert.cert.der().to_vec(), cert.signing_key.serialize_der()))
 }
 
