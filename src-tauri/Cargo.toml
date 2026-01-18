@@ -46,4 +46,5 @@ tracing-appender = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 uuid = { version = "1.19.0", features = ["v4", "fast-rng", "serde"] }
 tauri-plugin-clipboard-manager = "2.3.2"
+arboard = "3.6.1"
 
