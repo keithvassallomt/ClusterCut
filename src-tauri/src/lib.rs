@@ -1224,8 +1224,16 @@ pub fn run() {
                                             let mut sessions = listener_state.handshake_sessions.lock().unwrap();
                                             sessions.insert(addr.to_string(), session_key);
                                         }
-                                        Err(e) => tracing::error!("Auth Failed: {}", e),
+                                        Err(e) => {
+                                            tracing::error!("Auth Failed: {}", e);
+                                            // Notify frontend that pairing failed (likely wrong PIN)
+                                            let _ = listener_handle.emit("pairing-failed", "Authentication failed. Check the PIN and try again.");
+                                        }
                                     }
+                                } else {
+                                    // No pending handshake found - might be a stale response
+                                    tracing::warn!("Received PairResponse but no pending handshake found for {}", addr);
+                                    let _ = listener_handle.emit("pairing-failed", "Pairing session expired. Please try again.");
                                 }
                             }
                             Message::Welcome { encrypted_cluster_key, known_peers, network_name, network_pin } => {
@@ -1287,11 +1295,18 @@ pub fn run() {
                                                 }
                                                 save_known_peers(listener_handle.app_handle(), &kp_lock);
                                             }
-                                            Err(e) => tracing::error!("Decryption Error: {}", e),
+                                            Err(e) => {
+                                                tracing::error!("Decryption Error: {}", e);
+                                                let _ = listener_handle.emit("pairing-failed", "Failed to join network. The PIN may be incorrect.");
+                                            }
                                         }
                                     } else {
                                         tracing::error!("Decryption Error: No Cluster Key loaded.");
+                                        let _ = listener_handle.emit("pairing-failed", "Session key error. Please try again.");
                                     }
+                                } else {
+                                    tracing::warn!("Received Welcome but no session key found for {}", addr);
+                                    let _ = listener_handle.emit("pairing-failed", "Pairing session expired. Please try again.");
                                 }
                             }
                             Message::PeerDiscovery(mut peer) => {

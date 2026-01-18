@@ -419,6 +419,12 @@ export default function App() {
         invoke<string>("get_network_pin").then(pin => setNetworkPin(pin));
     });
 
+    const unlistenPairingFailed = listen<string>("pairing-failed", (event) => {
+        // Show error in the join modal
+        setJoinError(event.payload);
+        setJoinBusy(false);
+    });
+
     return () => {
       unlistenPeer.then((f) => f());
       unlistenClipboard.then((f) => f());
@@ -426,6 +432,7 @@ export default function App() {
       unlistenReset.then((f) => f());
       unlistenUpdate.then((f) => f());
       unlistenDelete.then((f) => f());
+      unlistenPairingFailed.then((f) => f());
     };
   }, []);
 
@@ -671,17 +678,22 @@ export default function App() {
               <input
                 className={clsx(
                     "mt-2 h-12 w-full rounded-2xl border bg-white px-4 font-mono text-lg tracking-[0.25em] text-zinc-900 outline-none focus:ring-2 dark:bg-zinc-950 dark:text-zinc-50",
-                    joinError 
-                        ? "border-rose-500 focus:ring-rose-500/40 dark:border-rose-500/50" 
+                    joinError
+                        ? "border-rose-500 focus:ring-rose-500/40 dark:border-rose-500/50"
                         : "border-zinc-900/10 focus:ring-emerald-500/40 dark:border-white/10"
                 )}
                 placeholder="••••••"
                 value={joinPin}
                 onChange={(e) => {
-                    setJoinPin(e.target.value.trim()); 
-                    setJoinError(""); 
+                    setJoinPin(e.target.value.trim());
+                    setJoinError("");
                 }}
+                onKeyDown={(e) => e.key === "Enter" && submitJoin()}
                 autoFocus
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
               />
               {joinError && (
                   <div className="mt-2 text-sm font-medium text-rose-600 dark:text-rose-400">
