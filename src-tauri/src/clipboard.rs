@@ -2,10 +2,9 @@ use crate::crypto;
 use crate::protocol::Message;
 use crate::state::AppState;
 use crate::transport::Transport;
-// use arboard::Clipboard;
+use arboard::Clipboard;
 use std::{thread, time::Duration};
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_clipboard_manager::ClipboardExt;
 
 // Use a shared cache to avoid feedback loops
 use once_cell::sync::Lazy;
@@ -13,46 +12,20 @@ use std::sync::{Arc, Mutex};
 
 static IGNORED_TEXT: Lazy<Arc<Mutex<Option<String>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
-/// Read clipboard text in a thread-safe manner.
-/// On macOS, NSPasteboard is NOT thread-safe and must be accessed from the main thread.
-/// Accessing it from background threads can cause the clipboard to be corrupted or cleared.
-/// This function dispatches the read to the main thread on macOS.
-fn read_clipboard_safe(app_handle: &AppHandle) -> Result<String, String> {
-    #[cfg(target_os = "macos")]
-    {
-        // macOS: NSPasteboard must be accessed from the main thread
-        // Use a std channel since we're in a sync context
-        let (tx, rx) = std::sync::mpsc::channel();
-        let app_clone = app_handle.clone();
-
-        if let Err(e) = app_handle.run_on_main_thread(move || {
-            let result = app_clone.clipboard().read_text();
-            let _ = tx.send(result);
-        }) {
-            return Err(format!("Failed to dispatch to main thread: {}", e));
-        }
-
-        // Wait for result with timeout to avoid deadlocks
-        match rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(text)) => Ok(text),
-            Ok(Err(e)) => Err(format!("Clipboard read error: {}", e)),
-            Err(_) => Err("Timeout waiting for clipboard read".to_string()),
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        // On other platforms, direct access is fine
-        app_handle.clipboard().read_text().map_err(|e| e.to_string())
-    }
-}
-
 pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transport) {
     thread::spawn(move || {
-        let mut last_text = match read_clipboard_safe(&app_handle) {
-            Ok(t) => t,
-            _ => String::new(),
+        // Create a dedicated Clipboard instance for this thread
+        // This is the key fix: each thread needs its own arboard::Clipboard instance
+        // The Tauri plugin shares one instance which causes issues on macOS
+        let mut clipboard = match Clipboard::new() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to initialize clipboard for monitor: {}", e);
+                return;
+            }
         };
+
+        let mut last_text = clipboard.get_text().unwrap_or_default();
 
         // Polling loop
         loop {
@@ -62,8 +35,8 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 break;
             }
 
-            // Use thread-safe clipboard read (dispatches to main thread on macOS)
-            if let Ok(text) = read_clipboard_safe(&app_handle) {
+            // Read clipboard using our dedicated instance
+            if let Ok(text) = clipboard.get_text() {
                 // Check if this text should be ignored (because we just set it)
                 let should_ignore = {
                     let ignored = IGNORED_TEXT.lock().unwrap();
@@ -204,56 +177,35 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
     });
 }
 
-pub fn set_clipboard(app: &AppHandle, text: String) {
-    // First, check if the clipboard already contains this exact text.
-    // This prevents a race condition on macOS where:
-    // 1. User copies text -> ClusterCut broadcasts it
-    // 2. Remote peer receives and relays back
-    // 3. We receive our own content and call set_clipboard
-    // 4. arboard's clearContents() + writeObjects() is NOT atomic
-    // 5. Between clear and write, the pasteboard is empty
-    // 6. User tries to paste -> nothing there!
-    //
-    // By checking BEFORE writing, we avoid the unnecessary clear+write cycle.
-
-    // Use thread-safe read
-    match read_clipboard_safe(app) {
-        Ok(current) if current == text => {
-            tracing::debug!("Clipboard already contains this text, skipping write to avoid race condition");
-            return;
-        }
-        _ => {}
-    }
-
+pub fn set_clipboard(_app: &AppHandle, text: String) {
     let text_clone = text.clone();
 
-    // Mark this content as "to be ignored" by the monitor
-    {
-        let mut ignored = IGNORED_TEXT.lock().unwrap();
-        *ignored = Some(text_clone);
-    }
+    // Spawn a thread to set clipboard to avoid blocking the caller
+    // Each write operation gets its own Clipboard instance (like the original working code)
+    thread::spawn(move || {
+        match Clipboard::new() {
+            Ok(mut clipboard) => {
+                // First check if clipboard already has this content to avoid unnecessary writes
+                if let Ok(current) = clipboard.get_text() {
+                    if current == text {
+                        tracing::debug!("Clipboard already contains this text, skipping write");
+                        return;
+                    }
+                }
 
-    // Write clipboard - dispatch to main thread on macOS
-    #[cfg(target_os = "macos")]
-    {
-        let app_clone = app.clone();
-        if let Err(e) = app.run_on_main_thread(move || {
-            if let Err(e) = app_clone.clipboard().write_text(text) {
-                tracing::error!("Failed to set clipboard via Tauri Plugin: {}", e);
-            } else {
-                tracing::debug!("Successfully set local clipboard content via Tauri Plugin.");
+                // Mark this content as "to be ignored" by the monitor
+                {
+                    let mut ignored = IGNORED_TEXT.lock().unwrap();
+                    *ignored = Some(text_clone);
+                }
+
+                if let Err(e) = clipboard.set_text(&text) {
+                    tracing::error!("Failed to set clipboard: {}", e);
+                } else {
+                    tracing::debug!("Successfully set local clipboard content.");
+                }
             }
-        }) {
-            tracing::error!("Failed to dispatch clipboard write to main thread: {}", e);
+            Err(e) => tracing::error!("Failed to init clipboard for write: {}", e),
         }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        if let Err(e) = app.clipboard().write_text(text) {
-            tracing::error!("Failed to set clipboard via Tauri Plugin: {}", e);
-        } else {
-            tracing::debug!("Successfully set local clipboard content via Tauri Plugin.");
-        }
-    }
+    });
 }
