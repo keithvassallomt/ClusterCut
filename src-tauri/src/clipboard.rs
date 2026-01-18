@@ -174,44 +174,6 @@ pub fn set_clipboard(app: &AppHandle, text: String) {
         *ignored = Some(text_clone);
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        tracing::debug!("Using pbcopy for macOS clipboard write...");
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
-        let mut child = Command::new("pbcopy")
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn pbcopy");
-
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(text.as_bytes()) {
-                tracing::error!("Failed to write to pbcopy stdin: {}", e);
-            }
-        }
-
-        if let Err(e) = child.wait() {
-            tracing::error!("pbcopy failed to exit: {}", e);
-        } else {
-            tracing::debug!("pbcopy executed successfully.");
-            // Verification
-            thread::sleep(Duration::from_millis(200));
-            use tauri_plugin_clipboard_manager::ClipboardExt;
-            match app.clipboard().read_text() {
-                Ok(read_val) => {
-                    if read_val == text {
-                        tracing::debug!("VERIFICATION (pbcopy): Confirmed.");
-                    } else {
-                        tracing::warn!("VERIFICATION (pbcopy) FAILED: Got '{}'", read_val);
-                    }
-                }
-                Err(e) => tracing::error!("VERIFICATION ERROR: {}", e),
-            }
-        }
-        return;
-    }
-
     // Use Tauri Clipboard Plugin (Main Thread Safe)
     use tauri_plugin_clipboard_manager::ClipboardExt;
     if let Err(e) = app.clipboard().write_text(text.clone()) {
@@ -231,21 +193,6 @@ pub fn set_clipboard(app: &AppHandle, text: String) {
                         text,
                         read_val
                     );
-                    // Fallback: Try pbcopy (macOS specific hack for debugging)
-                    #[cfg(target_os = "macos")]
-                    {
-                        tracing::warn!("Attempting fallback to pbcopy...");
-                        use std::io::Write;
-                        use std::process::{Command, Stdio};
-                        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn()
-                        {
-                            if let Some(mut stdin) = child.stdin.take() {
-                                let _ = stdin.write_all(text.as_bytes());
-                            }
-                            let _ = child.wait();
-                            tracing::info!("Fallback pbcopy executed.");
-                        }
-                    }
                 }
             }
             Err(e) => tracing::error!("VERIFICATION ERROR: Could not read clipboard: {}", e),
