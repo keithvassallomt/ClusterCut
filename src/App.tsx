@@ -307,16 +307,25 @@ export default function App() {
   const [expandedNetworks, setExpandedNetworks] = useState<Set<string>>(new Set());
   
   // Manual Sync State
+  // Manual Sync State
   const [manualSyncOpen, setManualSyncOpen] = useState(false);
   const [pendingReceive, setPendingReceive] = useState<{ text: string, sender: string, timestamp: number } | null>(null);
   const [localClipboard, setLocalClipboard] = useState(""); // Current local
   const [lastSentClipboard, setLastSentClipboard] = useState(""); // Last successfully sent
+  const [lastReceivedClipboard, setLastReceivedClipboard] = useState(""); // Last received from cluster
+
   // We need to know if Auto-Send is ON/OFF to decide if we show "Pending Send"
   const [isAutoSend, setIsAutoSend] = useState(true); // Default assumption, updated by Settings
-  // We need to know if Auto-Receive is ON/OFF (though backend handles pending, UI might want state)
   
-  const hasPendingSend = !isAutoSend && localClipboard !== lastSentClipboard && localClipboard.length > 0;
-  const hasPendingReceive = !!pendingReceive;
+  // Rule 2: If local matches last received, not a candidate for sending.
+  const hasPendingSend = !isAutoSend 
+      && localClipboard !== lastSentClipboard 
+      && localClipboard !== lastReceivedClipboard
+      && localClipboard.length > 0;
+
+  // Rule 3: If pending receive matches local (already have it or I sent it), not a candidate.
+  const hasPendingReceive = !!pendingReceive 
+      && pendingReceive.text !== localClipboard;
   
   const toggleNetwork = (name: string) => {
       setExpandedNetworks(prev => {
@@ -401,19 +410,22 @@ export default function App() {
 
       // Update Local Clipboard State
       // If sender is ME, I just copied it or sent it.
-      // Ideally "get_hostname" is async so we can't easily check synchronously here.
-      // But we can check if it MATCHES `myHostname` state (which is loaded on mount).
       if (myHostname && payloadSender === myHostname) {
            setLocalClipboard(payloadText);
-           // If I just SENT it (via manual send), we update `lastSent` elsewhere?
-           // OR if Auto-Send is ON, we assume it's sent?
-           // Actually, if Auto-Send is OFF, `clipboard-change` still fires for local copy.
-           // We don't update `lastSent` here yet.
+           // If I sent it, we can technically mark it as sent?
+           // The user says "When data ... was sent ... it should not be a candidate for receiving".
+           // Updating localClipboard addresses "not candidate for receiving" (via hasPendingReceive logic below).
+           
+           // Should we update lastSentClipboard?
+           // If 'clipboard-change' event implies successful broadcast (Auto-Send ON), then yes.
+           // If Auto-Send is OFF, this event fires just for local copy. We shouldn't update lastSentClipboard.
+           if (isAutoSend) {
+               setLastSentClipboard(payloadText);
+           }
       } else {
-           // Remote sender means I received and APPLIED it.
-           // So local clipboard NOW matches this text.
+           // Remote sender
            setLocalClipboard(payloadText);
-           // And since I didn't send it, `lastSent` is irrelevant (or remains whatever I last sent).
+           setLastReceivedClipboard(payloadText);
       }
       
       // Update History
@@ -1512,7 +1524,7 @@ function ManualSyncFAB({
     return (
         <button
              onClick={onClick}
-             className="fixed bottom-6 right-6 z-50 flex h-14 w-14 animate-bounce items-center justify-center rounded-full bg-emerald-600 text-white shadow-xl shadow-emerald-600/30 transition hover:scale-105 hover:bg-emerald-500 focus:outline-none focus:ring-4 focus:ring-emerald-500/30"
+             className="fixed bottom-6 right-6 z-50 flex h-14 w-14 items-center justify-center rounded-full bg-emerald-600 text-white shadow-xl shadow-emerald-600/30 transition hover:scale-105 hover:bg-emerald-500 focus:outline-none focus:ring-4 focus:ring-emerald-500/30"
         >
              {hasPendingReceive ? (
                  <ArrowDown className="h-6 w-6" />
