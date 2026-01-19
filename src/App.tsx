@@ -326,7 +326,7 @@ export default function App() {
   // Rule 3: If pending receive matches local (already have it or I sent it), not a candidate.
   const hasPendingReceive = !!pendingReceive 
       && pendingReceive.text !== localClipboard;
-  
+      
   const toggleNetwork = (name: string) => {
       setExpandedNetworks(prev => {
           const next = new Set(prev);
@@ -373,6 +373,8 @@ export default function App() {
 
   // Listeners
   useEffect(() => {
+    if (!myHostname) return; // Wait for identity to prevent false "remote" detection
+
     const unlistenPeer = listen<Peer>("peer-update", (event) => {
       // If we just paired (trusted), refresh metadata
       if (event.payload.is_trusted) {
