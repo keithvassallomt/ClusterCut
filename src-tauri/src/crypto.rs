@@ -11,7 +11,7 @@ pub fn start_spake2(
     password: &str,
     _id_a: &str,
     _id_b: &str,
-) -> Result<(SpakeState, Vec<u8>), Box<dyn Error>> {
+) -> Result<(SpakeState, Vec<u8>), Box<dyn Error + Send + Sync>> {
     let (spake, msg) = Spake2::<Ed25519Group>::start_symmetric(
         &Password::new(password.as_bytes()),
         &Identity::new(b"clustercut-connect"),
@@ -20,7 +20,10 @@ pub fn start_spake2(
     Ok((SpakeState { spake }, msg))
 }
 
-pub fn finish_spake2(state: SpakeState, inbound_msg: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn finish_spake2(
+    state: SpakeState,
+    inbound_msg: &[u8],
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
     let key = state
         .spake
         .finish(inbound_msg)
@@ -28,7 +31,7 @@ pub fn finish_spake2(state: SpakeState, inbound_msg: &[u8]) -> Result<Vec<u8>, B
     Ok(key)
 }
 
-pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng); // 96-bits; unique per message
     let ciphertext = cipher
@@ -40,7 +43,10 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Box<dyn Erro
     Ok(result)
 }
 
-pub fn decrypt(key: &[u8; 32], ciphertext_with_nonce: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+pub fn decrypt(
+    key: &[u8; 32],
+    ciphertext_with_nonce: &[u8],
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
     if ciphertext_with_nonce.len() < 12 {
         return Err("Ciphertext too short".into());
     }

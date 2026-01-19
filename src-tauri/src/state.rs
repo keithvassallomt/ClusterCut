@@ -36,6 +36,11 @@ pub struct AppState {
     pub pending_clipboard: Arc<Mutex<Option<crate::protocol::ClipboardPayload>>>,
     // Shutdown flag for graceful termination of background threads
     pub shutdown: Arc<AtomicBool>,
+    // Mapping of Message ID -> File Paths (for serving file requests)
+    // Mapping of Message ID -> File Paths (for serving file requests)
+    pub local_files: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    // Transport instance for sending messages from commands
+    pub transport: Arc<Mutex<Option<crate::transport::Transport>>>,
 }
 
 impl AppState {
@@ -55,6 +60,8 @@ impl AppState {
             pending_removals: Arc::new(Mutex::new(HashMap::new())),
             pending_clipboard: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            local_files: Arc::new(Mutex::new(HashMap::new())),
+            transport: Arc::new(Mutex::new(None)),
         }
     }
 

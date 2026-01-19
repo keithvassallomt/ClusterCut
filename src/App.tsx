@@ -36,6 +36,8 @@ type HistoryItem = {
     device: string; // The sender's hostname
     ts: number; // Unix timestamp in seconds
     text: string;
+    files?: { name: string; size: number; }[];
+    sender_id?: string;
 };
 
 // Simple Time Ago Helper
@@ -394,54 +396,39 @@ export default function App() {
     });
 
     // Listen for Clipboard Changes
-    const unlistenClipboard = listen<string | { id: string, text: string, timestamp: number, sender: string }>("clipboard-change", (event) => {
-      let newItem: HistoryItem;
-      let payloadText = "";
-      let payloadSender = "Unknown";
-      let payloadId = "";
-      let payloadTs = Date.now();
-
-      if (typeof event.payload === 'string') {
-           payloadText = event.payload;
-           payloadId = Math.random().toString(36).substring(7);
-           payloadTs = Math.floor(Date.now() / 1000);
-      } else {
-           const p = event.payload;
-           payloadText = p.text;
-           payloadSender = p.sender;
-           payloadId = p.id;
-           payloadTs = p.timestamp;
-      }
+    const unlistenClipboard = listen<any>("clipboard-change", (event) => {
+      console.log("Clipboard Changed Event:", event.payload);
+      
+      const p = event.payload;
+      const isLocal = p.sender === "self" || p.sender === myHostname;
+      
+      // Construct History Item immediately
+      const newItem: HistoryItem = {
+          id: p.id,
+          origin: isLocal ? "local" : "remote",
+          device: p.sender,
+          sender_id: p.sender_id,
+          ts: p.timestamp,
+          text: p.text || "",
+          files: p.files
+      };
 
       // Update Local Clipboard State
-      // If sender is ME, I just copied it or sent it.
-      if (myHostname && payloadSender === myHostname) {
-           setLocalClipboard(payloadText);
-           // If I sent it, we can technically mark it as sent?
-           // The user says "When data ... was sent ... it should not be a candidate for receiving".
-           // Updating localClipboard addresses "not candidate for receiving" (via hasPendingReceive logic below).
-           
-           // Should we update lastSentClipboard?
-           // If 'clipboard-change' event implies successful broadcast (Auto-Send ON), then yes.
-           // If Auto-Send is OFF, this event fires just for local copy. We shouldn't update lastSentClipboard.
+      if (isLocal) {
+           // If it has text, update local view
+           if (newItem.text) setLocalClipboard(newItem.text);
            if (isAutoSend) {
-               setLastSentClipboard(payloadText);
+               if (newItem.text) setLastSentClipboard(newItem.text);
            }
       } else {
            // Remote sender
-           setLocalClipboard(payloadText);
-           setLastReceivedClipboard(payloadText);
+           if (newItem.text) {
+               setLocalClipboard(newItem.text);
+               setLastReceivedClipboard(newItem.text);
+           }
       }
       
       // Update History
-      newItem = {
-          id: payloadId,
-          origin: "remote", 
-          device: payloadSender,
-          ts: payloadTs,
-          text: payloadText
-      };
-
       setClipboardHistory((prev) => {
           // Dedupe by ID
           if (prev.find(i => i.id === newItem.id)) return prev;
@@ -1079,6 +1066,15 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
       }
   };
 
+  const handleFileRequest = async (fileId: string, idx: number, peerId: string) => {
+       try {
+           await invoke("request_file", { fileId, fileIndex: idx, peerId });
+           alert("Download started in background...");
+       } catch (e) {
+           alert("Download failed: " + e);
+       }
+  };
+
   return (
     <div className="space-y-5">
       <Card className="p-5">
@@ -1116,7 +1112,28 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
                     </Badge>
                     <span className="text-xs text-zinc-500 dark:text-zinc-400">{timeAgo(it.ts)}</span>
                   </div>
-                  <div className="mt-2 line-clamp-3 whitespace-pre-wrap text-sm text-zinc-900 dark:text-zinc-50">{it.text}</div>
+                  {it.text && <div className="mt-2 line-clamp-3 whitespace-pre-wrap text-sm text-zinc-900 dark:text-zinc-50">{it.text}</div>}
+                  
+                  {it.files && it.files.length > 0 && (
+                      <div className="mt-2 space-y-1">
+                          {it.files.map((f, idx) => (
+                              <div key={idx} className="flex items-center justify-between rounded-lg bg-zinc-50 p-2 text-sm dark:bg-zinc-800">
+                                  <div className="flex items-center gap-2 overflow-hidden">
+                                      <span className="truncate font-medium text-zinc-700 dark:text-zinc-300">{f.name}</span>
+                                      <span className="shrink-0 text-xs text-zinc-500">({(f.size / 1024 / 1024).toFixed(1)} MB)</span>
+                                  </div>
+                                  {!isMe && it.sender_id && (
+                                     <button 
+                                        className="shrink-0 text-xs font-medium text-emerald-600 hover:text-emerald-500 disabled:opacity-50"
+                                        onClick={() => handleFileRequest(it.id, idx, it.sender_id!)}
+                                     >
+                                        Download
+                                     </button>
+                                  )}
+                              </div>
+                          ))}
+                      </div>
+                  )}
                 </div>
 
                 <div className="flex items-center justify-end gap-2">

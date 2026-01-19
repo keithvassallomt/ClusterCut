@@ -10,8 +10,20 @@ mod transport;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState, ShortcutEvent};
-use tauri_plugin_clipboard_manager::ClipboardExt;
+
+use tauri_plugin_clipboard::Clipboard;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use std::str::FromStr;
+use std::path::{Path, PathBuf};
+use tokio::fs::File;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use futures::SinkExt;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
+use crate::protocol::{FileStreamHeader, Message, FileRequestPayload};
 
 
 #[derive(Parser, Debug)]
@@ -85,7 +97,7 @@ fn get_hostname_internal() -> String {
 }
 use discovery::Discovery;
 use peer::Peer;
-use protocol::{Message, ClipboardPayload};
+use protocol::ClipboardPayload;
 use rand::Rng;
 use state::AppState;
 use storage::{
@@ -685,7 +697,7 @@ async fn send_clipboard(
     clipboard::set_clipboard(&app_handle, text.clone()); // Update local clipboard too? Yes, usually.
     
     // Construct Payload
-    // let local_id = state.local_device_id.lock().unwrap().clone();
+    let local_id = state.local_device_id.lock().unwrap().clone();
     let hostname = get_hostname_internal();
     let msg_id = uuid::Uuid::new_v4().to_string();
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -695,6 +707,8 @@ async fn send_clipboard(
         text: text.clone(),
         timestamp: ts,
         sender: hostname,
+        sender_id: local_id,
+        files: None,
     };
 
     // Emit local event so history updates
@@ -804,7 +818,7 @@ pub fn run() {
     
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_clipboard::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(handle_shortcut).build())
         .manage(AppState::new())
@@ -1050,508 +1064,44 @@ pub fn run() {
             let listener_handle = app.handle().clone();
             let listener_state = (*app.state::<AppState>()).clone();
 
+            {
+                let mut t_lock = listener_state.transport.lock().unwrap();
+                *t_lock = Some(transport.clone());
+            }
 
             app.manage(transport.clone());
 
             // Start Listening
+            // Start Listening
             let transport_inside = transport.clone();
-            transport.start_listening(move |data, addr| {
-                tracing::trace!("Received {} bytes from {}", data.len(), addr);
-                
-                let listener_handle = listener_handle.clone();
-                let listener_state = listener_state.clone();
-                let transport_inside = transport_inside.clone();
+            let file_state = listener_state.clone();
+            let file_handle = listener_handle.clone();
 
-                tauri::async_runtime::spawn(async move {
-                    match serde_json::from_slice::<Message>(&data) {
-                        Ok(msg) => match msg {
-                            Message::Clipboard(ciphertext) => {
-                                // Decrypt
-                                tracing::debug!("Received Encrypted Clipboard from {}", addr);
-                                let key_opt = {
-                                    listener_state.cluster_key.lock().unwrap().clone()
-                                };
+            transport.start_listening(
+                move |data, addr| {
+                    tracing::trace!("Received {} bytes from {}", data.len(), addr);
+                    let listener_handle = listener_handle.clone();
+                    let listener_state = listener_state.clone();
+                    let transport_inside = transport_inside.clone();
 
-                                if let Some(key) = key_opt {
-                                    let mut key_arr = [0u8; 32];
-                                    if key.len() == 32 {
-                                        key_arr.copy_from_slice(&key);
-                                        match crypto::decrypt(&key_arr, &ciphertext).map_err(|e| e.to_string()) {
-                                            Ok(plaintext) => {
-                                                // Try to parse as ClipboardPayload
-                                                let (text, id, ts, sender) = if let Ok(payload) = serde_json::from_slice::<crate::protocol::ClipboardPayload>(&plaintext) {
-                                                     (payload.text, payload.id, payload.timestamp, payload.sender)
-                                                } else if let Ok(text) = String::from_utf8(plaintext.clone()) {
-                                                     // Backward compatibility / Fallback
-                                                     (
-                                                         text,
-                                                         uuid::Uuid::new_v4().to_string(),
-                                                         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                                                         "Unknown (Legacy)".to_string()
-                                                     )
-                                                } else {
-                                                     tracing::error!("Failed to parse decrypted clipboard payload.");
-                                                     return;
-                                                };
-
-                                                // Self-sender check: Don't process our own clipboard messages
-                                                // This can happen in relay scenarios or network loops
-                                                {
-                                                    let my_hostname = get_hostname_internal();
-                                                    if sender == my_hostname {
-                                                        tracing::debug!("Ignoring clipboard message from self (sender={})", sender);
-                                                        return;
-                                                    }
-                                                }
-
-                                                // Loop Check
-                                                {
-                                                    let mut last = listener_state.last_clipboard_content.lock().unwrap();
-                                                    if *last == text {
-                                                        tracing::debug!("Ignoring clipboard message - content matches last_clipboard_content");
-                                                        return;
-                                                    }
-                                                    *last = text.clone();
-                                                }
-
-                                                // Check Auto-Receive Setting
-                                                tracing::debug!("Decrypted Clipboard from {}: {}...", sender, if text.len() > 20 { &text[0..20] } else { &text }); // Truncate for log
-                                                
-                                                // Set Clipboard (Dedupe check is inside set_clipboard)
-                                                let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
-                                                
-                                                // Create Payload Object
-                                                let payload_obj = crate::protocol::ClipboardPayload {
-                                                    id: id.clone(),
-                                                    text: text.clone(),
-                                                    timestamp: ts,
-                                                    sender: sender.clone(),
-                                                };
-
-                                                if auto_receiver {
-                                                    clipboard::set_clipboard(&listener_handle, text.clone());
-                                                    // Emit enriched event
-                                                    let _ = listener_handle.emit("clipboard-change", &payload_obj);
-                                                } else {
-                                                    // Manual Mode: Store Pending & Notify
-                                                    tracing::info!("[Clipboard] Auto-receive OFF. Storing pending clipboard from {}", sender);
-                                                    {
-                                                        let mut pending = listener_state.pending_clipboard.lock().unwrap();
-                                                        *pending = Some(payload_obj.clone());
-                                                    }
-                                                    let _ = listener_handle.emit("clipboard-pending", &payload_obj);
-                                                    
-                                                    // We still relay below if auto-send is ON? 
-                                                    // Wait, auto-send setting usually controls SENDING my own clipboard.
-                                                    // For relaying, we usually just relay everything we receive to ensure full coverage?
-                                                    // But the original code checked `auto_send` inside `if !auto_receiver` block?
-                                                    // "if !auto_send { return; }" -> This logic was weird. It meant "If I don't auto-receive, I ONLY relay if I auto-send".
-                                                    // Let's preserve the existing Relay logic decision for now or fix it?
-                                                    // The prompt doesn't ask to change Relay logic, but Manual Receive shouldn't block relaying if valid.
-                                                    // However, to minimize side effects, let's keep the flow similar but just split the action.
-                                                    
-                                                    let auto_send = { listener_state.settings.lock().unwrap().auto_send };
-                                                    // If we are Manual Receive, we might still want to relay? 
-                                                    // The original code returned early if !auto_send. 
-                                                    // That implies "If I am not participating (auto-receive off AND auto-send off), don't relay".
-                                                    if !auto_send {
-                                                         tracing::debug!("Auto-send disabled and Auto-receive disabled. Skipping relay.");
-                                                         return; 
-                                                    }
-                                                }
-
-                                                // Notify
-                                                let notifications = listener_state.settings.lock().unwrap().notifications.clone();
-                                                if notifications.data_received {
-                                                    send_notification(&listener_handle, "Clipboard Received", "Content copied to clipboard");
-                                                }
-
-                                                // Relay (Re-encrypting the RAW PLAINTEXT currently means legacy format if we don't switch to Payload)
-                                                // Ideally relay should reuse the Payload concept.
-                                                // For now, let's just relay the original ciphertext? 
-                                                // No, we need to re-encrypt with OUR nonce logic if we used that.
-                                                // Actually our crypto module generates random nonce and prepends it.
-                                                // So we CANNOT just relay ciphertext unless we know it's same key and valid nonce.
-                                                // Safe to re-encrypt payload.
-                                                
-                                                let state_relay = listener_state.clone();
-                                                let transport_relay = transport_inside.clone(); 
-                                                let sender_addr = addr;
-                                                let relay_key_arr = key_arr; 
-                                                
-                                                // Re-encrypt (Payload preferred)
-                                                let payload_bytes = serde_json::to_vec(&payload_obj).unwrap_or(plaintext);
-                                                
-                                                if let Ok(relay_ciphertext) = crypto::encrypt(&relay_key_arr, &payload_bytes).map_err(|e| e.to_string()) {
-                                                    let relay_data = serde_json::to_vec(&Message::Clipboard(relay_ciphertext)).unwrap_or_default();
-                                                    let peers = state_relay.get_peers();
-                                                    for p in peers.values() {
-                                                        let p_addr = std::net::SocketAddr::new(p.ip, p.port);
-                                                        if p_addr == sender_addr { continue; }
-                                                        let _ = transport_relay.send_message(p_addr, &relay_data).await;
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => tracing::error!("Decryption failed: {}", e),
-                                        }
-                                    } else {
-                                       tracing::warn!("Received clipboard but no Cluster Key set!"); 
-                                    }
-                                }
-                            }
-                            Message::HistoryDelete(id) => {
-                                tracing::info!("Received HistoryDelete for ID: {}", id);
-                                let _ = listener_handle.emit("history-delete", &id);
-                            }
-                            Message::PairRequest { msg, device_id } => {
-                                tracing::info!("Received PairRequest from {} ({}). Authenticating...", addr, device_id);
-                                let local_id = listener_state.local_device_id.lock().unwrap().clone();
-                                let pin = listener_state.network_pin.lock().unwrap().clone();
-                                
-                                match crypto::start_spake2(&pin, &local_id, &device_id).map_err(|e| e.to_string()) {
-                                    Ok((spake_state, response_msg)) => {
-                                        let resp_struct = Message::PairResponse {
-                                            msg: response_msg,
-                                            device_id: local_id.clone(),
-                                        };
-                                        if let Ok(resp_data) = serde_json::to_vec(&resp_struct) {
-                                            if transport_inside.send_message(addr, &resp_data).await.map_err(|e| e.to_string()).is_ok() {
-                                                 match crypto::finish_spake2(spake_state, &msg).map_err(|e| e.to_string()) {
-                                                     Ok(session_key) => {
-                                                         tracing::info!("Authentication Success for {}!", device_id);
-                                                         // Encrypt Cluster Key
-                                                         let cluster_key_opt = {
-                                                             listener_state.cluster_key.lock().unwrap().clone()
-                                                         };
-                                                         if let Some(cluster_key) = cluster_key_opt {
-                                                             let mut session_key_arr = [0u8; 32];
-                                                             if session_key.len() == 32 {
-                                                                 session_key_arr.copy_from_slice(&session_key);
-                                                                 if let Ok(encrypted_ck) = crypto::encrypt(&session_key_arr, &cluster_key).map_err(|e| e.to_string()) {
-                                                                     let known_peers = listener_state.known_peers.lock().unwrap().values().cloned().collect();
-                                                                     let network_name = listener_state.network_name.lock().unwrap().clone();
-                                                                     let network_pin = listener_state.network_pin.lock().unwrap().clone();
-                                                                     let welcome = Message::Welcome {
-                                                                         encrypted_cluster_key: encrypted_ck,
-                                                                         known_peers,
-                                                                         network_name: network_name.clone(),
-                                                                         network_pin
-                                                                     };
-                                                                     if let Ok(welcome_data) = serde_json::to_vec(&welcome) {
-                                                                         let _ = transport_inside.send_message(addr, &welcome_data).await;
-                                                                         
-                                                                         // Trust them
-                                                                         let mut kp_lock = listener_state.known_peers.lock().unwrap();
-                                                                         let p = crate::peer::Peer {
-                                                                             id: device_id.clone(),
-                                                                             ip: addr.ip(),
-                                                                             port: addr.port(),
-                                                                             hostname: format!("Peer ({})", addr.ip()), 
-                                                                             last_seen: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                                                                             is_trusted: true,
-                                                                             is_manual: false,
-                                                                             network_name: Some(network_name),
-                                                                             signature: None,
-                                                                         };
-                                                                         kp_lock.insert(device_id.clone(), p.clone());
-                                                                         save_known_peers(listener_handle.app_handle(), &kp_lock);
-                                                                         listener_state.add_peer(p.clone());
-                                                                         let _ = listener_handle.emit("peer-update", &p);
-                                                                         gossip_peer(&p, &listener_state, &transport_inside, Some(addr));
-                                                                     }
-                                                                 }
-                                                             }
-                                                         }
-                                                     }
-                                                     Err(e) => tracing::error!("Auth Failed: {}", e),
-                                                 }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => tracing::error!("SPAKE2 Error: {}", e),
-                                }
-                            }
-                            Message::PairResponse { msg, device_id } => {
-                                tracing::info!("Received PairResponse from {} ({})", addr, device_id);
-                                let spake_state = {
-                                    let mut pending = listener_state.pending_handshakes.lock().unwrap();
-                                    pending.remove(&addr.to_string())
-                                };
-                                if let Some(state) = spake_state {
-                                    match crypto::finish_spake2(state, &msg).map_err(|e| e.to_string()) {
-                                        Ok(session_key) => {
-                                            tracing::info!("Auth Success (Initiator)! Waiting for Welcome...");
-                                            let mut sessions = listener_state.handshake_sessions.lock().unwrap();
-                                            sessions.insert(addr.to_string(), session_key);
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("Auth Failed: {}", e);
-                                            // Notify frontend that pairing failed (likely wrong PIN)
-                                            let _ = listener_handle.emit("pairing-failed", "Authentication failed. Check the PIN and try again.");
-                                        }
-                                    }
-                                } else {
-                                    // No pending handshake found - might be a stale response
-                                    tracing::warn!("Received PairResponse but no pending handshake found for {}", addr);
-                                    let _ = listener_handle.emit("pairing-failed", "Pairing session expired. Please try again.");
-                                }
-                            }
-                            Message::Welcome { encrypted_cluster_key, known_peers, network_name, network_pin } => {
-                                tracing::info!("Received WELCOME from {}", addr);
-                                let session_key = {
-                                    let sessions = listener_state.handshake_sessions.lock().unwrap();
-                                    sessions.get(&addr.to_string()).cloned()
-                                };
-                                if let Some(sk) = session_key {
-                                    let mut sk_arr = [0u8; 32];
-                                    if sk.len() == 32 {
-                                        sk_arr.copy_from_slice(&sk);
-                                        match crypto::decrypt(&sk_arr, &encrypted_cluster_key).map_err(|e| e.to_string()) {
-                                            Ok(cluster_key) => {
-                                                tracing::info!("Joined Network: {} (PIN: {})", network_name, network_pin);
-                                                // Save Keys & Name
-                                                {
-                                                    let mut ck = listener_state.cluster_key.lock().unwrap();
-                                                    *ck = Some(cluster_key.clone());
-                                                    save_cluster_key(listener_handle.app_handle(), &cluster_key);
-                                                    
-                                                    let mut nn = listener_state.network_name.lock().unwrap();
-                                                    *nn = network_name.clone();
-                                                    save_network_name(listener_handle.app_handle(), &network_name);
-                                                    
-                                                    let mut np = listener_state.network_pin.lock().unwrap();
-                                                    *np = network_pin.clone();
-                                                    save_network_pin(listener_handle.app_handle(), &network_pin);
-                                                }
-                                                // Re-register mDNS
-                                                let device_id = listener_state.local_device_id.lock().unwrap().clone();
-                                                let port = transport_inside.local_addr().map(|a| a.port()).unwrap_or(0);
-                                                if let Some(discovery) = listener_state.discovery.lock().unwrap().as_mut() {
-                                                     let _ = discovery.register(&device_id, &network_name, port);
-                                                }
-                                                // Merge Peers
-                                                let mut kp_lock = listener_state.known_peers.lock().unwrap();
-                                                let mut runtime_peers = listener_state.peers.lock().unwrap();
-                                                for peer in known_peers {
-                                                    kp_lock.insert(peer.id.clone(), peer.clone());
-                                                    
-                                                    // Always update runtime peer to ensure Trust is reflected
-                                                    // (Even if mDNS discovered it first as untrusted)
-                                                    runtime_peers.insert(peer.id.clone(), peer.clone());
-                                                    let _ = listener_handle.emit("peer-update", &peer);
-                                                }
-                                                save_known_peers(listener_handle.app_handle(), &kp_lock);
-                                                
-                                                // Trust Gateway
-                                                for (id, peer) in runtime_peers.iter_mut() {
-                                                    if peer.ip == addr.ip() {
-                                                        peer.is_trusted = true;
-                                                        peer.network_name = Some(network_name.clone());
-                                                        let _ = listener_handle.emit("peer-update", &*peer);
-                                                        // Update known peers for gateway too
-                                                        kp_lock.insert(id.clone(), peer.clone());
-                                                        break;
-                                                    }
-                                                }
-                                                save_known_peers(listener_handle.app_handle(), &kp_lock);
-                                            }
-                                            Err(e) => {
-                                                tracing::error!("Decryption Error: {}", e);
-                                                let _ = listener_handle.emit("pairing-failed", "Failed to join network. The PIN may be incorrect.");
-                                            }
-                                        }
-                                    } else {
-                                        tracing::error!("Decryption Error: No Cluster Key loaded.");
-                                        let _ = listener_handle.emit("pairing-failed", "Session key error. Please try again.");
-                                    }
-                                } else {
-                                    tracing::warn!("Received Welcome but no session key found for {}", addr);
-                                    let _ = listener_handle.emit("pairing-failed", "Pairing session expired. Please try again.");
-                                }
-                            }
-                            Message::PeerDiscovery(mut peer) => {
-                                tracing::debug!("Received PeerDiscovery for {}", peer.hostname);
-                                
-                                // 0. Self Filter (Issue C)
-                                let local_id = listener_state.local_device_id.lock().unwrap().clone();
-                                if peer.id == local_id {
-                                    return;
-                                }
-
-                                // FIX: Cancel pending removal if we receive a Heartbeat!
-                                // If mDNS said "Service Removed" but we just got a packet from them, they are NOT gone.
-                                {
-                                    let mut pending = listener_state.pending_removals.lock().unwrap();
-                                    if pending.remove(&peer.id).is_some() {
-                                        tracing::info!("[Discovery] Cancelled pending removal for {} due to Heartbeat/Packet.", peer.id);
-                                    }
-                                }
-
-                                // TRUST THE PACKET SOURCE for IP/Port (fixes 0.0.0.0 issue)
-                                peer.ip = addr.ip();
-                                peer.port = addr.port();
-                                peer.last_seen = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                                
-                                // 1. Fix is_manual Logic (Issue A)
-                                // Do NOT unconditionally set is_manual = true.
-                                // If we already know them, preserve the flag. If new, default to FALSE (Auto) unless explicitly Manual.
-                                {
-                                    let kp = listener_state.known_peers.lock().unwrap();
-                                    if let Some(existing) = kp.get(&peer.id) {
-                                         peer.is_manual = existing.is_manual;
-                                    } else {
-                                         // New peer via Gossip/Heartbeat -> Assume Auto Discovered
-                                         peer.is_manual = false; 
-                                    }
-                                }
-                                
-                                let mut should_reply = false;
-                                {
-                                     let mut kp_lock = listener_state.known_peers.lock().unwrap();
-                                     // If we don't know them, OR if we only know them as a manual placeholder...
-                                     // Check for placeholder? ID is "manual-IP". Real ID is UUID.
-                                     // If we have a manual placeholder for this IP, remove it.
-                                     let manual_id = format!("manual-{}", peer.ip);
-                                     if kp_lock.contains_key(&manual_id) {
-                                         tracing::info!("Replacing manual placeholder {} with real peer {}", manual_id, peer.id);
-                                         kp_lock.remove(&manual_id);
-                                         listener_state.peers.lock().unwrap().remove(&manual_id);
-                                         let _ = listener_handle.emit("peer-remove", &manual_id);
-                                         should_reply = true; 
-                                         // If we had a manual placeholder, it means User Added IP -> So this IS manual
-                                         peer.is_manual = true;
-                                     }
-                                     
-                                     // If we don't know them at all, reply!
-                                     // Fix Infinite Loop: Check if we know them in MEMORY too.
-                                     // access runtime peers (safe here because we hold kp_lock, establishing KP->Peers order)
-                                     let runtime_known = listener_state.peers.lock().unwrap().contains_key(&peer.id);
-                                     
-                                     if !kp_lock.contains_key(&peer.id) && !runtime_known {
-                                         should_reply = true;
-                                     }
-
-                                     // Trust Arbitration
-                                     // Rule: Trust is strictly based on Key Possession (Signature).
-                                     let mut is_signature_valid = false;
-                                     if let Some(sig) = &peer.signature {
-                                         if let Some(key_vec) = listener_state.cluster_key.lock().unwrap().as_ref() {
-                                             if key_vec.len() == 32 {
-                                                 let mut key_arr = [0u8; 32];
-                                                 key_arr.copy_from_slice(key_vec);
-                                                 if verify_signature(&key_arr, &peer.id, sig) {
-                                                     is_signature_valid = true;
-                                                 }
-                                             }
-                                         }
-                                     }
-                                     
-                                     if is_signature_valid {
-                                         // Valid Signature: We TRUST this peer.
-                                         tracing::debug!("Verified Signature for {}! Trust maintained/granted.", peer.id);
-                                         peer.is_trusted = true;
-                                     } else {
-                                         // Invalid/Missing Signature: We DO NOT TRUST this peer.
-                                         if let Some(existing) = kp_lock.get(&peer.id) {
-                                             if existing.is_trusted {
-                                                tracing::warn!("Revoking Trust for {}: Invalid/Missing Signature.", peer.id);
-                                             }
-                                         }
-                                         peer.is_trusted = false;
-                                     }
-
-                                     // 2. Persistence Logic (Issue B)
-                                     // Update Runtime State ALWAYS
-                                     listener_state.add_peer(peer.clone());
-                                     let _ = listener_handle.emit("peer-update", &peer);
-
-                                     if peer.is_trusted || peer.is_manual {
-                                         // PERSIST only if Trusted or explicitly Manual
-                                         kp_lock.insert(peer.id.clone(), peer.clone());
-                                         save_known_peers(listener_handle.app_handle(), &kp_lock);
-                                     } else {
-                                         // Untrusted Auto-Discovered -> Memory Only.
-                                         // If it WAS persisted (e.g. formerly trusted), REMOVE it from disk.
-                                         if kp_lock.contains_key(&peer.id) {
-                                             tracing::info!("Removing untrusted auto-peer {} from persistence.", peer.id);
-                                             kp_lock.remove(&peer.id);
-                                             save_known_peers(listener_handle.app_handle(), &kp_lock);
-                                         }
-                                     }
-                                }
-                                
-                                // Send OUR info back so they can update their placeholder!
-                                if should_reply {
-                                    tracing::debug!("Sending Discovery Reply to {}", addr);
-                                    let local_id = listener_state.local_device_id.lock().unwrap().clone();
-                                    let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
-                                    let network_name = listener_state.network_name.lock().unwrap().clone();
-                                    
-                                    let mut signature = None;
-                                    if let Some(key_vec) = listener_state.cluster_key.lock().unwrap().as_ref() {
-                                        if key_vec.len() == 32 {
-                                            let mut key_arr = [0u8; 32];
-                                            key_arr.copy_from_slice(key_vec);
-                                            signature = generate_signature(&key_arr, &local_id);
-                                        }
-                                    }
-                                    
-                                    let my_peer = Peer {
-                                        id: local_id,
-                                        // payload IP is 0.0.0.0 if bound to all, but receiver will fix it using addr.ip() as above!
-                                        ip: transport_inside.local_addr().unwrap().ip(),
-                                        port: transport_inside.local_addr().unwrap().port(),
-                                        hostname,
-                                        last_seen: 0,
-                                        is_trusted: false, // We aren't trusted yet
-                                        is_manual: true,
-                                        network_name: Some(network_name),
-                                        signature,
-                                    };
-                                    
-                                    let msg = Message::PeerDiscovery(my_peer);
-                                    let data = serde_json::to_vec(&msg).unwrap_or_default();
-                                    // Send back to sender
-                                    tauri::async_runtime::spawn(async move {
-                                        let _ = transport_inside.send_message(addr, &data).await;
-                                    });
-                                }
-                            }
-                            Message::PeerRemoval(target_id) => {
-                                tracing::info!("Received PeerRemoval for {}", target_id);
-                                let local_id = listener_state.local_device_id.lock().unwrap().clone();
-                                
-                                if target_id == local_id {
-                                    tracing::warn!("I have been removed from the network! resetting state...");
-                                    perform_factory_reset(
-                                        &listener_handle,
-                                        &listener_state,
-                                        transport_inside.local_addr().map(|a| a.port()).unwrap_or(0)
-                                    );
-                                } else {
-                                    // Remove the peer
-                                    {
-                                        let mut kp = listener_state.known_peers.lock().unwrap();
-                                        if kp.remove(&target_id).is_some() {
-                                            save_known_peers(listener_handle.app_handle(), &kp);
-                                        }
-                                    }
-                                    {
-                                        let mut peers = listener_state.peers.lock().unwrap();
-                                        if let Some(peer) = peers.remove(&target_id) {
-                                            drop(peers);
-                                            check_and_notify_leave(&listener_handle, &listener_state, &peer);
-                                        }
-                                    }
-                                    let _ = listener_handle.emit("peer-remove", &target_id);
-                                }
-                            }
-                        }
-                        Err(e) => tracing::error!("Failed to parse message: {}", e),
-                    }
-                });
-            });
-
+                    // ... Existing Message Handler Code ...
+                    tauri::async_runtime::spawn(async move {
+                         match serde_json::from_slice::<Message>(&data) {
+                             Ok(msg) => handle_message(msg, addr, listener_state, listener_handle, transport_inside).await,
+                             Err(e) => tracing::error!("Failed to parse message: {}", e), 
+                         }
+                    });
+                },
+                move |mut recv, addr| {
+                    tracing::info!("Received FILE stream from {}", addr);
+                    let state = file_state.clone();
+                    let handle = file_handle.clone();
+                    
+                    tauri::async_runtime::spawn(async move {
+                         handle_incoming_file_stream(recv, addr, state, handle).await;
+                    });
+                }
+            );
             // Start Clipboard Monitor
             let transport_for_clipboard = transport.clone();
             let state_for_clipboard = (*app.state::<AppState>()).clone();
@@ -1686,6 +1236,7 @@ pub fn run() {
             delete_history_item,
             set_local_clipboard,
             confirm_pending_clipboard,
+            request_file,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1709,6 +1260,767 @@ pub fn run() {
             _ => {}
         }
     });
+}
+
+async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::SocketAddr, state: AppState, app: tauri::AppHandle) {
+    tracing::info!("Starting File Stream Handler for {}", addr);
+    
+    let mut reader = BufReader::new(recv);
+    let mut header_line = String::new();
+    
+    // 1. Read Header (JSON + Newline)
+    if let Err(e) = reader.read_line(&mut header_line).await {
+        tracing::error!("Failed to read file stream header from {}: {}", addr, e);
+        return;
+    }
+    
+    let header: crate::protocol::FileStreamHeader = match serde_json::from_str(&header_line) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("Failed to parse file stream header '{}': {}", header_line.trim(), e);
+            return;
+        }
+    };
+    
+    tracing::info!("Receiving File: {} ({} bytes) [ID: {}]", header.file_name, header.file_size, header.id);
+    
+    // 2. Prepare Output File
+    // Use Cache Directory
+    let cache_dir = match app.path().app_cache_dir() {
+        Ok(p) => p,
+        Err(e) => {
+             tracing::error!("Failed to get cache dir: {}", e);
+             return;
+        }
+    };
+    
+    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        tracing::error!("Failed to create cache dir: {}", e);
+        return;
+    }
+    
+    // Use ID/Index subfolder to avoid collisions? Or just flat?
+    // Flat for now, verify uniqueness?
+    // unique_name = header.file_name
+    let file_path = cache_dir.join(&header.file_name);
+    // TODO: Handle name collision (append _1, etc)?
+    
+    let mut file = match File::create(&file_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("Failed to create file {:?}: {}", file_path, e);
+            return;
+        }
+    };
+    
+    // 3. Decrypt & Write Loop
+    let mut session_key = [0u8; 32];
+    {
+         // Find Session Key? No, we use Cluster Key for file transfer!
+         // Wait, plan said Cluster Key encryption?
+         // "End-to-end encryption... using the shared Cluster Key"
+         let ck_lock = state.cluster_key.lock().unwrap();
+         if let Some(key) = ck_lock.as_ref() {
+             if key.len() == 32 {
+                 session_key.copy_from_slice(key);
+             } else {
+                 tracing::error!("Cluster Key invalid length!");
+                 return;
+             }
+         } else {
+             tracing::error!("Cluster Key missing!");
+             return;
+         }
+    }
+    
+    let mut total_written = 0u64;
+    loop {
+        // Read Length (u32 LE)
+        let mut len_buf = [0u8; 4];
+        match reader.read_exact(&mut len_buf).await {
+            Ok(_) => {
+                let chunk_len = u32::from_le_bytes(len_buf) as usize;
+                if chunk_len == 0 {
+                    break; // EOF marker? No, 0 len chunk implies end? Or rely on stream end?
+                    // Usually we don't send 0 len chunks unless sentinel.
+                    // But if stream closes, read_exact fails with UnexpectedEof?
+                    // Let's rely on reading 4 bytes. If it fails EOF, we are done.
+                }
+                
+                // Read Chunk (Encrypted)
+                let mut chunk_buf = vec![0u8; chunk_len];
+                if let Err(e) = reader.read_exact(&mut chunk_buf).await {
+                    tracing::error!("Failed to read chunk body: {}", e);
+                    break;
+                }
+                
+                // Decrypt
+                match crypto::decrypt(&session_key, &chunk_buf).map_err(|e| e.to_string()) {
+                    Ok(plaintext) => {
+                        if let Err(e) = file.write_all(&plaintext).await {
+                            tracing::error!("Failed to write to file: {}", e);
+                            break;
+                        }
+                        total_written += plaintext.len() as u64;
+                        // TODO: Emit Progress?
+                    }
+                    Err(e) => {
+                         tracing::error!("Decryption failed for chunk: {}", e);
+                         break;
+                    }
+                }
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    // Stream finished cleanly (hopefully)
+                    tracing::info!("File Stream Completed. Written {} bytes.", total_written);
+                    // Emit event
+                     let _ = app.emit("file-received", &header); // Notify UI
+                } else {
+                    tracing::error!("Error reading chunk len: {}", e);
+                }
+                break;
+            }
+        }
+    }
+    
+    // 4. Verify Size?
+    if total_written == header.file_size {
+        tracing::info!("File Transfer Verified OK: {:?}", file_path);
+        // Add to "Available Files" list in UI? Or notification provided by ClipboardPayload.
+        // If this was Auto-Download, we might want to move it to Downloads?
+        // Or just keep in Cache.
+    } else {
+        tracing::warn!("File Transfer Incomplete! Expected {}, got {}", header.file_size, total_written);
+    }
+}
+
+async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state: AppState, listener_handle: tauri::AppHandle, transport_inside: Transport) {
+    match msg {
+        Message::Clipboard(ciphertext) => {
+            // Decrypt
+            tracing::debug!("Received Encrypted Clipboard from {}", addr);
+            let key_opt = {
+                listener_state.cluster_key.lock().unwrap().clone()
+            };
+
+            if let Some(key) = key_opt {
+                let mut key_arr = [0u8; 32];
+                if key.len() == 32 {
+                    key_arr.copy_from_slice(&key);
+                    match crypto::decrypt(&key_arr, &ciphertext).map_err(|e| e.to_string()) {
+                        Ok(plaintext) => {
+                            // Try to parse as ClipboardPayload
+                            let (text, id, ts, sender, payload) = if let Ok(payload) = serde_json::from_slice::<crate::protocol::ClipboardPayload>(&plaintext) {
+                                    (payload.text.clone(), payload.id.clone(), payload.timestamp, payload.sender.clone(), payload)
+                            } else if let Ok(text) = String::from_utf8(plaintext.clone()) {
+                                    // Backward compatibility / Fallback
+                                    (
+                                        text.clone(),
+                                        uuid::Uuid::new_v4().to_string(),
+                                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                                        "Unknown (Legacy)".to_string(),
+                                        crate::protocol::ClipboardPayload {
+                                            text: text.clone(),
+                                            id: uuid::Uuid::new_v4().to_string(),
+                                            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                                            sender: "Unknown (Legacy)".to_string(),
+                                            sender_id: "unknown".to_string(),
+                                            files: None,
+                                        }
+                                    )
+                            } else {
+                                    tracing::error!("Failed to parse decrypted clipboard payload.");
+                                    return;
+                            };
+
+                            // Self-sender check
+                            {
+                                let my_hostname = get_hostname_internal();
+                                if sender == my_hostname {
+                                    tracing::debug!("Ignoring clipboard message from self (sender={})", sender);
+                                    return;
+                                }
+                            }
+
+                            // Loop Check
+                            {
+                                let mut last = listener_state.last_clipboard_content.lock().unwrap();
+                                if *last == text {
+                                    tracing::debug!("Ignoring clipboard message - content matches last_clipboard_content");
+                                    return;
+                                }
+                                *last = text.clone();
+                            }
+
+                            // Check Auto-Receive Setting
+                            tracing::debug!("Decrypted Clipboard from {}: {}...", sender, if text.len() > 20 { &text[0..20] } else { &text }); 
+                            
+                            // Create Payload Object (already created above as 'payload' or fallback)
+                            // Use the one we constructed or parsed
+                            let payload_obj = crate::protocol::ClipboardPayload {
+                                id: id.clone(),
+                                text: text.clone(),
+                                files: payload.files.clone(),
+                                timestamp: ts,
+                                sender: sender.clone(),
+                                sender_id: payload.sender_id.clone(),
+                            };
+
+                            // FILE HANDLING
+                            if let Some(files) = &payload.files {
+                                if !files.is_empty() {
+                                    tracing::info!("Received File Metadata from {}: {} files", sender, files.len());
+                                    let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                    
+                                    // Auto-Download Logic
+                                    // Rule: If total size < Limit (e.g. 10MB), and Auto-Receive is ON.
+                                    let auto_recv = listener_state.settings.lock().unwrap().auto_receive;
+                                    let mut total_size = 0u64;
+                                    for f in files { total_size += f.size; }
+                                    
+                                    // Hardcoded limit for now: 100MB (increased from 50MB)
+                                    let size_limit = 100 * 1024 * 1024; 
+                                    
+                                    if auto_recv && total_size < size_limit {
+                                        tracing::info!("Auto-downloading {} files ({} bytes)", files.len(), total_size);
+                                        // Request Each File
+                                        for (idx, _file_meta) in files.iter().enumerate() {
+                                            tracing::info!("Requesting file {}/{}", idx, files.len());
+                                            let req_payload = crate::protocol::FileRequestPayload {
+                                                id: id.clone(),
+                                                file_index: idx,
+                                                offset: 0,
+                                            };
+                                            // Encrypt Request
+                                            if let Ok(req_json) = serde_json::to_vec(&req_payload) {
+                                                if let Ok(req_cipher) = crypto::encrypt(&key_arr, &req_json) {
+                                                    let msg = Message::FileRequest(req_cipher);
+                                                    if let Ok(data) = serde_json::to_vec(&msg) {
+                                                        let transport_clone = transport_inside.clone();
+                                                        let addr_clone = addr;
+                                                        tauri::async_runtime::spawn(async move {
+                                                            let _ = transport_clone.send_message(addr_clone, &data).await;
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let notifications = listener_state.settings.lock().unwrap().notifications.clone();
+                                        if notifications.data_received {
+                                            let body = format!("Received {} files from {}. Click to download.", files.len(), sender);
+                                            send_notification(&listener_handle, "Files Available", &body);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // TEXT HANDLING
+                            if !text.is_empty() {
+                                let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
+                                if auto_receiver {
+                                    clipboard::set_clipboard(&listener_handle, text.clone());
+                                    let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                } else {
+                                    // Manual Mode
+                                    tracing::info!("[Clipboard] Auto-receive OFF. Storing pending clipboard from {}", sender);
+                                    {
+                                        let mut pending = listener_state.pending_clipboard.lock().unwrap();
+                                        *pending = Some(payload_obj.clone());
+                                    }
+                                    let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                }
+                                
+                                let notifications = listener_state.settings.lock().unwrap().notifications.clone();
+                                if notifications.data_received {
+                                    send_notification(&listener_handle, "Clipboard Received", "Content copied to clipboard");
+                                }
+                            }
+
+                            // Relay Logic
+                            let auto_send = { listener_state.settings.lock().unwrap().auto_send };
+                            if !auto_send {
+                                    return; 
+                            }
+                            
+                            let state_relay = listener_state.clone();
+                            let transport_relay = transport_inside.clone(); 
+                            let sender_addr = addr;
+                            let relay_key_arr = key_arr; 
+                            
+                            let payload_bytes = serde_json::to_vec(&payload_obj).unwrap_or(plaintext);
+                            
+                            if let Ok(relay_ciphertext) = crypto::encrypt(&relay_key_arr, &payload_bytes).map_err(|e| e.to_string()) {
+                                let relay_data = serde_json::to_vec(&Message::Clipboard(relay_ciphertext)).unwrap_or_default();
+                                let peers = state_relay.get_peers();
+                                for p in peers.values() {
+                                    let p_addr = std::net::SocketAddr::new(p.ip, p.port);
+                                    if p_addr == sender_addr { continue; }
+                                    let _ = transport_relay.send_message(p_addr, &relay_data).await;
+                                }
+                            }
+                        }
+                        Err(e) => tracing::error!("Decryption failed: {}", e),
+                    }
+                } else {
+                    tracing::warn!("Received clipboard but no Cluster Key set!"); 
+                }
+            }
+        }
+        Message::HistoryDelete(id) => {
+            tracing::info!("Received HistoryDelete for ID: {}", id);
+            let _ = listener_handle.emit("history-delete", &id);
+        }
+        Message::PairRequest { msg, device_id } => {
+            tracing::info!("Received PairRequest from {} ({}). Authenticating...", addr, device_id);
+            let local_id = listener_state.local_device_id.lock().unwrap().clone();
+            let pin = listener_state.network_pin.lock().unwrap().clone();
+            
+            match crypto::start_spake2(&pin, &local_id, &device_id).map_err(|e| e.to_string()) {
+                Ok((spake_state, response_msg)) => {
+                    let resp_struct = Message::PairResponse {
+                        msg: response_msg,
+                        device_id: local_id.clone(),
+                    };
+                    if let Ok(resp_data) = serde_json::to_vec(&resp_struct) {
+                        if transport_inside.send_message(addr, &resp_data).await.map_err(|e| e.to_string()).is_ok() {
+                            match crypto::finish_spake2(spake_state, &msg).map_err(|e| e.to_string()) {
+                                Ok(session_key) => {
+                                    tracing::info!("Authentication Success for {}!", device_id);
+                                    let cluster_key_opt = {
+                                        listener_state.cluster_key.lock().unwrap().clone()
+                                    };
+                                    if let Some(cluster_key) = cluster_key_opt {
+                                        let mut session_key_arr = [0u8; 32];
+                                        if session_key.len() == 32 {
+                                            session_key_arr.copy_from_slice(&session_key);
+                                            if let Ok(encrypted_ck) = crypto::encrypt(&session_key_arr, &cluster_key).map_err(|e| e.to_string()) {
+                                                let known_peers = listener_state.known_peers.lock().unwrap().values().cloned().collect();
+                                                let network_name = listener_state.network_name.lock().unwrap().clone();
+                                                let network_pin = listener_state.network_pin.lock().unwrap().clone();
+                                                let welcome = Message::Welcome {
+                                                    encrypted_cluster_key: encrypted_ck,
+                                                    known_peers,
+                                                    network_name: network_name.clone(),
+                                                    network_pin
+                                                };
+                                                if let Ok(welcome_data) = serde_json::to_vec(&welcome) {
+                                                    let _ = transport_inside.send_message(addr, &welcome_data).await;
+                                                    
+                                                    let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                                                    let p = crate::peer::Peer {
+                                                        id: device_id.clone(),
+                                                        ip: addr.ip(),
+                                                        port: addr.port(),
+                                                        hostname: format!("Peer ({})", addr.ip()), 
+                                                        last_seen: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                                        is_trusted: true,
+                                                        is_manual: false,
+                                                        network_name: Some(network_name),
+                                                        signature: None,
+                                                    };
+                                                    kp_lock.insert(device_id.clone(), p.clone());
+                                                    save_known_peers(listener_handle.app_handle(), &kp_lock);
+                                                    listener_state.add_peer(p.clone());
+                                                    let _ = listener_handle.emit("peer-update", &p);
+                                                    gossip_peer(&p, &listener_state, &transport_inside, Some(addr));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::error!("Auth Failed: {}", e),
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::error!("SPAKE2 Error: {}", e),
+            }
+        }
+        Message::PairResponse { msg, device_id } => {
+            tracing::info!("Received PairResponse from {} ({})", addr, device_id);
+            let spake_state = {
+                let mut pending = listener_state.pending_handshakes.lock().unwrap();
+                pending.remove(&addr.to_string())
+            };
+            if let Some(state) = spake_state {
+                match crypto::finish_spake2(state, &msg).map_err(|e| e.to_string()) {
+                    Ok(session_key) => {
+                        tracing::info!("Auth Success (Initiator)! Waiting for Welcome...");
+                        let mut sessions = listener_state.handshake_sessions.lock().unwrap();
+                        sessions.insert(addr.to_string(), session_key);
+                    }
+                    Err(e) => {
+                        tracing::error!("Auth Failed: {}", e);
+                        let _ = listener_handle.emit("pairing-failed", "Authentication failed. Check the PIN and try again.");
+                    }
+                }
+            } else {
+                tracing::warn!("Received PairResponse but no pending handshake found for {}", addr);
+                let _ = listener_handle.emit("pairing-failed", "Pairing session expired. Please try again.");
+            }
+        }
+        Message::Welcome { encrypted_cluster_key, known_peers, network_name, network_pin } => {
+             tracing::info!("Received WELCOME from {}", addr);
+             let session_key = {
+                 let sessions = listener_state.handshake_sessions.lock().unwrap();
+                 sessions.get(&addr.to_string()).cloned()
+             };
+             if let Some(sk) = session_key {
+                 let mut sk_arr = [0u8; 32];
+                 if sk.len() == 32 {
+                     sk_arr.copy_from_slice(&sk);
+                     match crypto::decrypt(&sk_arr, &encrypted_cluster_key).map_err(|e| e.to_string()) {
+                         Ok(cluster_key) => {
+                             tracing::info!("Joined Network: {} (PIN: {})", network_name, network_pin);
+                             {
+                                 let mut ck = listener_state.cluster_key.lock().unwrap();
+                                 *ck = Some(cluster_key.clone());
+                                 save_cluster_key(listener_handle.app_handle(), &cluster_key);
+                                 
+                                 let mut nn = listener_state.network_name.lock().unwrap();
+                                 *nn = network_name.clone();
+                                 save_network_name(listener_handle.app_handle(), &network_name);
+                                 
+                                 let mut np = listener_state.network_pin.lock().unwrap();
+                                 *np = network_pin.clone();
+                                 save_network_pin(listener_handle.app_handle(), &network_pin);
+                             }
+                             let device_id = listener_state.local_device_id.lock().unwrap().clone();
+                             let port = transport_inside.local_addr().map(|a| a.port()).unwrap_or(0);
+                             if let Some(discovery) = listener_state.discovery.lock().unwrap().as_mut() {
+                                  let _ = discovery.register(&device_id, &network_name, port);
+                             }
+                             let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                             let mut runtime_peers = listener_state.peers.lock().unwrap();
+                             for peer in known_peers {
+                                 kp_lock.insert(peer.id.clone(), peer.clone());
+                                 runtime_peers.insert(peer.id.clone(), peer.clone());
+                                 let _ = listener_handle.emit("peer-update", &peer);
+                             }
+                             save_known_peers(listener_handle.app_handle(), &kp_lock);
+                             
+                             for (id, peer) in runtime_peers.iter_mut() {
+                                 if peer.ip == addr.ip() {
+                                     peer.is_trusted = true;
+                                     peer.network_name = Some(network_name.clone());
+                                     let _ = listener_handle.emit("peer-update", &*peer);
+                                     kp_lock.insert(id.clone(), peer.clone());
+                                     break;
+                                 }
+                             }
+                             save_known_peers(listener_handle.app_handle(), &kp_lock);
+                         }
+                         Err(e) => {
+                             tracing::error!("Decryption Error: {}", e);
+                             let _ = listener_handle.emit("pairing-failed", "Failed to join network. The PIN may be incorrect.");
+                         }
+                     }
+                 } else {
+                     tracing::error!("Decryption Error: No Cluster Key loaded.");
+                     let _ = listener_handle.emit("pairing-failed", "Session key error. Please try again.");
+                 }
+             } else {
+                 tracing::warn!("Received Welcome but no session key found for {}", addr);
+                 let _ = listener_handle.emit("pairing-failed", "Pairing session expired. Please try again.");
+             }
+        }
+        Message::PeerDiscovery(mut peer) => {
+            tracing::debug!("Received PeerDiscovery for {}", peer.hostname);
+            
+            let local_id = listener_state.local_device_id.lock().unwrap().clone();
+            if peer.id == local_id {
+                return;
+            }
+
+            {
+                let mut pending = listener_state.pending_removals.lock().unwrap();
+                if pending.remove(&peer.id).is_some() {
+                    tracing::info!("[Discovery] Cancelled pending removal for {} due to Heartbeat/Packet.", peer.id);
+                }
+            }
+
+            peer.ip = addr.ip();
+            peer.port = addr.port();
+            peer.last_seen = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            
+            {
+                let kp = listener_state.known_peers.lock().unwrap();
+                if let Some(existing) = kp.get(&peer.id) {
+                     peer.is_manual = existing.is_manual;
+                } else {
+                     peer.is_manual = false; 
+                }
+            }
+            
+            let mut should_reply = false;
+            {
+                 let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                 let manual_id = format!("manual-{}", peer.ip);
+                 if kp_lock.contains_key(&manual_id) {
+                     tracing::info!("Replacing manual placeholder {} with real peer {}", manual_id, peer.id);
+                     kp_lock.remove(&manual_id);
+                     listener_state.peers.lock().unwrap().remove(&manual_id);
+                     let _ = listener_handle.emit("peer-remove", &manual_id);
+                     should_reply = true; 
+                     peer.is_manual = true;
+                 }
+                 
+                 let runtime_known = listener_state.peers.lock().unwrap().contains_key(&peer.id);
+                 if !kp_lock.contains_key(&peer.id) && !runtime_known {
+                     should_reply = true;
+                 }
+
+                 let mut is_signature_valid = false;
+                 if let Some(sig) = &peer.signature {
+                     if let Some(key_vec) = listener_state.cluster_key.lock().unwrap().as_ref() {
+                         if key_vec.len() == 32 {
+                             let mut key_arr = [0u8; 32];
+                             key_arr.copy_from_slice(key_vec);
+                             if verify_signature(&key_arr, &peer.id, sig) {
+                                 is_signature_valid = true;
+                             }
+                         }
+                     }
+                 }
+                 
+                 if is_signature_valid {
+                     tracing::debug!("Verified Signature for {}! Trust maintained/granted.", peer.id);
+                     peer.is_trusted = true;
+                 } else {
+                     if let Some(existing) = kp_lock.get(&peer.id) {
+                         if existing.is_trusted {
+                            tracing::warn!("Revoking Trust for {}: Invalid/Missing Signature.", peer.id);
+                         }
+                     }
+                     peer.is_trusted = false;
+                 }
+
+                 listener_state.add_peer(peer.clone());
+                 let _ = listener_handle.emit("peer-update", &peer);
+
+                 if peer.is_trusted || peer.is_manual {
+                     kp_lock.insert(peer.id.clone(), peer.clone());
+                     save_known_peers(listener_handle.app_handle(), &kp_lock);
+                 } else {
+                     if kp_lock.contains_key(&peer.id) {
+                         tracing::info!("Removing untrusted auto-peer {} from persistence.", peer.id);
+                         kp_lock.remove(&peer.id);
+                         save_known_peers(listener_handle.app_handle(), &kp_lock);
+                     }
+                 }
+            }
+            
+            if should_reply {
+                tracing::debug!("Sending Discovery Reply to {}", addr);
+                let local_id = listener_state.local_device_id.lock().unwrap().clone();
+                let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
+                let network_name = listener_state.network_name.lock().unwrap().clone();
+                
+                let mut signature = None;
+                if let Some(key_vec) = listener_state.cluster_key.lock().unwrap().as_ref() {
+                    if key_vec.len() == 32 {
+                        let mut key_arr = [0u8; 32];
+                        key_arr.copy_from_slice(key_vec);
+                        signature = generate_signature(&key_arr, &local_id);
+                    }
+                }
+                
+                let my_peer = crate::peer::Peer {
+                    id: local_id,
+                    ip: transport_inside.local_addr().unwrap().ip(),
+                    port: transport_inside.local_addr().unwrap().port(),
+                    hostname,
+                    last_seen: 0,
+                    is_trusted: false, 
+                    is_manual: true,
+                    network_name: Some(network_name),
+                    signature,
+                };
+                
+                let msg = Message::PeerDiscovery(my_peer);
+                let data = serde_json::to_vec(&msg).unwrap_or_default();
+                tauri::async_runtime::spawn(async move {
+                    let _ = transport_inside.send_message(addr, &data).await;
+                });
+            }
+        }
+        Message::PeerRemoval(target_id) => {
+            tracing::info!("Received PeerRemoval for {}", target_id);
+            let local_id = listener_state.local_device_id.lock().unwrap().clone();
+            
+            if target_id == local_id {
+                tracing::warn!("I have been removed from the network! resetting state...");
+                perform_factory_reset(
+                    &listener_handle,
+                    &listener_state,
+                    transport_inside.local_addr().map(|a| a.port()).unwrap_or(0)
+                );
+            } else {
+                {
+                    let mut kp = listener_state.known_peers.lock().unwrap();
+                    if kp.remove(&target_id).is_some() {
+                        save_known_peers(listener_handle.app_handle(), &kp);
+                    }
+                }
+                {
+                    let mut peers = listener_state.peers.lock().unwrap();
+                    if let Some(peer) = peers.remove(&target_id) {
+                        drop(peers);
+                        check_and_notify_leave(&listener_handle, &listener_state, &peer);
+                    }
+                }
+                let _ = listener_handle.emit("peer-remove", &target_id);
+            }
+        }
+        
+        Message::FileRequest(req_cipher) => {
+             // HANDLE FILE REQUEST (Sender)
+             // 1. Decrypt Request
+             tracing::info!("Received File Request from {}", addr);
+             let key_opt = { listener_state.cluster_key.lock().unwrap().clone() };
+             if let Some(key) = key_opt {
+                 let mut key_arr = [0u8; 32];
+                 if key.len() == 32 {
+                     key_arr.copy_from_slice(&key);
+                     match crypto::decrypt(&key_arr, &req_cipher).map_err(|e| e.to_string()) {
+                         Ok(plaintext) => {
+                             if let Ok(req) = serde_json::from_slice::<crate::protocol::FileRequestPayload>(&plaintext) {
+                                 tracing::info!("Processing File Request: ID={}, Index={}", req.id, req.file_index);
+                                 
+                                 // 2. Find File Path
+                                 let path = {
+                                     let map = listener_state.local_files.lock().unwrap();
+                                     if let Some(paths) = map.get(&req.id) {
+                                         if req.file_index < paths.len() {
+                                             Some(paths[req.file_index].clone())
+                                         } else { None }
+                                     } else { None }
+                                 };
+                                 
+                                 if let Some(p_str) = path {
+                                      let file_path = PathBuf::from(p_str.clone());
+                                      // 3. Open Stream & Send
+                                      tauri::async_runtime::spawn(async move {
+                                           // Open File
+                                           let mut file = match File::open(&file_path).await {
+                                               Ok(f) => f,
+                                               Err(e) => { tracing::error!("Failed to open requested file: {}", e); return; }
+                                           };
+                                           let file_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                                           let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                           
+                                           // Open QUIC Stream
+                                           match transport_inside.send_file_stream(addr).await {
+                                               Ok(mut stream) => {
+                                                   // 4. Send Header
+                                                   let header = crate::protocol::FileStreamHeader {
+                                                       id: req.id,
+                                                       file_index: req.file_index,
+                                                       file_name,
+                                                       file_size,
+                                                   };
+                                                   if let Ok(h_json) = serde_json::to_string(&header) {
+                                                       if let Err(e) = stream.write_all(h_json.as_bytes()).await { tracing::error!("Header Write Error: {}", e); return; }
+                                                       if let Err(e) = stream.write_all(b"\n").await { tracing::error!("Header Newline Error: {}", e); return; }
+                                                   }
+                                                   
+                                                   // 5. Encrypt & Send Chunks
+                                                   let mut buf = [0u8; 64 * 1024]; // 64KB chunks
+                                                   loop {
+                                                       match file.read(&mut buf).await {
+                                                           Ok(0) => break, // EOF
+                                                           Ok(n) => {
+                                                               // Encrypt Chunk
+                                                               match crypto::encrypt(&key_arr, &buf[0..n]) {
+                                                                   Ok(encrypted) => {
+                                                                       // Write Len (u32 LE)
+                                                                       let len_bytes = (encrypted.len() as u32).to_le_bytes();
+                                                                       if let Err(e) = stream.write_all(&len_bytes).await { tracing::error!("Stream Write Error: {}", e); break; }
+                                                                       // Write Data
+                                                                       if let Err(e) = stream.write_all(&encrypted).await { tracing::error!("Stream Write Error: {}", e); break; }
+                                                                   }
+                                                                   Err(e) => { tracing::error!("Encrypt Error: {}", e); break; }
+                                                               }
+                                                           }
+                                                           Err(e) => { tracing::error!("File Read Error: {}", e); break; }
+                                                       }
+                                                   }
+                                                   // Finish Stream
+                                                   let _ = stream.finish();
+                                                   tracing::info!("File Sent Successfully: {}", p_str);
+                                               }
+                                               Err(e) => tracing::error!("Failed to open file stream: {}", e),
+                                           }
+                                      });
+                                 } else {
+                                     tracing::warn!("Requested file not found (ID: {}, Index: {})", req.id, req.file_index);
+                                 }
+                             }
+                         }
+                         Err(e) => tracing::error!("Failed to decrypt FileRequest: {}", e),
+                     }
+                 }
+             }
+        }
+    }
+}
+
+
+
+#[tauri::command]
+async fn request_file(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    file_id: String,
+    file_index: usize,
+    peer_id: String,
+) -> Result<(), String> {
+    tracing::info!("Manual File Request: ID={}, Index={}, Peer={}", file_id, file_index, peer_id);
+    
+    // 1. Find Peer Address
+    let addr = {
+        let peers = state.get_peers();
+        if let Some(p) = peers.get(&peer_id) {
+            std::net::SocketAddr::new(p.ip, p.port)
+        } else {
+             return Err(format!("Peer {} not found or offline", peer_id));
+        }
+    };
+    
+    // 2. Get Transport
+    let transport = {
+        let t_lock = state.transport.lock().unwrap();
+        t_lock.clone().ok_or("Transport not initialized".to_string())?
+    };
+    
+    // 3. Encrypt & Send Request
+    let req_payload = crate::protocol::FileRequestPayload {
+        id: file_id,
+        file_index,
+        offset: 0,
+    };
+    
+    let key_opt = state.cluster_key.lock().unwrap().clone();
+    if let Some(key) = key_opt {
+        if key.len() == 32 {
+            let mut key_arr = [0u8; 32];
+            key_arr.copy_from_slice(&key);
+             if let Ok(req_json) = serde_json::to_vec(&req_payload) {
+                if let Ok(req_cipher) = crypto::encrypt(&key_arr, &req_json).map_err(|e| e.to_string()) {
+                    let msg = Message::FileRequest(req_cipher);
+                    if let Ok(data) = serde_json::to_vec(&msg) {
+                        transport.send_message(addr, &data).await.map_err(|e| e.to_string())?;
+                        tracing::info!("File Request sent to {}", addr);
+                        return Ok(());
+                    }
+                }
+             }
+        }
+    }
+    
+    Err("Failed to encrypt/send request".to_string())
 }
 
 fn register_shortcuts(app_handle: &tauri::AppHandle) {
@@ -1767,18 +2079,21 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
                tracing::info!("Global Send Shortcut Triggered!");
                // Trigger Send Logic
                // Get local content
-               match app_handle.clipboard().read_text() {
+               match app_handle.state::<Clipboard>().read_text() {
                    Ok(text) => {
                         let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
                         let msg_id = uuid::Uuid::new_v4().to_string();
                         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
 
-                        let payload_obj = crate::protocol::ClipboardPayload {
-                            id: msg_id.clone(),
-                            text: text.clone(),
-                            timestamp: ts,
-                            sender: hostname,
-                        };
+                            let local_id = state.local_device_id.lock().unwrap().clone();
+                            let payload_obj = crate::protocol::ClipboardPayload {
+                                id: msg_id.clone(),
+                                text: text.clone(),
+                                timestamp: ts,
+                                sender: hostname,
+                                sender_id: local_id,
+                                files: None,
+                            };
                         
                         // Emit local event
                         let _ = app_handle.emit("clipboard-change", &payload_obj);
@@ -1832,7 +2147,7 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
                 if let Some(payload) = guard.take() { // take() removes it from pending
                     // Apply to System Clipboard
                     // Using clipboard plugin
-                    if let Err(e) = app_handle.clipboard().write_text(payload.text) {
+                    if let Err(e) = app_handle.state::<Clipboard>().write_text(payload.text) {
                         tracing::error!("Failed to write pending clipboard to system: {}", e);
                     } else {
                         tracing::info!("Confirmed pending clipboard content via shortcut.");

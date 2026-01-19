@@ -31,6 +31,7 @@ rand = "0.8.5"
 getrandom = "0.2.14"
 base64 = "0.22.1"
 tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
 local-ip-address = "0.6.8"
 rcgen = "0.14.6"
 rustls = { version = "0.23.35", features = ["aws_lc_rs"] }
@@ -45,6 +46,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 uuid = { version = "1.19.0", features = ["v4", "fast-rng", "serde"] }
-tauri-plugin-clipboard-manager = "2"
+tauri-plugin-clipboard = "2"
 tauri-plugin-global-shortcut = "2.3.1"
 

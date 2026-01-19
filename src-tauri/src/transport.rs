@@ -22,7 +22,11 @@ impl Transport {
         Ok(Self { endpoint })
     }
 
-    pub async fn send_message(&self, addr: SocketAddr, data: &[u8]) -> Result<(), Box<dyn Error>> {
+    pub async fn send_message(
+        &self,
+        addr: SocketAddr,
+        data: &[u8],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let connection = self.endpoint.connect(addr, "clustercut-transport")?.await?;
         let (mut send, _recv) = connection.open_bi().await?; // Rename recv to _recv
 
@@ -36,57 +40,104 @@ impl Transport {
         Ok(())
     }
 
-    pub fn start_listening<F>(&self, on_receive: F)
+    /// Open a dedicated file stream connection to start sending a file
+    /// Returns the SendStream so the caller can pump data into it.
+    pub async fn send_file_stream(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<quinn::SendStream, Box<dyn Error + Send + Sync>> {
+        let connection = self.endpoint.connect(addr, "clustercut-file")?.await?;
+        // Use Uni stream for file transfer (Sender -> Receiver)
+        let send = connection.open_uni().await?;
+        Ok(send)
+    }
+
+    pub fn start_listening<F, G>(&self, on_receive_message: F, on_receive_file: G)
     where
         F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static + Clone,
+        G: Fn(quinn::RecvStream, SocketAddr) + Send + Sync + 'static + Clone,
     {
         let endpoint = self.endpoint.clone();
         tauri::async_runtime::spawn(async move {
             tracing::info!("Starting transport listener loop...");
             while let Some(conn) = endpoint.accept().await {
-                tracing::debug!("Transport accepted a connection attempt...");
+                // tracing::debug!("Transport accepted a connection attempt...");
                 let connection = conn.await;
                 match connection {
                     Ok(conn) => {
                         let remote_addr = conn.remote_address();
-                        tracing::info!("Transport established connection with {}", remote_addr);
-                        let on_receive = on_receive.clone();
-                        tauri::async_runtime::spawn(async move {
-                            tracing::debug!(
-                                "Waiting for bidirectional stream from {}",
-                                remote_addr
-                            );
-                            loop {
-                                match conn.accept_bi().await {
-                                    Ok((_, mut recv)) => {
-                                        tracing::debug!("Accepted stream from {}", remote_addr);
-                                        // Limit 10MB
-                                        if let Ok(buf) = recv.read_to_end(1024 * 1024 * 10).await {
-                                            tracing::trace!(
-                                                "Read {} bytes from stream from {}",
-                                                buf.len(),
+                        // tracing::info!("Transport established connection with {}", remote_addr);
+
+                        // Check Protocol (ALPN)
+                        let protocol = conn
+                            .handshake_data()
+                            .unwrap()
+                            .downcast::<quinn::crypto::rustls::HandshakeData>()
+                            .unwrap()
+                            .protocol
+                            .map(|p| String::from_utf8_lossy(&p).to_string());
+
+                        // Default to transport if unknown (shouldn't happen with our config)
+                        let proto = protocol.unwrap_or_else(|| "clustercut-transport".to_string());
+
+                        if proto == "clustercut-file" {
+                            // File Stream Handler
+                            let on_receive_file = on_receive_file.clone();
+                            tauri::async_runtime::spawn(async move {
+                                tracing::debug!("Handling FILE connection from {}", remote_addr);
+                                loop {
+                                    // Accept Uni streams for files
+                                    match conn.accept_uni().await {
+                                        Ok(recv) => {
+                                            tracing::info!(
+                                                "Accepted FILE stream from {}",
                                                 remote_addr
                                             );
-                                            on_receive(buf, remote_addr);
-                                        } else {
-                                            tracing::error!(
-                                                "Failed to read from stream from {}",
-                                                remote_addr
+                                            on_receive_file(recv, remote_addr);
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                "File connection closed/error from {}: {}",
+                                                remote_addr,
+                                                e
                                             );
+                                            break;
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to accept stream from {}: {}",
-                                            remote_addr,
-                                            e
-                                        );
-                                        break;
+                                }
+                            });
+                        } else {
+                            // Standard Message Handler (clustercut-transport)
+                            let on_receive_message = on_receive_message.clone();
+                            tauri::async_runtime::spawn(async move {
+                                // tracing::debug!("Handling MESSAGE connection from {}", remote_addr);
+                                loop {
+                                    match conn.accept_bi().await {
+                                        Ok((_, mut recv)) => {
+                                            // tracing::debug!("Accepted message stream from {}", remote_addr);
+                                            // Limit 10MB
+                                            if let Ok(buf) =
+                                                recv.read_to_end(1024 * 1024 * 10).await
+                                            {
+                                                if !buf.is_empty() {
+                                                    on_receive_message(buf, remote_addr);
+                                                }
+                                            } else {
+                                                tracing::error!(
+                                                    "Failed to read from stream from {}",
+                                                    remote_addr
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // connection closed is normal
+                                            // tracing::debug!("Message connection closed/error from {}: {}", remote_addr, e);
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                            tracing::debug!("Stream loop ended for {}", remote_addr);
-                        });
+                            });
+                        }
                     }
                     Err(e) => tracing::error!("Connection handshake failed: {}", e),
                 }
@@ -100,7 +151,11 @@ impl Transport {
 }
 
 fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
-    let cert = generate_simple_self_signed(vec!["clustercut-transport".into()])?;
+    // Register BOTH protocols
+    let cert = generate_simple_self_signed(vec![
+        "clustercut-transport".into(),
+        "clustercut-file".into(),
+    ])?;
     Ok((cert.cert.der().to_vec(), cert.signing_key.serialize_der()))
 }
 
@@ -109,7 +164,19 @@ fn configure_server(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<ServerConfig,
     let key =
         rustls::pki_types::PrivateKeyDer::try_from(key_der).map_err(|_| "Invalid private key")?;
 
-    let server_config = ServerConfig::with_single_cert(vec![cert], key)?;
+    let mut crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)?;
+
+    crypto.alpn_protocols = vec![
+        b"clustercut-transport".to_vec(),
+        b"clustercut-file".to_vec(),
+    ];
+
+    let server_config = ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto)?,
+    ));
+
     Ok(server_config)
 }
 
@@ -167,9 +234,12 @@ fn configure_client() -> Result<ClientConfig, Box<dyn Error>> {
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
-    let quic_config = quinn::ClientConfig::new(Arc::new(
+    // Client ALPN will be set per-connection ("connect(..., alpn)") so we don't need default here,
+    // but we can add them to supported.
+    let mut quic_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_config)?,
     ));
+    // quic_config.alpn_protocols = vec![b"clustercut-transport".to_vec(), b"clustercut-file".to_vec()];
 
     Ok(quic_config)
 }
