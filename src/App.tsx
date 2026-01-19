@@ -543,18 +543,7 @@ export default function App() {
       }
   };
 
-  const showMessage = (title: string, msg: string, type: "success" | "neutral" = "neutral") => {
-      setDialog({
-          open: true,
-          title,
-          description: msg,
-          type,
-          confirmLabel: "Close",
-          onConfirm: () => setDialog(d => ({ ...d, open: false })),
-          cancelLabel: undefined,
-          onCancel: undefined // Hides cancel button
-      });
-  };
+
 
   const confirmLeaveNetwork = async () => {
     setLeaveOpen(false);
@@ -706,7 +695,7 @@ export default function App() {
              ) : activeView === "history" ? (
                <HistoryView items={clipboardHistory} />
              ) : (
-               <SettingsView onDirtyChange={setUnsavedChanges} showMessage={showMessage} onSettingsRefreshed={fetchSettings} />
+               <SettingsView onSettingsRefreshed={fetchSettings} />
              )}
            </div>
         </div>
@@ -1153,21 +1142,15 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
 }
 
 function SettingsView({ 
-    onDirtyChange,
-    showMessage,
     onSettingsRefreshed
 }: { 
-    onDirtyChange: (dirty: boolean) => void;
-    showMessage: (title: string, msg: string, type: "success" | "neutral") => void;
     onSettingsRefreshed?: () => void;
 }) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
-  const [initialSettings, setInitialSettings] = useState<AppSettings | null>(null); // For deep compare if needed
+  const [initialSettings, setInitialSettings] = useState<AppSettings | null>(null); // For mode switch detection
   
   const [networkName, setNetworkName] = useState("");
   const [networkPin, setNetworkPin] = useState("");
-  const [initialName, setInitialName] = useState("");
-  const [initialPin, setInitialPin] = useState("");
 
   const [provName, setProvName] = useState("");
   const [provPin, setProvPin] = useState("");
@@ -1175,6 +1158,7 @@ function SettingsView({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
+  // Load Settings
   useEffect(() => {
     Promise.all([
       invoke<AppSettings>("get_settings"),
@@ -1185,99 +1169,99 @@ function SettingsView({
       setInitialSettings(JSON.parse(JSON.stringify(s)));
       setNetworkName(n);
       setNetworkPin(p);
-      setInitialName(n);
-      setInitialPin(p);
       setProvName(n); 
       setProvPin(p);
       setLoading(false);
     });
   }, []);
 
-  // Dirty Check Effect
+  // Autosave Effect
   useEffect(() => {
-     if (!settings || !initialSettings) return;
-     
-     // Check basic settings
-     const basicDirty = JSON.stringify(settings) !== JSON.stringify(initialSettings);
-     
-     // Check Provisioning Fields check:
-     // If we are in "provisioned" mode, and the provName/provPin differ from what is currently active/saved
-     let provDirty = false;
-     if (settings.cluster_mode === "provisioned") {
-         // However, provName/Pin changes are local to inputs until saved.
-         // If I change provName, is it dirty vs Initial State?
-         // YES. Initial State had `provName == networkName`.
-         // If `provName !== initialName` or `provPin !== initialPin`, it is dirty.
-         provDirty = (provName !== initialName || provPin !== initialPin);
-     }
-     
-     onDirtyChange(basicDirty || provDirty);
-  }, [settings, initialSettings, provName, provPin, initialName, initialPin]);
+    if (loading || !settings) return;
 
-  const handleSave = async () => {
-    if (!settings) return;
-    setSaving(true);
-    try {
-      // 1. Save general settings
-      await invoke("save_settings", { settings });
-      
-      // 2. Handle Provisioning Changes
-      let msg = "Settings saved successfully.";
-      
-      if (settings.cluster_mode === "provisioned") {
-         // Validate
-         if (provName.trim().includes(" ")) {
-             showMessage("Validation Error", "Cluster Name cannot contain spaces.", "neutral");
-             setSaving(false);
-             return;
-         }
-         if (provPin.length < 6) {
-             showMessage("Validation Error", "PIN must be at least 6 characters.", "neutral");
-             setSaving(false);
-             return;
-         }
-         
-         if (provName !== networkName || provPin !== networkPin) {
-             await invoke("set_network_identity", { name: provName, pin: provPin });
-             // Reload network data
-             const n = await invoke<string>("get_network_name");
-             const p = await invoke<string>("get_network_pin");
-             setNetworkName(n);
-             setNetworkPin(p);
-             setInitialName(n);
-             setInitialPin(p);
-             msg = "Network Identity Updated. You may need to repair your devices.";
-         }
-      } else {
-        if (initialSettings && initialSettings.cluster_mode === "provisioned") {
-            await invoke("regenerate_network_identity");
-            // Reload network data
-            const n = await invoke<string>("get_network_name");
-            const p = await invoke<string>("get_network_pin");
-            setNetworkName(n);
-            setNetworkPin(p);
-            setProvName(n);
-            setProvPin(p);
-            setInitialName(n);
-            setInitialPin(p);
-            msg = "Network Identity has been reset to random.";
+    const savePayload = { 
+        settings: { ...settings }, 
+        provName, 
+        provPin,
+        currentMode: settings.cluster_mode
+    };
+
+    const save = async () => {
+        setSaving(true);
+        try {
+            // 1. Save General Settings
+            await invoke("save_settings", { settings: savePayload.settings });
+            
+            // 2. Handle Identity Logic
+            // If mode is Provisioned
+            if (savePayload.currentMode === "provisioned") {
+                // Validation
+                const isNameValid = !savePayload.provName.trim().includes(" ") && savePayload.provName.length > 0;
+                const isPinValid = savePayload.provPin.length >= 6;
+                // Check change against CURRENT ACTIVE network name/pin
+                // We use refs or closure state. Here we use state `networkName`.
+                // Note: networkName state might be stale in closure? 
+                // No, useEffect re-runs if deps change. `networkName` is not in deps.
+                // But `provName` IS in deps.
+                // We need `networkName` in deps? Or access it safely.
+                // Let's rely on the fact that if we successfully change identity, we update `networkName`.
+                
+                // Better approach for identity: 
+                // Only act if `provName/Pin` differs from `initialName/InitialPin` (which track active state).
+                
+                // Actually, let's use the local state directly, but we need to capture it.
+                // We'll rely on `networkName` being consistent with `initialName` usually.
+                
+                if (isNameValid && isPinValid) {
+                     // Check if changed from ACTIVE
+                     // functionality: If I change name, I want to apply it.
+                     // But I need to know what the current active is. `networkName`.
+                     // But I can't access `networkName` efficiently inside this closure if I don't dep it.
+                     // But if I dep it, I re-trigger. That's fine.
+                     
+                     // ACTUALLY: The `networkName` state is updated ONLY when we reload from backend.
+                     // So it is the "Active" one.
+                     if (savePayload.provName !== networkName || savePayload.provPin !== networkPin) {
+                         console.log("Applying new Identity...");
+                         await invoke("set_network_identity", { name: savePayload.provName, pin: savePayload.provPin });
+                         
+                         // Update Active State
+                         const n = savePayload.provName;
+                         const p = savePayload.provPin;
+                         setNetworkName(n);
+                         setNetworkPin(p);
+                     }
+                }
+            } 
+            // If mode switched FROM Provisioned TO Auto
+            else if (initialSettings?.cluster_mode === "provisioned" && savePayload.currentMode === "auto") {
+                console.log("Resetting Identity to Auto...");
+                await invoke("regenerate_network_identity");
+                const n = await invoke<string>("get_network_name");
+                const p = await invoke<string>("get_network_pin");
+                setNetworkName(n);
+                setNetworkPin(p);
+                setProvName(n);
+                setProvPin(p);
+            }
+
+            // Sync Initial Settings to Current (to track mode changes)
+            setInitialSettings(JSON.parse(JSON.stringify(savePayload.settings)));
+            
+            if (onSettingsRefreshed) onSettingsRefreshed();
+            
+        } catch (e) {
+            console.error("Autosave failed", e);
+            // showMessage("Error", "Autosave failed", "neutral"); // Optional
+        } finally {
+            setSaving(false);
         }
-      }
-      
-      // Update initial state
-      setInitialSettings(JSON.parse(JSON.stringify(settings)));
-      onDirtyChange(false);
-      
-      if (onSettingsRefreshed) onSettingsRefreshed();
-      
-      showMessage("Success", msg, "success");
+    };
 
-    } catch (e) {
-      showMessage("Error", "Failed to save: " + e, "neutral");
-    } finally {
-      setSaving(false);
-    }
-  };
+    const timer = setTimeout(save, 800);
+    return () => clearTimeout(timer);
+  }, [settings, provName, provPin, networkName, networkPin, initialSettings]); 
+  // Added networkName/Pin/initialSettings to deps to correct closures.
 
   if (loading || !settings) return <div className="p-10 text-center text-zinc-500">Loading settings...</div>;
 
@@ -1346,6 +1330,7 @@ function SettingsView({
                         value={provName}
                         onChange={(e) => setProvName(e.target.value.replace(/\s/g, ""))}
                         />
+                         {provName.trim().includes(" ") && <span className="text-[10px] text-rose-500">Spaces not allowed.</span>}
                     </div>
                     <div className="flex flex-col gap-1">
                         <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Cluster PIN (Min 6 chars)</label>
@@ -1354,6 +1339,7 @@ function SettingsView({
                         value={provPin}
                         onChange={(e) => setProvPin(e.target.value)}
                         />
+                         {provPin.length > 0 && provPin.length < 6 && <span className="text-[10px] text-rose-500">PIN must be at least 6 characters.</span>}
                     </div>
                 </div>
             )}
@@ -1467,11 +1453,11 @@ function SettingsView({
         </div>
       </Card>
       
-      {/* Save Action */}
-      <div className="flex justify-end pt-4">
-          <Button variant="primary" onClick={handleSave} disabled={saving} iconLeft={<CheckCircle2 className="h-4 w-4" />}>
-              {saving ? "Saving..." : "Save Changes"}
-          </Button>
+      {/* Footer Status */}
+      <div className="flex justify-center pt-2">
+           <span className={clsx("text-[10px] font-medium transition-opacity", saving ? "opacity-100 text-zinc-500" : "opacity-0 duration-1000")}>
+               Saving changes...
+           </span>
       </div>
     </div>
   );
