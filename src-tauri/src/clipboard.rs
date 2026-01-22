@@ -244,9 +244,12 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
 
                         broadcast_clipboard(&app_handle, &state, &transport, payload_obj);
                     }
-                    ClipboardContent::Files(paths) => {
-                        tracing::debug!("Clipboard File Change Detected ({} files)", paths.len());
-                        // TODO: Dedupe logic for files?
+                    ClipboardContent::Files(raw_paths) => {
+                        tracing::debug!(
+                            "Clipboard File Change Detected. Raw paths: {:?}",
+                            raw_paths
+                        );
+                        // Dedupe logic for files?
                         // For now rely on last_content local dedupe.
 
                         let hostname = crate::get_hostname_internal();
@@ -256,10 +259,28 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                             .unwrap_or_default()
                             .as_secs();
 
-                        // Process Metadata
+                        // Process Metadata & Validate Paths
                         let mut file_metas = Vec::new();
-                        for path_str in &paths {
-                            let path = std::path::Path::new(path_str);
+                        let mut valid_paths = Vec::new();
+
+                        for path_str in &raw_paths {
+                            // Try to parse as URL first
+                            let path_buf = if let Ok(u) = url::Url::parse(path_str) {
+                                if u.scheme() == "file" {
+                                    if let Ok(p) = u.to_file_path() {
+                                        p
+                                    } else {
+                                        // Metadata decoding failed or not a local file
+                                        std::path::PathBuf::from(path_str)
+                                    }
+                                } else {
+                                    std::path::PathBuf::from(path_str)
+                                }
+                            } else {
+                                std::path::PathBuf::from(path_str)
+                            };
+
+                            let path = path_buf.as_path();
                             if path.exists() {
                                 let name = path
                                     .file_name()
@@ -268,14 +289,17 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                                     .to_string();
                                 let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                                 file_metas.push(FileMetadata { name, size });
+                                valid_paths.push(path.to_string_lossy().to_string());
+                            } else {
+                                tracing::warn!("Path does not exist or invalid: {:?}", path);
                             }
                         }
 
                         if !file_metas.is_empty() {
-                            // Store files mapping for serving requests
+                            // Store files mapping for serving requests (Use VALID paths)
                             {
                                 let mut files_lock = state.local_files.lock().unwrap();
-                                files_lock.insert(msg_id.clone(), paths.clone());
+                                files_lock.insert(msg_id.clone(), valid_paths.clone());
                             }
 
                             let local_id = state.local_device_id.lock().unwrap().clone();
@@ -288,6 +312,8 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                                 sender_id: local_id,
                             };
                             broadcast_clipboard(&app_handle, &state, &transport, payload_obj);
+                        } else {
+                            tracing::warn!("No valid files found in clipboard content.");
                         }
                     }
                     ClipboardContent::None => {}
