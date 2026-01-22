@@ -48,4 +48,5 @@ clap = { version = "4.5", features = ["derive"] }
 uuid = { version = "1.19.0", features = ["v4", "fast-rng", "serde"] }
 tauri-plugin-clipboard = "2"
 tauri-plugin-global-shortcut = "2.3.1"
+url = "2.5"
 

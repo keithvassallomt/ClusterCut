@@ -62,12 +62,30 @@ pub fn set_system_clipboard(app: &AppHandle, text: String) -> Result<(), String>
 
 /// Write clipboard files (paths)
 pub fn set_clipboard_files(app: &AppHandle, files: Vec<String>) -> Result<(), String> {
-    // This plugin might not support write_files directly yet, but let's check or assume
-    // If it's the community plugin, it usually has write_files_uris or similar.
-    // For now, let's assume write_files handles paths.
-    // If fail, we will fallback to text.
+    // Convert paths to file:// URIs
+    let uris: Vec<String> = files
+        .into_iter()
+        .filter_map(|p| {
+            let path = std::path::Path::new(&p);
+            // Ensure absolute path
+            let abs_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir().ok()?.join(path)
+            };
+
+            url::Url::from_file_path(abs_path)
+                .ok()
+                .map(|u| u.to_string())
+        })
+        .collect();
+
+    if uris.is_empty() {
+        return Err("No valid file paths convertible to URIs".to_string());
+    }
+
     app.state::<Clipboard>()
-        .write_files_uris(files)
+        .write_files_uris(uris)
         .map_err(|e| e.to_string())
 }
 
