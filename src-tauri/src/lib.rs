@@ -1950,6 +1950,13 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                    }
                                                    // Finish Stream
                                                    let _ = stream.finish();
+                                                   
+                                                   // Ensure connection stays alive until data is flushed/acknowledged
+                                                   // Simple wait to allow flush
+                                                   tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                                                   // Now we can close explicitly
+                                                   _connection.close(0u32.into(), b"done");
+                                                   
                                                    tracing::info!("File Sent Successfully: {}", p_str);
                                                }
                                                Err(e) => tracing::error!("Failed to open file stream: {}", e),
