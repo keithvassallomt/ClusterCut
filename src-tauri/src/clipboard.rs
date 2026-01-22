@@ -349,6 +349,25 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                         }
 
                         if !file_metas.is_empty() {
+                            // Construct Signature for Deduplication
+                            let mut sig = String::from("FILES:");
+                            for f in &file_metas {
+                                use std::fmt::Write;
+                                let _ = write!(sig, "{}:{};", f.name, f.size);
+                            }
+
+                            // Dedupe Global Check
+                            {
+                                let mut last_global = state.last_clipboard_content.lock().unwrap();
+                                if *last_global == sig {
+                                    tracing::debug!(
+                                        "Ignoring broadcast - files match last_clipboard_content"
+                                    );
+                                    return; // Abort broadcast
+                                }
+                                *last_global = sig;
+                            }
+
                             // Store files mapping for serving requests (Use VALID paths)
                             {
                                 let mut files_lock = state.local_files.lock().unwrap();

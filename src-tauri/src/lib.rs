@@ -1444,14 +1444,29 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 }
                             }
 
-                            // Loop Check
+                            // Loop/Dedupe Check
+                            let content_signature = if let Some(files) = &payload.files {
+                                if !files.is_empty() {
+                                    let mut sig = String::from("FILES:");
+                                    for f in files {
+                                        use std::fmt::Write;
+                                        let _ = write!(sig, "{}:{};", f.name, f.size);
+                                    }
+                                    sig
+                                } else {
+                                    text.clone()
+                                }
+                            } else {
+                                text.clone()
+                            };
+
                             {
                                 let mut last = listener_state.last_clipboard_content.lock().unwrap();
-                                if *last == text {
+                                if *last == content_signature {
                                     tracing::debug!("Ignoring clipboard message - content matches last_clipboard_content");
                                     return;
                                 }
-                                *last = text.clone();
+                                *last = content_signature;
                             }
 
                             // Check Auto-Receive Setting
