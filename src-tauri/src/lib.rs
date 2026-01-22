@@ -14,16 +14,9 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState, S
 use tauri_plugin_clipboard::Clipboard;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use std::str::FromStr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::fs::File;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use futures::SinkExt;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use uuid::Uuid;
-use crate::protocol::{FileStreamHeader, Message, FileRequestPayload};
+use crate::protocol::Message;
 
 
 #[derive(Parser, Debug)]
@@ -97,7 +90,6 @@ fn get_hostname_internal() -> String {
 }
 use discovery::Discovery;
 use peer::Peer;
-use protocol::ClipboardPayload;
 use rand::Rng;
 use state::AppState;
 use storage::{
@@ -1092,7 +1084,7 @@ pub fn run() {
                          }
                     });
                 },
-                move |mut recv, addr| {
+                move |recv, addr| {
                     tracing::info!("Received FILE stream from {}", addr);
                     let state = file_state.clone();
                     let handle = file_handle.clone();
@@ -1994,7 +1986,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
 
 #[tauri::command]
 async fn request_file(
-    app_handle: tauri::AppHandle,
+    _app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_id: String,
     file_index: usize,

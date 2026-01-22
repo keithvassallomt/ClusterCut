@@ -146,7 +146,7 @@ impl Transport {
                                                 );
                                             }
                                         }
-                                        Err(e) => {
+                                        Err(_e) => {
                                             // connection closed is normal
                                             // tracing::debug!("Message connection closed/error from {}: {}", remote_addr, e);
                                             break;
