@@ -30,6 +30,7 @@ pub struct FileStreamHeader {
     pub file_index: usize,
     pub file_name: String,
     pub file_size: u64,
+    pub iv: String, // Base64 encoded 12-byte IV for stateful encryption
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -1308,9 +1308,6 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
     // 3. Decrypt & Write Loop
     let mut session_key = [0u8; 32];
     {
-         // Find Session Key? No, we use Cluster Key for file transfer!
-         // Wait, plan said Cluster Key encryption?
-         // "End-to-end encryption... using the shared Cluster Key"
          let ck_lock = state.cluster_key.lock().unwrap();
          if let Some(key) = ck_lock.as_ref() {
              if key.len() == 32 {
@@ -1324,6 +1321,25 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
              return;
          }
     }
+
+    // 3a. Init Decryptor
+    let iv_vec = match BASE64.decode(&header.iv) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Failed to decode IV from header: {}", e);
+            return;
+        }
+    };
+    
+    let mut iv = [0u8; 12];
+    if iv_vec.len() == 12 {
+        iv.copy_from_slice(&iv_vec);
+    } else {
+        tracing::error!("Invalid IV length: {}", iv_vec.len());
+        return;
+    }
+    
+    let mut decryptor = crypto::StatefulDecryptor::new(&session_key, iv);
     
     let mut total_written = 0u64;
     let mut last_emit = std::time::Instant::now();
@@ -1344,8 +1360,8 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
                     break;
                 }
                 
-                // Decrypt
-                match crypto::decrypt(&session_key, &chunk_buf).map_err(|e| e.to_string()) {
+                // Decrypt using Stateful Context
+                match decryptor.decrypt(&chunk_buf) {
                     Ok(plaintext) => {
                         if let Err(e) = file.write_all(&plaintext).await {
                             tracing::error!("Failed to write to file: {}", e);
@@ -1950,26 +1966,33 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                            // Open QUIC Stream
                                            match transport_inside.send_file_stream(addr).await {
                                                Ok((_connection, mut stream)) => {
-                                                   // 4. Send Header
+                                                   // 4a. Init Stateful Encryptor
+                                                   let mut iv = [0u8; 12];
+                                                   rand::thread_rng().fill(&mut iv);
+                                                   let mut encryptor = crypto::StatefulEncryptor::new(&key_arr, iv);
+                                                   
+                                                   // 4b. Send Header
                                                    let header = crate::protocol::FileStreamHeader {
                                                        id: req.id,
                                                        file_index: req.file_index,
                                                        file_name,
                                                        file_size,
+                                                       iv: BASE64.encode(iv),
                                                    };
+                                                   
                                                    if let Ok(h_json) = serde_json::to_string(&header) {
                                                        if let Err(e) = stream.write_all(h_json.as_bytes()).await { tracing::error!("Header Write Error: {}", e); return; }
                                                        if let Err(e) = stream.write_all(b"\n").await { tracing::error!("Header Newline Error: {}", e); return; }
                                                    }
                                                    
-                                                   // 5. Encrypt & Send Chunks
+                                                   // 5. Encrypt & Send Chunks (Optimized)
                                                    let mut buf = vec![0u8; 1024 * 1024]; // 1MB chunks
                                                    loop {
                                                        match file.read(&mut buf).await {
                                                            Ok(0) => break, // EOF
                                                            Ok(n) => {
-                                                               // Encrypt Chunk
-                                                               match crypto::encrypt(&key_arr, &buf[0..n]) {
+                                                               // Encrypt Chunk using Stateful Context (Vectorized)
+                                                               match encryptor.encrypt(&buf[0..n]) {
                                                                    Ok(encrypted) => {
                                                                        // Write Len (u32 LE)
                                                                        let len_bytes = (encrypted.len() as u32).to_le_bytes();
@@ -1987,9 +2010,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                    let _ = stream.finish();
                                                    
                                                    // Ensure connection stays alive until data is flushed/acknowledged
-                                                   // Simple wait to allow flush
                                                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                                                   // Now we can close explicitly
                                                    _connection.close(0u32.into(), b"done");
                                                    
                                                    tracing::info!("File Sent Successfully: {}", p_str);
