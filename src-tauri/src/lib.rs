@@ -1342,14 +1342,21 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
     let mut decryptor = crypto::StatefulDecryptor::new(&session_key, iv);
     
     let mut total_written = 0u64;
+    let mut chunks_received = 0;
+    let start_time = std::time::Instant::now();
     let mut last_emit = std::time::Instant::now();
+    
+    tracing::info!("[Receiver] Starting loop. Header size: {}", header.file_size);
+
     loop {
+        let chunk_start = std::time::Instant::now();
         // Read Length (u32 LE)
         let mut len_buf = [0u8; 4];
         match reader.read_exact(&mut len_buf).await {
             Ok(_) => {
                 let chunk_len = u32::from_le_bytes(len_buf) as usize;
                 if chunk_len == 0 {
+                    tracing::info!("[Receiver] Received 0-length chunk (EOF). Total chunks: {}", chunks_received);
                     break; 
                 }
                 
@@ -1359,15 +1366,26 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
                     tracing::error!("Failed to read chunk body: {}", e);
                     break;
                 }
+                let read_duration = chunk_start.elapsed();
                 
                 // Decrypt using Stateful Context
+                let decrypt_start = std::time::Instant::now();
                 match decryptor.decrypt(&chunk_buf) {
                     Ok(plaintext) => {
+                        let decrypt_duration = decrypt_start.elapsed();
+                        
+                        let write_start = std::time::Instant::now();
                         if let Err(e) = file.write_all(&plaintext).await {
                             tracing::error!("Failed to write to file: {}", e);
                             break;
                         }
+                        let write_duration = write_start.elapsed();
+                        
                         total_written += plaintext.len() as u64;
+                        chunks_received += 1;
+                        
+                        tracing::info!("[Receiver] Chunk {}: Read={:?}, Decrypt={:?}, Write={:?}, Len={}", 
+                            chunks_received, read_duration, decrypt_duration, write_duration, plaintext.len());
                         
                         // Emit Progress (Throttled 100ms)
                         if last_emit.elapsed().as_millis() > 100 {
@@ -1388,8 +1406,12 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    // Stream finished cleanly (hopefully)
-                    tracing::info!("File Stream Completed. Written {} bytes.", total_written);
+                    let total_time = start_time.elapsed();
+                    let mb = total_written as f64 / 1_000_000.0;
+                    let speed = mb / total_time.as_secs_f64();
+                    
+                    tracing::info!("File Stream Completed. Written {} bytes in {:?}. Speed: {:.2} MB/s", total_written, total_time, speed);
+                    
                     // Emit FINAL progress to ensure 100%
                     let _ = app.emit("file-progress", serde_json::json!({
                          "id": header.id,
@@ -1987,18 +2009,35 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                    
                                                    // 5. Encrypt & Send Chunks (Optimized)
                                                    let mut buf = vec![0u8; 1024 * 1024]; // 1MB chunks
+                                                   let mut chunks_sent = 0;
+                                                   let start_time = std::time::Instant::now();
+
+                                                   tracing::info!("[Sender] Starting loop. File size: {}", file_size);
+
                                                    loop {
+                                                       let chunk_start = std::time::Instant::now();
                                                        match file.read(&mut buf).await {
                                                            Ok(0) => break, // EOF
                                                            Ok(n) => {
+                                                               let read_duration = chunk_start.elapsed();
+                                                               
                                                                // Encrypt Chunk using Stateful Context (Vectorized)
+                                                               let encrypt_start = std::time::Instant::now();
                                                                match encryptor.encrypt(&buf[0..n]) {
                                                                    Ok(encrypted) => {
+                                                                       let encrypt_duration = encrypt_start.elapsed();
+                                                                       
                                                                        // Write Len (u32 LE)
+                                                                       let write_start = std::time::Instant::now();
                                                                        let len_bytes = (encrypted.len() as u32).to_le_bytes();
                                                                        if let Err(e) = stream.write_all(&len_bytes).await { tracing::error!("Stream Write Error: {}", e); break; }
                                                                        // Write Data
                                                                        if let Err(e) = stream.write_all(&encrypted).await { tracing::error!("Stream Write Error: {}", e); break; }
+                                                                       let write_duration = write_start.elapsed();
+                                                                       
+                                                                       chunks_sent += 1;
+                                                                       tracing::info!("[Sender] Chunk {}: Read={:?}, Encrypt={:?}, Write={:?}, Len={}", 
+                                                                           chunks_sent, read_duration, encrypt_duration, write_duration, n);
                                                                    }
                                                                    Err(e) => { tracing::error!("Encrypt Error: {}", e); break; }
                                                                }
@@ -2006,6 +2045,8 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                            Err(e) => { tracing::error!("File Read Error: {}", e); break; }
                                                        }
                                                    }
+                                                   let total_time = start_time.elapsed();
+                                                   tracing::info!("[Sender] Loop finished in {:?}. Chunks: {}", total_time, chunks_sent);
                                                    // Finish Stream
                                                    let _ = stream.finish();
                                                    
