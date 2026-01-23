@@ -1326,6 +1326,7 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
     }
     
     let mut total_written = 0u64;
+    let mut last_emit = std::time::Instant::now();
     loop {
         // Read Length (u32 LE)
         let mut len_buf = [0u8; 4];
@@ -1333,10 +1334,7 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
             Ok(_) => {
                 let chunk_len = u32::from_le_bytes(len_buf) as usize;
                 if chunk_len == 0 {
-                    break; // EOF marker? No, 0 len chunk implies end? Or rely on stream end?
-                    // Usually we don't send 0 len chunks unless sentinel.
-                    // But if stream closes, read_exact fails with UnexpectedEof?
-                    // Let's rely on reading 4 bytes. If it fails EOF, we are done.
+                    break; 
                 }
                 
                 // Read Chunk (Encrypted)
@@ -1354,7 +1352,17 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
                             break;
                         }
                         total_written += plaintext.len() as u64;
-                        // TODO: Emit Progress?
+                        
+                        // Emit Progress (Throttled 100ms)
+                        if last_emit.elapsed().as_millis() > 100 {
+                             let _ = app.emit("file-progress", serde_json::json!({
+                                 "id": header.id,
+                                 "fileName": header.file_name,
+                                 "total": header.file_size,
+                                 "transferred": total_written
+                             }));
+                             last_emit = std::time::Instant::now();
+                        }
                     }
                     Err(e) => {
                          tracing::error!("Decryption failed for chunk: {}", e);
@@ -1366,7 +1374,15 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     // Stream finished cleanly (hopefully)
                     tracing::info!("File Stream Completed. Written {} bytes.", total_written);
-                    // Emit event
+                    // Emit FINAL progress to ensure 100%
+                    let _ = app.emit("file-progress", serde_json::json!({
+                         "id": header.id,
+                         "fileName": header.file_name,
+                         "total": header.file_size,
+                         "transferred": total_written
+                     }));
+                    
+                    // Emit received event
                      let _ = app.emit("file-received", &header); // Notify UI
                 } else {
                     tracing::error!("Error reading chunk len: {}", e);
@@ -1923,6 +1939,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                            let file_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
                                            let file_name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
                                            
+                                           tracing::info!("Opening QUIC Stream to {} for file '{}' ({} bytes)", addr, file_name, file_size);
                                            // Open QUIC Stream
                                            match transport_inside.send_file_stream(addr).await {
                                                Ok((_connection, mut stream)) => {

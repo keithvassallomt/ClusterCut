@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { 
   Monitor, Copy, History, ShieldCheck, PlusCircle, Trash2, LogOut, 
   Settings, Wifi, Lock, Unlock, AlertTriangle, Info, CheckCircle2,
-  ChevronDown, ChevronRight, ArrowUp, ArrowDown, Send
+  ChevronDown, ChevronRight, ArrowUp, ArrowDown, Send, Download
 } from "lucide-react";
 import clsx from "clsx";
 import { ShortcutRecorder } from "./components/ShortcutRecorder";
@@ -51,6 +51,15 @@ function timeAgo(ts: number): string {
     return new Date(ts * 1000).toLocaleDateString();
 }
 
+function formatBytes(bytes: number, decimals = 1) {
+    if (!+bytes) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+}
+
 
 interface NotificationSettings {
   device_join: boolean;
@@ -69,6 +78,7 @@ interface AppSettings {
   shortcut_receive: string | null;
   enable_file_transfer: boolean;
   max_auto_download_size: number;
+  notify_large_files: boolean;
 }
 
 /* --- Helper Components (from Design) --- */
@@ -1027,9 +1037,19 @@ function DevicesView({
 
 function HistoryView({ items }: { items: HistoryItem[] }) {
   const [myHostname, setMyHostname] = useState<string>("");
+  const [progress, setProgress] = useState<Record<string, { transferred: number, total: number }>>({});
 
   useEffect(() => {
       invoke<string>("get_hostname").then(setMyHostname);
+      
+      const unlistenPromise = listen<{id: string, fileName: string, total: number, transferred: number}>("file-progress", (e) => {
+         setProgress(p => ({ 
+             ...p, 
+             [e.payload.id]: { transferred: e.payload.transferred, total: e.payload.total } 
+         }));
+      });
+
+      return () => { unlistenPromise.then(u => u()); };
   }, []);
 
   const handleSend = async (text: string) => {
@@ -1070,10 +1090,11 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
 
   const handleFileRequest = async (fileId: string, idx: number, peerId: string) => {
        try {
+           setProgress(p => ({ ...p, [fileId]: { transferred: 0, total: 100 } })); // Optimistic start
            await invoke("request_file", { fileId, fileIndex: idx, peerId });
-           alert("Download started in background...");
        } catch (e) {
            alert("Download failed: " + e);
+           setProgress(p => { const n = {...p}; delete n[fileId]; return n; });
        }
   };
 
@@ -1119,18 +1140,35 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
                   {it.files && it.files.length > 0 && (
                       <div className="mt-2 space-y-1">
                           {it.files.map((f, idx) => (
-                              <div key={idx} className="flex items-center justify-between rounded-lg bg-zinc-50 p-2 text-sm dark:bg-zinc-800">
-                                  <div className="flex items-center gap-2 overflow-hidden">
-                                      <span className="truncate font-medium text-zinc-700 dark:text-zinc-300">{f.name}</span>
-                                      <span className="shrink-0 text-xs text-zinc-500">({(f.size / 1024 / 1024).toFixed(1)} MB)</span>
+                              <div key={idx} className="flex flex-col gap-2 rounded-lg bg-zinc-50 p-2 text-sm dark:bg-zinc-800">
+                                  <div className="flex items-center justify-between">
+                                      <div className="flex items-center gap-2 overflow-hidden">
+                                          <span className="truncate font-medium text-zinc-700 dark:text-zinc-300">{f.name}</span>
+                                          <span className="shrink-0 text-xs text-zinc-500">({formatBytes(f.size)})</span>
+                                      </div>
+                                      {!isMe && it.sender_id && !progress[it.id] && (
+                                         <button 
+                                            className="text-emerald-600 hover:bg-emerald-500/10 p-1 rounded-md transition-colors"
+                                            onClick={() => handleFileRequest(it.id, idx, it.sender_id!)}
+                                            title="Download"
+                                         >
+                                            <Download className="h-4 w-4" />
+                                         </button>
+                                      )}
                                   </div>
-                                  {!isMe && it.sender_id && (
-                                     <button 
-                                        className="shrink-0 text-xs font-medium text-emerald-600 hover:text-emerald-500 disabled:opacity-50"
-                                        onClick={() => handleFileRequest(it.id, idx, it.sender_id!)}
-                                     >
-                                        Download
-                                     </button>
+                                  {progress[it.id] && (
+                                      <div className="w-full">
+                                          <div className="flex justify-between text-[10px] text-zinc-500 mb-1">
+                                               <span>Downloading...</span>
+                                               <span>{Math.round((progress[it.id].transferred / progress[it.id].total) * 100)}%</span>
+                                          </div>
+                                          <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-700">
+                                               <div 
+                                                  className="h-full bg-emerald-500 transition-all duration-300 ease-out"
+                                                  style={{ width: `${(progress[it.id].transferred / progress[it.id].total) * 100}%` }}
+                                               />
+                                          </div>
+                                      </div>
                                   )}
                               </div>
                           ))}
@@ -1520,6 +1558,20 @@ function SettingsView({
                     </button>
                 </div>
             ))}
+            
+            {/* Large File Notification (Root Setting) */}
+            <div className="flex items-center justify-between">
+                <div className="text-sm text-zinc-700 dark:text-zinc-300">Large File Transfers</div>
+                <button 
+                    onClick={() => setSettings({
+                        ...settings, 
+                        notify_large_files: !settings.notify_large_files
+                    })}
+                    className={clsx("relative h-5 w-9 rounded-full transition-colors", settings.notify_large_files ? "bg-emerald-500" : "bg-zinc-200 dark:bg-zinc-700")}
+                >
+                        <span className={clsx("block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform", settings.notify_large_files ? "translate-x-5" : "translate-x-1")} />
+                </button>
+            </div>
         </div>
       </Card>
       
