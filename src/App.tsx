@@ -1088,10 +1088,12 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
       }
   };
 
-  const handleFileRequest = async (fileId: string, idx: number, peerId: string) => {
+  const handleDownloadAll = async (fileId: string, files: {name: string}[], peerId: string) => {
        try {
-           setProgress(p => ({ ...p, [fileId]: { transferred: 0, total: 100 } })); // Optimistic start
-           await invoke("request_file", { fileId, fileIndex: idx, peerId });
+           for(let i=0; i<files.length; i++) {
+                setProgress(p => ({ ...p, [fileId]: { transferred: 0, total: 100 } })); 
+                await invoke("request_file", { fileId, fileIndex: i, peerId });
+           }
        } catch (e) {
            alert("Download failed: " + e);
            setProgress(p => { const n = {...p}; delete n[fileId]; return n; });
@@ -1146,15 +1148,6 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
                                           <span className="truncate font-medium text-zinc-700 dark:text-zinc-300">{f.name}</span>
                                           <span className="shrink-0 text-xs text-zinc-500">({formatBytes(f.size)})</span>
                                       </div>
-                                      {!isMe && it.sender_id && !progress[it.id] && (
-                                         <button 
-                                            className="text-emerald-600 hover:bg-emerald-500/10 p-1 rounded-md transition-colors"
-                                            onClick={() => handleFileRequest(it.id, idx, it.sender_id!)}
-                                            title="Download"
-                                         >
-                                            <Download className="h-4 w-4" />
-                                         </button>
-                                      )}
                                   </div>
                                   {progress[it.id] && (
                                       <div className="w-full">
@@ -1180,6 +1173,12 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
                   <IconButton label="Copy to Clipboard" onClick={() => handleLocalCopy(it.text)}>
                       <Copy className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />
                   </IconButton>
+
+                  {!isMe && it.files && it.files.length > 0 && it.sender_id && (
+                      <IconButton label="Download All" onClick={() => handleDownloadAll(it.id, it.files!, it.sender_id!)}>
+                          <Download className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                      </IconButton>
+                  )}
                   
                   <IconButton label="Send to Cluster" onClick={() => handleSend(it.text)}>
                       <Send className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />

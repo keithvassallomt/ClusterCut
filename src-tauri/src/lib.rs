@@ -1384,6 +1384,13 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
                     
                     // Emit received event
                      let _ = app.emit("file-received", &header); // Notify UI
+                     
+                     // Notification (if enabled)
+                     let settings = state.settings.lock().unwrap();
+                     if settings.notify_large_files && header.file_size > settings.max_auto_download_size {
+                         let body = format!("Download complete: {}", header.file_name);
+                         send_notification(&app, "Download Complete", &body);
+                     }
                 } else {
                     tracing::error!("Error reading chunk len: {}", e);
                 }
@@ -1534,8 +1541,8 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                 }
                                             }
                                         } else {
-                                            let notifications = listener_state.settings.lock().unwrap().notifications.clone();
-                                            if notifications.data_received {
+                                            let settings = listener_state.settings.lock().unwrap();
+                                            if settings.notify_large_files {
                                                 let body = format!("Received {} files from {}. Click to download.", files.len(), sender);
                                                 send_notification(&listener_handle, "Files Available", &body);
                                             }
@@ -1956,7 +1963,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                    }
                                                    
                                                    // 5. Encrypt & Send Chunks
-                                                   let mut buf = [0u8; 64 * 1024]; // 64KB chunks
+                                                   let mut buf = vec![0u8; 1024 * 1024]; // 1MB chunks
                                                    loop {
                                                        match file.read(&mut buf).await {
                                                            Ok(0) => break, // EOF
