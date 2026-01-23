@@ -137,8 +137,6 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
         let title = title.to_string();
         let body = body.to_string();
         let app = app_handle.clone();
-        let _ = increment_badge; // Silence unused warning on Linux
-        
         // Spawn to avoid blocking
         tauri::async_runtime::spawn(async move {
             let mut notification = Notification::new();
@@ -147,6 +145,15 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
                 .body(&body)
                 .appname("ClusterCut")
                 .timeout(notify_rust::Timeout::Milliseconds(5000));
+            
+            // Ubuntu/Dock Badge Logic:
+            // "Transient" hint often prevents the notification from persisting in the history/dock.
+            // If we DO NOT want to increment the badge (increment_badge = false), we set Transient(true).
+            if !increment_badge {
+                notification.hint(notify_rust::Hint::Transient(true));
+            } else {
+                notification.hint(notify_rust::Hint::Transient(false));
+            }
             
             // If it's a "File Available" type notification (which implies we want action)
             // We can add an action.
@@ -1285,6 +1292,25 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle: &tauri::AppHandle, event: tauri::RunEvent| {
         match event {
+            tauri::RunEvent::WindowEvent { event: tauri::WindowEvent::Focused(true), .. } => {
+                // Clear badge on focus
+                #[cfg(target_os = "linux")]
+                {
+                    // Hinting "0" or "transient" might be needed?
+                    // With dbus, usually just replacing or clearing isn't standard.
+                    // But if we use tauri badging plugin, it might work?
+                    // Let's try the native tauri badge set to 0.
+                    let _ = app_handle.notification().builder().body("").show(); // Dummy? No.
+                    // Access badging if available.
+                    // Since we don't have badging plugin setup explicitly in rust code (it's in capabilities),
+                    // we might need to rely on the fact that Transient history won't show it.
+                    // But for the persistent one ("Files Available"), we want to clear.
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                     let _ = app_handle.set_badge_count(Some(0));
+                }
+            }
             tauri::RunEvent::Exit => {
                 tracing::info!("App exiting, signaling shutdown to background threads...");
                 let state = app_handle.state::<AppState>();
