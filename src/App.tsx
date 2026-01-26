@@ -485,6 +485,10 @@ export default function App() {
         // Bring window to front handled by backend
     });
 
+    const unlistenSettingsChanged = listen<AppSettings>("settings-changed", (event) => {
+        setIsAutoSend(event.payload.auto_send);
+    });
+
     return () => {
       unlistenPeer.then((f) => f());
       unlistenClipboard.then((f) => f());
@@ -495,6 +499,7 @@ export default function App() {
       unlistenDelete.then((f) => f());
       unlistenPairingFailed.then((f) => f());
       unlistenNotification.then((f) => f());
+      unlistenSettingsChanged.then((f) => f());
     };
   }, [myHostname]); // Re-bind if hostname loads (needed for sender check)
 
@@ -1248,6 +1253,20 @@ function SettingsView({
       setProvPin(p);
       setLoading(false);
     });
+
+    const unlisten = listen<AppSettings>("settings-changed", (event) => {
+        setSettings(event.payload);
+        // We also need to update initialSettings to prevent auto-save loops if we consider this "saved"
+        // But auto-save effect depends on comparing `settings` to something? 
+        // No, auto-save effect runs when `settings` changes.
+        // If we update `settings` here, auto-save triggers. 
+        // Use a flag or ref to avoid re-saving what we just received?
+        // Actually, if settings match what backend has, saving it again is harmless (idempotent-ish).
+        // To be safe, we can update initialSettings too.
+        setInitialSettings(JSON.parse(JSON.stringify(event.payload)));
+    });
+
+    return () => { unlisten.then(f => f()); };
   }, []);
 
   // Autosave Effect

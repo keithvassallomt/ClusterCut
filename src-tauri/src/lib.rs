@@ -6,6 +6,7 @@ mod protocol;
 mod state;
 mod storage;
 mod transport;
+mod tray;
 
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -277,6 +278,9 @@ fn save_settings(
 ) {
     *state.settings.lock().unwrap() = settings.clone();
     crate::storage::save_settings(&app_handle, &settings);
+    
+    #[cfg(desktop)]
+    crate::tray::update_tray_menu(&app_handle);
     
     // Update Shortcuts
     register_shortcuts(&app_handle);
@@ -888,6 +892,11 @@ pub fn run() {
             tracing::info!("QUIC Transport listening on port {}", port);
 
             let app_handle = app.handle();
+            
+            #[cfg(desktop)]
+            {
+                let _ = crate::tray::create_tray(app_handle);
+            }
 
             // Load State
             {
@@ -1288,6 +1297,16 @@ pub fn run() {
             confirm_pending_clipboard,
             request_file,
         ])
+        .on_window_event(|window, event| {
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                     // Minimize to Tray behavior
+                     let _ = window.hide();
+                     api.prevent_close();
+                }
+                _ => {}
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle: &tauri::AppHandle, event: tauri::RunEvent| {
@@ -1582,6 +1601,13 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
 
                             // Check Auto-Receive Setting
                             tracing::debug!("Decrypted Clipboard from {}: {}...", sender, if text.len() > 20 { &text[0..20] } else { &text }); 
+
+                            if let Some(files) = &payload.files {
+                                if !files.is_empty() {
+                                    #[cfg(desktop)]
+                                    crate::tray::set_badge(&listener_handle, true);
+                                }
+                            }
                             
                             // Create Payload Object (already created above as 'payload' or fallback)
                             // Use the one we constructed or parsed
