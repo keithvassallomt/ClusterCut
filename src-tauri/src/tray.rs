@@ -264,6 +264,95 @@ pub fn update_tray_menu(_app: &AppHandle) {
     // STUB
 }
 
-pub fn set_badge(_app: &AppHandle, _show: bool) {
-    // STUB
+pub fn set_badge(app: &AppHandle, show: bool) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        if !show {
+            // Restore default icon
+            let (icon, is_template) = get_platform_icon(app);
+            let _ = tray.set_icon(Some(icon));
+            let _ = tray.set_icon_as_template(is_template);
+            return;
+        }
+
+        // Load current icon bytes to modify
+        // We'll reuse get_platform_icon logic but need the raw bytes or re-load.
+        // It's cleaner to just re-load source bytes here.
+
+        let icon_bytes = {
+            #[cfg(target_os = "windows")]
+            {
+                include_bytes!("../icons/ico/clustercut-tray.ico").to_vec()
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                // Linux/macOS Theme Logic
+                use tauri::Theme;
+                let theme = if let Some(window) = app.get_webview_window("main") {
+                    window.theme().unwrap_or(Theme::Light)
+                } else {
+                    Theme::Light
+                };
+
+                match theme {
+                    Theme::Dark => {
+                        include_bytes!("../icons/png/clustercut-tray-white.png").to_vec()
+                    }
+                    Theme::Light => {
+                        include_bytes!("../icons/png/clustercut-tray-black.png").to_vec()
+                    }
+                    _ => include_bytes!("../icons/png/clustercut-tray.png").to_vec(),
+                }
+            }
+        };
+
+        // Process with image crate
+        // Detect format: ICO for windows, PNG for others
+        #[cfg(target_os = "windows")]
+        let format = image::ImageFormat::Ico;
+        #[cfg(not(target_os = "windows"))]
+        let format = image::ImageFormat::Png;
+
+        if let Ok(mut img) = image::load_from_memory_with_format(&icon_bytes, format) {
+            // Draw Red Dot (Top Right)
+            // 20% size, 5% padding
+            let (w, h) = (img.width(), img.height());
+            let dot_size = (w as f32 * 0.25) as u32;
+            let padding = (w as f32 * 0.05) as u32; // 5% padding
+
+            // For RGBA drawing manually
+            use image::GenericImage;
+            use image::Rgba;
+
+            let red = Rgba([255, 0, 0, 255]);
+
+            // Draw circle-ish square for now or circle
+            // Simple square dot
+            let x_start = w - dot_size - padding;
+            let y_start = padding;
+
+            for x in x_start..(x_start + dot_size) {
+                for y in y_start..(y_start + dot_size) {
+                    if x < w && y < h {
+                        img.put_pixel(x, y, red);
+                    }
+                }
+            }
+
+            // Convert back to bytes (PNG usually best for transport)
+            // But for Tauri Tray, Image::from_rgba is best if we have raw buffer
+            // Or Image::from_bytes with PNG encoding.
+            // Encoding to PNG in memory is safer for compatibility.
+            let mut buf = Vec::new();
+            if img
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .is_ok()
+            {
+                if let Ok(icon) = tauri::image::Image::from_bytes(&buf) {
+                    let _ = tray.set_icon(Some(icon));
+                    // Disable template mode so Red dot shows (on macOS)
+                    let _ = tray.set_icon_as_template(false);
+                }
+            }
+        }
+    }
 }

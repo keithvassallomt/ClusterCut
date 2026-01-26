@@ -850,6 +850,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.16",
  "hostname",
+ "image",
  "ipnetwork",
  "local-ip-address",
  "mdns-sd",
