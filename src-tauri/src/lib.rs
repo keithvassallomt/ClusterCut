@@ -892,6 +892,9 @@ pub fn run() {
             tracing::info!("QUIC Transport listening on port {}", port);
 
             let app_handle = app.handle();
+
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             
             #[cfg(desktop)]
             {
