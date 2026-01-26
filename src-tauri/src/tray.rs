@@ -1,39 +1,73 @@
 use crate::state::AppState;
 use tauri::{
     image::Image,
-    menu::{CheckMenuItem, Menu, MenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Listener, Manager, Wry,
 };
 
+#[cfg(not(target_os = "linux"))]
+use tauri::menu::CheckMenuItem;
+
 pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
-    let toggle_auto_send = CheckMenuItem::with_id(
-        app,
-        "toggle_auto_send",
-        "Auto-Send",
-        true,
-        false,
-        None::<&str>,
-    )?;
-    let toggle_auto_receive = CheckMenuItem::with_id(
-        app,
-        "toggle_auto_receive",
-        "Auto-Receive",
-        true,
-        false,
-        None::<&str>,
-    )?;
+    // Platform-specific Menu Item Creation
+    #[cfg(not(target_os = "linux"))]
+    let (toggle_auto_send, toggle_auto_receive) = {
+        let send = CheckMenuItem::with_id(
+            app,
+            "toggle_auto_send",
+            "Auto-Send",
+            true,
+            false,
+            None::<&str>,
+        )?;
+        let receive = CheckMenuItem::with_id(
+            app,
+            "toggle_auto_receive",
+            "Auto-Receive",
+            true,
+            false,
+            None::<&str>,
+        )?;
+        (send, receive)
+    };
+
+    #[cfg(target_os = "linux")]
+    let (toggle_auto_send, toggle_auto_receive) = {
+        // Linux uses standard MenuItems with dynamic text "Enable ... / Disable ..."
+        let send = MenuItem::with_id(
+            app,
+            "toggle_auto_send",
+            "Disable Auto-Send",
+            true,
+            None::<&str>,
+        )?;
+        let receive = MenuItem::with_id(
+            app,
+            "toggle_auto_receive",
+            "Disable Auto-Receive",
+            true,
+            None::<&str>,
+        )?;
+        (send, receive)
+    };
+
     let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let show_i = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
+
+    // Construct Menu
+    // Note: We need to cast our platform specific items to &dyn IsMenuItem or similar if strictly typed,
+    // but Menu::with_items takes &dyn IsMenuItem.
+    // CheckMenuItem implements IsMenuItem. MenuItem implements IsMenuItem.
 
     let menu = Menu::with_items(
         app,
         &[
             &show_i,
-            &MenuItem::with_id(app, "sep1", "-", true, None::<&str>)?,
+            &PredefinedMenuItem::separator(app)?,
             &toggle_auto_send,
             &toggle_auto_receive,
-            &MenuItem::with_id(app, "sep2", "-", true, None::<&str>)?,
+            &PredefinedMenuItem::separator(app)?,
             &quit_i,
         ],
     )?;
@@ -41,8 +75,30 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
     // Initial state sync
     let state = app.state::<AppState>();
     let settings = state.settings.lock().unwrap();
-    let _ = toggle_auto_send.set_checked(settings.auto_send);
-    let _ = toggle_auto_receive.set_checked(settings.auto_receive);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = toggle_auto_send.set_checked(settings.auto_send);
+        let _ = toggle_auto_receive.set_checked(settings.auto_receive);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = toggle_auto_send.set_text(if settings.auto_send {
+            "Disable Auto-Send"
+        } else {
+            "Enable Auto-Send"
+        });
+        let _ = toggle_auto_receive.set_text(if settings.auto_receive {
+            "Disable Auto-Receive"
+        } else {
+            "Enable Auto-Receive"
+        });
+    }
+
+    // Capture handles for the closure
+    let toggle_send_handle = toggle_auto_send.clone();
+    let toggle_receive_handle = toggle_auto_receive.clone();
 
     // Initial Icon Selection
     let (icon, is_template) = get_platform_icon(app);
@@ -70,6 +126,17 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
                     settings.auto_send = !settings.auto_send;
                     crate::storage::save_settings(app, &settings);
                     let _ = app.emit("settings-changed", settings.clone());
+
+                    // Update Menu Item using captured handle
+                    #[cfg(target_os = "linux")]
+                    let _ = toggle_send_handle.set_text(if settings.auto_send {
+                        "Disable Auto-Send"
+                    } else {
+                        "Enable Auto-Send"
+                    });
+
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = toggle_send_handle.set_checked(settings.auto_send);
                 }
                 "toggle_auto_receive" => {
                     let state = app.state::<AppState>();
@@ -77,6 +144,17 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
                     settings.auto_receive = !settings.auto_receive;
                     crate::storage::save_settings(app, &settings);
                     let _ = app.emit("settings-changed", settings.clone());
+
+                    // Update Menu Item using captured handle
+                    #[cfg(target_os = "linux")]
+                    let _ = toggle_receive_handle.set_text(if settings.auto_receive {
+                        "Disable Auto-Receive"
+                    } else {
+                        "Enable Auto-Receive"
+                    });
+
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = toggle_receive_handle.set_checked(settings.auto_receive);
                 }
                 _ => {}
             }
