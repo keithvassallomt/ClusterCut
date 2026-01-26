@@ -100,7 +100,7 @@ use storage::{
 };
 use tauri::{Emitter, Manager};
 use transport::Transport;
-use tauri_plugin_notification::NotificationExt;
+// use tauri_plugin_notification::NotificationExt;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 // Helper to broadcast a new peer to all known peers (Gossip)
@@ -109,7 +109,7 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
     #[cfg(not(target_os = "linux"))]
     {
         use tauri_plugin_notification::NotificationExt;
-        let mut builder = app_handle.notification().builder()
+        let builder = app_handle.notification().builder()
             .title(title)
             .body(body)
             .sound("Ping");
@@ -1318,6 +1318,7 @@ pub fn run() {
                 // Clear badge on focus
                 #[cfg(target_os = "linux")]
                 {
+                    use tauri_plugin_notification::NotificationExt;
                     // Hinting "0" or "transient" might be needed?
                     // With dbus, usually just replacing or clearing isn't standard.
                     // But if we use tauri badging plugin, it might work?

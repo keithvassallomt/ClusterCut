@@ -2,9 +2,12 @@ use crate::state::AppState;
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
+    tray::{TrayIcon, TrayIconBuilder},
     AppHandle, Emitter, Listener, Manager, Wry,
 };
+
+#[cfg(target_os = "linux")]
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 
 #[cfg(not(target_os = "linux"))]
 use tauri::menu::CheckMenuItem;
@@ -174,6 +177,12 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
                     set_badge(app, false);
                 }
             }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Unused
+                let _ = tray;
+                let _ = event;
+            }
         })
         .build(app)?;
 
@@ -187,6 +196,9 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
 }
 
 fn get_platform_icon(app: &AppHandle) -> (Image<'static>, bool) {
+    #[cfg(target_os = "windows")]
+    let _ = app;
+
     #[cfg(target_os = "macos")]
     {
         get_themed_icon(app)
@@ -226,8 +238,6 @@ fn get_themed_icon(app: &AppHandle) -> (Image<'static>, bool) {
         Theme::Light // Fallback if no window
     };
 
-    tracing::info!("Detected System Theme: {:?}", theme);
-
     match theme {
         Theme::Dark => (
             tauri::image::Image::from_bytes(include_bytes!(
@@ -252,6 +262,9 @@ fn get_themed_icon(app: &AppHandle) -> (Image<'static>, bool) {
 }
 
 pub fn update_tray_icon(app: &AppHandle) {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = app; // Unused on Windows
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if let Some(tray) = app.tray_by_id("main-tray") {
