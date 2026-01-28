@@ -32,25 +32,18 @@
       "entitlements": "Entitlements.plist",
       "dmg": {
         "background": "./assets/dmg-background.png",
-        "iconSize": 128,
         "windowSize": {
           "width": 660,
           "height": 384
         },
-        "contents": [
-          {
-            "x": 538,
-            "y": 243,
-            "type": "link",
-            "path": "/Applications"
-          },
-          {
-            "x": 122,
-            "y": 243,
-            "type": "file",
-            "path": "ClusterCut.app"
-          }
-        ]
+        "appPosition": {
+          "x": 122,
+          "y": 243
+        },
+        "applicationFolderPosition": {
+          "x": 538,
+          "y": 243
+        }
       }
     },
     "windows": {
