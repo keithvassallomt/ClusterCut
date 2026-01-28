@@ -60,7 +60,9 @@ fn init_logging() {
     // Let's us `directories` crate? Or just `.logs` in CWD for development as requested?
     // "We need each log line to be timestamped, and include hostname."
     
-    let file_appender = tracing_appender::rolling::daily("logs", "clustercut.log");
+    // Use temp_dir for logs to ensure we can write even if CWD is / (macOS Bundle)
+    let log_dir = std::env::temp_dir().join("ClusterCutLogs");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "clustercut.log");
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_appender)
         .with_ansi(false)
