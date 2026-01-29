@@ -16,6 +16,16 @@ flatpak-local:
     flatpak-builder --user --install --force-clean src-tauri/flatpak/build-dir src-tauri/flatpak/com.keithvassallo.clustercut.yml
     @echo "Done! Run with: flatpak run com.keithvassallo.clustercut"
 
+# Build for Flathub (Source build)
+flatpak-flathub:
+    @echo "Generating Cargo sources..."
+    python3 src-tauri/flatpak/builder-tools/cargo/flatpak-cargo-generator.py src-tauri/Cargo.lock -o src-tauri/flatpak/cargo-sources.json
+    @echo "Generating Node sources..."
+    export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/src-tauri/flatpak/builder-tools/node" && python3 -m flatpak_node_generator npm package-lock.json -o src-tauri/flatpak/node-sources.json
+    @echo "Building Flatpak from source..."
+    flatpak-builder --user --install --force-clean src-tauri/flatpak/build-dir src-tauri/flatpak/com.keithvassallo.clustercut.flathub.yml
+    @echo "Done! This version was built locally from source."
+
 # Run the local Flatpak
 run-flatpak:
     flatpak run com.keithvassallo.clustercut
