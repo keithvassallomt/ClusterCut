@@ -13,6 +13,8 @@ finish-args:
   - --socket=x11
   # System Tray Icon (StatusNotifierItem)
   - --talk-name=org.kde.StatusNotifierWatcher
+  # Allow exporting tray icons to host
+  - --filesystem=xdg-run/tray-icon:create
   # GPU acceleration
   - --device=dri
   # Audio access (for notifications)
