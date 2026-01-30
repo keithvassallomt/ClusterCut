@@ -1,0 +1,9 @@
+{
+  "name": "ClusterCut",
+  "description": "Integration for ClusterCut Clipboard Sync. Adds a Quick Settings toggle to control Auto-Send and Show Window.",
+  "uuid": "clustercut@keithvassallo.com",
+  "shell-version": [
+    "45", "46", "47", "48", "49"
+  ],
+  "url": "https://github.com/keithvassallomt/ClusterCut"
+}

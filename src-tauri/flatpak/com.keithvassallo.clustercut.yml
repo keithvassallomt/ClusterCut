@@ -23,6 +23,8 @@ finish-args:
   - --talk-name=org.freedesktop.Notifications
   # Access to user's Downloads folder (if needed for file sharing, optional)
   - --filesystem=xdg-download
+  # Own D-Bus name for GNOME Extension communication
+  - --own-name=com.keithvassallo.clustercut
 modules:
   - name: intltool
     buildsystem: autotools

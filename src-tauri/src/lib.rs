@@ -1,4 +1,6 @@
 mod clipboard;
+#[cfg(target_os = "linux")]
+mod dbus;
 mod crypto;
 mod discovery;
 mod peer;
@@ -281,7 +283,7 @@ fn save_settings(
     *state.settings.lock().unwrap() = settings.clone();
     crate::storage::save_settings(&app_handle, &settings);
     
-    #[cfg(desktop)]
+    #[cfg(all(desktop, not(target_os = "linux")))]
     crate::tray::update_tray_menu(&app_handle);
     
     // Update Shortcuts
@@ -901,6 +903,16 @@ pub fn run() {
             #[cfg(desktop)]
             {
                 let _ = crate::tray::create_tray(&app_handle);
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                let dbus_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                     if let Err(e) = crate::dbus::start_dbus_server(dbus_handle).await {
+                         tracing::error!("Failed to start D-Bus service: {}", e);
+                     }
+                });
             }
 
             // Load State

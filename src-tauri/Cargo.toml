@@ -51,5 +51,6 @@ tauri-plugin-global-shortcut = "2.3.1"
 url = "2.5"
 percent-encoding = "2.3"
 notify-rust = "4"
+zbus = { version = "4", features = ["tokio"] }
 image = "0.25.9"
 
