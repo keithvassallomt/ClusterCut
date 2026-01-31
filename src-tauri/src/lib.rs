@@ -282,6 +282,7 @@ fn save_settings(
 ) {
     *state.settings.lock().unwrap() = settings.clone();
     crate::storage::save_settings(&app_handle, &settings);
+    let _ = app_handle.emit("settings-changed", settings.clone());
     
     #[cfg(all(desktop, not(target_os = "linux")))]
     crate::tray::update_tray_menu(&app_handle);
@@ -1103,7 +1104,7 @@ pub fn run() {
                                 let r_id = id.clone();
                                 
                                 tauri::async_runtime::spawn(async move {
-                                    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                                     
                                     let mut pending = r_state.pending_removals.lock().unwrap();
                                     if let Some(n) = pending.get(&r_id) {
@@ -1195,7 +1196,7 @@ pub fn run() {
 
             tauri::async_runtime::spawn(async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     
                     let peers: Vec<Peer> = {
                         // FIX: Heartbeat ALL runtime peers, not just known (connected) ones.
@@ -1366,6 +1367,39 @@ pub fn run() {
                 tracing::info!("Dropping discovery service...");
                 let mut discovery = state.discovery.lock().unwrap();
                 *discovery = None; // Explicitly drop to trigger unregister
+
+                // Broadcast Goodbye
+                let local_id = state.local_device_id.lock().unwrap().clone();
+                let msg = crate::protocol::Message::PeerRemoval(local_id);
+                if let Ok(data) = serde_json::to_vec(&msg) {
+                    let peers = state.get_peers();
+                    tracing::info!("Broadcasting Goodbye to {} peers...", peers.len());
+                    
+                    // Best effort send (blocking/sync context or fire-and-forget)
+                    // Since we are exiting, async runtime might be shutting down.
+                    // We can try to spawn on the handle if it's still valid, or just hope.
+                    // Actually, 'app_handle' is valid.
+                    
+                    for p in peers.values() {
+                         let addr = std::net::SocketAddr::new(p.ip, p.port);
+                         let data_vec = data.clone();
+                         // We create a new transport instance or use existing? 
+                         // Existing transport is in state, but we need to use it.
+                         // Quickest way: spawn and give it a few millis.
+                         let t_state = (*state).clone();
+                         tauri::async_runtime::spawn(async move {
+                             let transport_opt = {
+                                 let lock = t_state.transport.lock().unwrap();
+                                 lock.clone()
+                             };
+                             if let Some(transport) = transport_opt {
+                                 let _ = transport.send_message(addr, &data_vec).await;
+                             }
+                         });
+                    }
+                    // Give a brief moment for packets to fly
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
             }
             _ => {}
         }

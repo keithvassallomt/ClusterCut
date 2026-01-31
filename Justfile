@@ -44,6 +44,8 @@ setup-flatpak:
     git clone https://github.com/flathub/shared-modules.git src-tauri/flatpak/shared-modules 2>/dev/null || echo "shared-modules already exists"
     @echo "Copying necessary patches..."
     # Ensure patches are extracted from shared-modules if not present
-    # (For now, we assume they are checked in or handled by the repo structure, 
-    # but strictly speaking strict Flathub builds would re-download everything.
-    # We will rely on the repo state for local builds for now.)
+# Build the GNOME Extension ZIP
+extension-zip:
+    @echo "Building GNOME Extension ZIP..."
+    cd gnome-extension && zip -r ../clustercut-extension.zip .
+    @echo "Done: clustercut-extension.zip"

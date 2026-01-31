@@ -1,6 +1,7 @@
 use crate::state::AppState;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Listener, Manager};
 use zbus::interface;
+use zbus::object_server::SignalContext;
 
 pub struct ClusterCutDBus {
     app_handle: tauri::AppHandle,
@@ -58,15 +59,44 @@ impl ClusterCutDBus {
     async fn quit(&self) {
         self.app_handle.exit(0);
     }
+
+    #[zbus(signal)]
+    pub async fn state_changed(
+        ctxt: &SignalContext<'_>,
+        auto_send: bool,
+        auto_receive: bool,
+    ) -> zbus::Result<()>;
 }
 
 pub async fn start_dbus_server(app_handle: tauri::AppHandle) -> zbus::Result<()> {
-    let service = ClusterCutDBus::new(app_handle);
-    let _conn = zbus::connection::Builder::session()?
+    let service = ClusterCutDBus::new(app_handle.clone());
+    let conn = zbus::connection::Builder::session()?
         .name("com.keithvassallo.clustercut")?
         .serve_at("/org/gnome/Shell/Extensions/ClusterCut", service)?
         .build()
         .await?;
+
+    // Clone for the closure
+    let dbus_conn = conn.clone();
+
+    // Listen for internal settings changes
+    app_handle.listen("settings-changed", move |event: tauri::Event| {
+        if let Ok(payload) = serde_json::from_str::<crate::storage::AppSettings>(event.payload()) {
+            let conn = dbus_conn.clone();
+            // Emit signal asynchronously
+            tauri::async_runtime::spawn(async move {
+                let _ = conn
+                    .emit_signal(
+                        Option::<&str>::None, // destination (broadcast)
+                        "/org/gnome/Shell/Extensions/ClusterCut",
+                        "com.keithvassallo.clustercut",
+                        "StateChanged",
+                        &(payload.auto_send, payload.auto_receive),
+                    )
+                    .await;
+            });
+        }
+    });
 
     // Keep connection alive
     std::future::pending::<()>().await;
