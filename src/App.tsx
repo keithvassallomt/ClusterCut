@@ -374,8 +374,13 @@ export default function App() {
   };
 
   // GNOME Extension Check
+  // Use a ref to ensure we only show the dialog once per session if not ignored permanently
+  const hasCheckedExtension = useRef(false);
+
   useEffect(() => {
-      if (settings?.ignore_extension_missing === false) {
+      if (!hasCheckedExtension.current && settings?.ignore_extension_missing === false) {
+           hasCheckedExtension.current = true; // Mark as checked so we don't spam
+           
            invoke<{is_gnome: boolean, is_installed: boolean}>('check_gnome_extension_status')
            .then(status => {
                if (status.is_gnome && !status.is_installed) {
