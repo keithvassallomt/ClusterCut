@@ -2419,7 +2419,7 @@ struct ExtensionStatus {
 }
 
 #[tauri::command]
-fn check_gnome_extension_status() -> ExtensionStatus {
+async fn check_gnome_extension_status() -> ExtensionStatus {
     let xdg_current_desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     let is_gnome = xdg_current_desktop.contains("GNOME");
 
@@ -2427,7 +2427,29 @@ fn check_gnome_extension_status() -> ExtensionStatus {
         return ExtensionStatus { is_gnome: false, is_installed: false };
     }
 
-    // Check specific paths
+    // Try D-Bus first (works in Flatpak if permissions are set)
+    if let Ok(connection) = zbus::Connection::session().await {
+         let proxy_result: zbus::Result<zbus::Proxy> = zbus::Proxy::new(
+             &connection,
+             "org.gnome.Shell",
+             "/org/gnome/Shell",
+             "org.gnome.Shell.Extensions"
+         ).await;
+
+         if let Ok(proxy) = proxy_result {
+              // Method: ListExtensions() -> a{sa{sv}}
+              // Returns a map where key is UUID, value is properties
+              // Use OwnedValue to avoid lifetime issues with DynamicDeserialize
+              let call_result: zbus::Result<std::collections::HashMap<String, std::collections::HashMap<String, zbus::zvariant::OwnedValue>>> = proxy.call("ListExtensions", &()).await;
+              
+              if let Ok(extensions) = call_result {
+                   let is_installed = extensions.contains_key("clustercut@keithvassallo.com");
+                   return ExtensionStatus { is_gnome: true, is_installed };
+              }
+         }
+    }
+
+    // Fallback to File Check (for native builds)
     let home = std::env::var("HOME").unwrap_or_default();
     let local_path = format!("{}/.local/share/gnome-shell/extensions/clustercut@keithvassallo.com", home);
     let system_path = "/usr/share/gnome-shell/extensions/clustercut@keithvassallo.com";

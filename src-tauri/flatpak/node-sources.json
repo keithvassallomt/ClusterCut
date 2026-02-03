@@ -741,6 +741,13 @@
     },
     {
         "type": "file",
+        "url": "https://registry.npmjs.org/@types/node/-/node-25.2.0.tgz",
+        "sha512": "0d9f15c11154373baa279921aefc0c5c79af3defb319ac8986bd820cd88a075581135493f038e5d340f4202e2fbcd98731d8fa0e56d844868513b5878e50e5e7",
+        "dest-filename": "15c11154373baa279921aefc0c5c79af3defb319ac8986bd820cd88a075581135493f038e5d340f4202e2fbcd98731d8fa0e56d844868513b5878e50e5e7",
+        "dest": "flatpak-node/npm-cache/_cacache/content-v2/sha512/0d/9f"
+    },
+    {
+        "type": "file",
         "url": "https://registry.npmjs.org/@types/react-dom/-/react-dom-19.2.3.tgz",
         "sha512": "8e9d8bfde63a7e7f8a81555000ea9822d6c5d1563f600a5ee4ccf61746b29123bc831df56d8099caf49e6310872afcc71b97998dcfb3c9a4b906b056c9adbe91",
         "dest-filename": "8bfde63a7e7f8a81555000ea9822d6c5d1563f600a5ee4ccf61746b29123bc831df56d8099caf49e6310872afcc71b97998dcfb3c9a4b906b056c9adbe91",
@@ -1427,6 +1434,13 @@
     },
     {
         "type": "file",
+        "url": "https://registry.npmjs.org/undici-types/-/undici-types-7.16.0.tgz",
+        "sha512": "673f9a6564a3f0b13ace8c43fb1ae387855f9081bc61ae8bbd8919aad5101893d98d8979df2a42694c16aa8ede234c7ae8a046791a3e9a504490c49e499dfc37",
+        "dest-filename": "9a6564a3f0b13ace8c43fb1ae387855f9081bc61ae8bbd8919aad5101893d98d8979df2a42694c16aa8ede234c7ae8a046791a3e9a504490c49e499dfc37",
+        "dest": "flatpak-node/npm-cache/_cacache/content-v2/sha512/67/3f"
+    },
+    {
+        "type": "file",
         "url": "https://registry.npmjs.org/update-browserslist-db/-/update-browserslist-db-1.2.3.tgz",
         "sha512": "26cd26f5cc7ea8e803c68d1e32214612e796cedcfe778f8cdeb1a598a3d3f93e084bf8cfe32970dcdc29bba7294d33fc4753000b5905e156dd2eddc045fdb4f7",
         "dest-filename": "26f5cc7ea8e803c68d1e32214612e796cedcfe778f8cdeb1a598a3d3f93e084bf8cfe32970dcdc29bba7294d33fc4753000b5905e156dd2eddc045fdb4f7",
@@ -1692,6 +1706,12 @@
         "contents": "34f7fdd9976ddaeb00777468248091f871f463dd\t{\"key\": \"make-fetch-happen:request-cache:https://registry.npmjs.org/@tauri-apps/cli-darwin-x64/-/cli-darwin-x64-2.9.6.tgz\", \"integrity\": \"sha512-oWh74WmqbERwwrwcueJyY6HYhgCksUc6NT7WKeXyrlY/FPmNgdyQAgcLuTSkhRFuQ6zh4Np1HZpOqCTpeZBDcw==\", \"time\": 0, \"size\": 8542723, \"metadata\": {\"url\": \"https://registry.npmjs.org/@tauri-apps/cli-darwin-x64/-/cli-darwin-x64-2.9.6.tgz\", \"reqHeaders\": {}, \"resHeaders\": {}}}",
         "dest-filename": "0984eac7ba4c332c063354076b2ec7f4464f73fd78b833f36f42939502e9",
         "dest": "flatpak-node/npm-cache/_cacache/index-v5/a0/39"
+    },
+    {
+        "type": "inline",
+        "contents": "36c0a590909d84d62c8785446f85aca7465dceb5\t{\"key\": \"make-fetch-happen:request-cache:https://registry.npmjs.org/@types/node/-/node-25.2.0.tgz\", \"integrity\": \"sha512-DZ8VwRFUNzuqJ5khrvwMXHmvPe+zGayJhr2CDNiKB1WBE1ST8Djl00D0IC4vvNmHMdj6DlbYRIaFE7WHjlDl5w==\", \"time\": 0, \"size\": 443375, \"metadata\": {\"url\": \"https://registry.npmjs.org/@types/node/-/node-25.2.0.tgz\", \"reqHeaders\": {}, \"resHeaders\": {}}}",
+        "dest-filename": "ded315462b419938f7ad8467ad781cd942d48a092bb0111e503b92893ecf",
+        "dest": "flatpak-node/npm-cache/_cacache/index-v5/f4/68"
     },
     {
         "type": "inline",
@@ -2178,6 +2198,12 @@
         "contents": "9d3fdcde75cc3d44a066499a2dfb2a43a343171e\t{\"key\": \"make-fetch-happen:request-cache:https://registry.npmjs.org/arg/-/arg-5.0.2.tgz\", \"integrity\": \"sha512-PYjyFOLKQ9y57JvQ6QLo8dAgNqswh8M1RMJYdQduT6xbWSgK36P/Z/v+p888pM69jMMfS8Xd8F6I1kQ/I9HUGg==\", \"time\": 0, \"size\": 5620, \"metadata\": {\"url\": \"https://registry.npmjs.org/arg/-/arg-5.0.2.tgz\", \"reqHeaders\": {}, \"resHeaders\": {}}}",
         "dest-filename": "cb8820da33e4b6b8281e52263db9a95652cdeadc4c913c9381b108fec502",
         "dest": "flatpak-node/npm-cache/_cacache/index-v5/22/44"
+    },
+    {
+        "type": "inline",
+        "contents": "9ddfdb33c7229f031c63a857bb78982359e7ba03\t{\"key\": \"make-fetch-happen:request-cache:https://registry.npmjs.org/undici-types/-/undici-types-7.16.0.tgz\", \"integrity\": \"sha512-Zz+aZWSj8LE6zoxD+xrjh4VfkIG8Ya6LvYkZqtUQGJPZjYl53ypCaUwWqo7eI0x66KBGeRo+mlBEkMSeSZ38Nw==\", \"time\": 0, \"size\": 27127, \"metadata\": {\"url\": \"https://registry.npmjs.org/undici-types/-/undici-types-7.16.0.tgz\", \"reqHeaders\": {}, \"resHeaders\": {}}}",
+        "dest-filename": "b0f9b5540f4411a70046161bbf8672c4333f852914d8848b4357e43cfb78",
+        "dest": "flatpak-node/npm-cache/_cacache/index-v5/96/c0"
     },
     {
         "type": "inline",

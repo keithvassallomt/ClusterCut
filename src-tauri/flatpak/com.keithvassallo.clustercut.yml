@@ -21,6 +21,8 @@ finish-args:
   - --socket=pulseaudio
   # Notification Bus access
   - --talk-name=org.freedesktop.Notifications
+  # Access GNOME Shell to check for extensions
+  - --talk-name=org.gnome.Shell
   # Access to user's Downloads folder (if needed for file sharing, optional)
   - --filesystem=xdg-download
   # Autostart access
