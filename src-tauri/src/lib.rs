@@ -478,43 +478,55 @@ async fn probe_ip(
     let _data = serde_json::to_vec(&msg).unwrap_or_default();
     
             tracing::debug!("Probing {}...", addr);
-            let stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200));
-            if stream.is_ok() {
-               tracing::debug!("Probe to {} SUCCESS!", addr);
-               // Found a potential peer!
-               // Add to manual peers list temporarily so we can try to pair?
-               // Or just trigger a PairRequest immediately?
-               // For now, let's just add to known peers as "Manual" if not exists
-               
-                 let mut peers = state.known_peers.lock().unwrap();
-                 let id = format!("manual-{}", ip); // Temp ID until proper handshake
-                 if !peers.contains_key(&id) {
-                     let peer = Peer {
-                         id: id.clone(),
-                         ip, // Use the original `ip` which is `std::net::IpAddr`
-                         port,
-                         hostname: format!("Manual ({})", ip),
-                         last_seen: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                         is_trusted: false,
-                         is_manual: true,
-                         network_name: None,
-                         signature: None, 
-                     };
-                     peers.insert(id.clone(), peer.clone());
-                     // Emit update
-                     let _ = app_handle.emit("peer-update", &peer);
-                     
-                     // Notify?
-                      let notifications = state.settings.lock().unwrap().notifications.clone();
-                      if notifications.device_join {
-                         tracing::info!("[Notification] Triggering 'Device Joined' for manual peer: {}", peer.hostname);
-                         send_notification(&app_handle, "Device Joined", &format!("Found manual peer: {}", peer.hostname), false, Some(1));
-                      } else {
-                         tracing::debug!("[Notification] Device join notification suppressed by settings for manual peer: {}", peer.hostname);
-                      }
-                 }
-            } else {
-                // tracing::debug!("Probe to {} failed or timed out.", addr);
+            
+            // Send Peer Discovery via QUIC/UDP
+            let data_vec = _data.clone();
+            let transport_clone = transport.clone();
+            
+            // We use a small timeout for the send operation
+            let send_future = async move {
+                 transport_clone.send_message(addr, &data_vec).await
+            };
+            
+            match tokio::time::timeout(std::time::Duration::from_millis(500), send_future).await {
+                Ok(Ok(())) => {
+                   tracing::debug!("Probe to {} SUCCESS (Packet Sent)", addr);
+                   // We successfully sent the packet.
+                   // Since UDP is connectionless, this doesn't guarantee they received it,
+                   // BUT `send_message` in our Transport uses `open_bi` which implies a handshake.
+                   // If handshake succeeds, they are there.
+                   
+                   // Add to manual peers list
+                     let mut peers = state.known_peers.lock().unwrap();
+                     let id = format!("manual-{}", ip); 
+                     if !peers.contains_key(&id) {
+                         let peer = Peer {
+                             id: id.clone(),
+                             ip,
+                             port,
+                             hostname: format!("Manual ({})", ip),
+                             last_seen: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                             is_trusted: false,
+                             is_manual: true,
+                             network_name: None,
+                             signature: None, 
+                         };
+                         peers.insert(id.clone(), peer.clone());
+                         let _ = app_handle.emit("peer-update", &peer);
+                         
+                          let notifications = state.settings.lock().unwrap().notifications.clone();
+                          if notifications.device_join {
+                             tracing::info!("[Notification] Triggering 'Device Joined' for manual peer: {}", peer.hostname);
+                             send_notification(&app_handle, "Device Joined", &format!("Found manual peer: {}", peer.hostname), false, Some(1));
+                          }
+                     }
+                },
+                Ok(Err(e)) => {
+                    tracing::debug!("Probe to {} failed: {}", addr, e);
+                },
+                Err(_) => {
+                    tracing::debug!("Probe to {} timed out.", addr);
+                }
             }
 }
 
