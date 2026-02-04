@@ -916,6 +916,16 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            #[cfg(target_os = "linux")]
+            {
+                 // Explicitly enforce window settings on Linux/Flatpak to ensure WM respects them
+                 if let Some(window) = app.get_webview_window("main") {
+                     let _ = window.set_maximizable(false);
+                     // Match native GNOME behavior: hide minimize button on Linux (Flatpak usually shows it by default otherwise)
+                     let _ = window.set_minimizable(false); 
+                 }
+            }
+
             let app_handle = app.handle();
             
             #[cfg(desktop)]
