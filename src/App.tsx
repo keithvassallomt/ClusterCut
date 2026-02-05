@@ -384,6 +384,7 @@ export default function App() {
 
   /* Connection Failure Logic */
   const [isConnectionFailed, setIsConnectionFailed] = useState(false);
+  const [connectionCheckDismissed, setConnectionCheckDismissed] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [hasManualPeers, setHasManualPeers] = useState(false);
 
@@ -412,10 +413,11 @@ export default function App() {
     
     logToBackend("Connection Check: Mode =", settings.cluster_mode, "HasManual =", hasManualPeers, "Should Check =", shouldCheck, "Peers =", peers.length);
 
-    if (shouldCheck) {
+    if (shouldCheck && !connectionCheckDismissed) {
         if (peers.length > 0) {
             logToBackend("Connection Check: Peers found. Clearing failure state.");
             setIsConnectionFailed(false);
+            setConnectionCheckDismissed(false); // Reset dismissal on success
             return;
         }
         
@@ -429,10 +431,11 @@ export default function App() {
     } else {
         setIsConnectionFailed(false);
     }
-  }, [settings, peers.length, retryCount, hasManualPeers]);
+  }, [settings, peers.length, retryCount, hasManualPeers, connectionCheckDismissed]);
 
   const handleRetryConnection = async () => {
       setIsConnectionFailed(false);
+      setConnectionCheckDismissed(false);
       setRetryCount(c => c + 1);
       await invoke("retry_connection");
   };
@@ -798,6 +801,12 @@ export default function App() {
               <Button variant="default" onClick={() => invoke("exit_app")}>
                 Exit Application
               </Button>
+              <Button variant="ghost" onClick={() => {
+                  setIsConnectionFailed(false);
+                  setConnectionCheckDismissed(true);
+              }}>
+                Do nothing
+              </Button>
             </div>
           </div>
         </div>
@@ -1082,7 +1091,7 @@ export default function App() {
       </div>
 
       {/* Reconnecting Overlay */}
-      {settings && (settings.cluster_mode === "provisioned" || hasManualPeers) && peers.length === 0 && !isConnectionFailed && (
+      {settings && (settings.cluster_mode === "provisioned" || hasManualPeers) && peers.length === 0 && !isConnectionFailed && !connectionCheckDismissed && (
           <div className="fixed inset-0 z-[60] flex flex-col items-center justify-center bg-white/80 backdrop-blur-sm dark:bg-zinc-950/80">
               <Loader2 className="h-12 w-12 animate-spin text-indigo-500 mb-4" />
               <div className="text-xl font-medium text-zinc-900 dark:text-zinc-50">Connecting to remote cluster...</div>
