@@ -6,7 +6,7 @@ import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { 
   Monitor, Copy, History, ShieldCheck, PlusCircle, Trash2, LogOut, 
   Settings, Wifi, Lock, Unlock, AlertTriangle, Info, CheckCircle2,
-  ChevronDown, ChevronRight, ArrowUp, ArrowDown, Send, Download, Puzzle, Loader2
+  ChevronDown, ChevronRight, ArrowUp, ArrowDown, Send, Download, Puzzle, Loader2, Unplug
 } from "lucide-react";
 import clsx from "clsx";
 import { ShortcutRecorder } from "./components/ShortcutRecorder";
@@ -895,10 +895,17 @@ export default function App() {
             
             <div className="mx-2 h-6 w-px bg-zinc-200 dark:bg-zinc-700" />
              
-            <IconButton
-                label="Leave & Reset"
+            <IconButton 
                 danger
                 onClick={() => setLeaveOpen(true)}
+                label="Leave Cluster"
+            >
+                <Unplug className="h-5 w-5" />
+            </IconButton>
+            
+            <IconButton 
+                onClick={() => invoke("exit_app")}
+                label="Exit App"
             >
                 <LogOut className="h-5 w-5" />
             </IconButton>
