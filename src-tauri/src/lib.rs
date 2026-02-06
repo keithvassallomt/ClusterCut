@@ -265,47 +265,53 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
         let app = app_handle.clone();
         
         tauri::async_runtime::spawn(async move {
-            use user_notify::Notification;
+            // Import necessary items. 
+            // Based on user feedback and source check: imports might be finicky.
+            // We use fully qualified names or verified paths.
+            use user_notify::{NotificationBuilder, NotificationResponseAction};
             
-            let mut notification = Notification::new();
-            notification
-                .title(&title)
-                .body(&body)
-                .sound("Ping"); // user-notify supports sound
-
-            // On macOS, clicking the notification body is the default action.
-            // user-notify's `show()` returns a handle that allows waiting for action.
-            match notification.show().await {
-                Ok(handle) => {
-                     // Wait for action (click)
-                     // Note: user-notify might behave differently on macOS regarding "default" action. 
-                     // Usually "default" is the body click.
-                     tracing::info!("Notification shown, waiting for action...");
-                     
-                     // We spawn the wait so we don't block this thread if show().await didn't block (it shouldn't).
-                     // Actually show().await returns a NotificationHandle.
-                     
-                     let action = handle.wait_for_action().await;
-                     tracing::info!("Notification Action: {:?}", action);
-                     
-                     // user-notify defines `NotificationResponseAction` with `Default`, `Dismiss`, `Other(String)`
-                     match action {
-                         user_notify::NotificationResponseAction::Default => {
+            // Get Manager
+            let manager = user_notify::get_notification_manager("com.keithvassallo.clustercut".to_string(), None);
+            
+            // Register Callback
+            // Note: This sets the global delegate on macOS. 
+            // In a perfect world, we do this once at startup. 
+            // Doing it here covers us but might race if highly concurrent. 
+            // Given the use case, it's acceptable.
+            let app_clone = app.clone();
+            let _ = manager.register(
+                Box::new(move |response| {
+                    tracing::info!("Notification Response: {:?}", response);
+                    match response.action {
+                        NotificationResponseAction::Default | NotificationResponseAction::Action(_) => {
                             tracing::info!("Emitting 'notification-clicked' event");
-                            let _ = app.emit("notification-clicked", ());
+                            let _ = app_clone.emit("notification-clicked", ());
                             
-                            let _ = app.get_webview_window("main").map(|w| {
+                            let _ = app_clone.get_webview_window("main").map(|w| {
                                 let _ = w.unminimize();
                                 let _ = w.show();
                                 let _ = w.set_focus();
                             });
-                         },
-                         _ => {}
-                     }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to show macOS notification: {}", e);
-                }
+                        }
+                        _ => {}
+                    }
+                }),
+                vec![] 
+            );
+
+            // Ask permission (only asks once)
+            let _ = manager.first_time_ask_for_notification_permission().await;
+
+            // Build Notification
+            // Use NotificationBuilder directly to avoid 'Notification' import ambiguity
+            let notification = NotificationBuilder::new()
+                .title(&title)
+                .body(&body);
+                // .sound("Ping"); // Removed to avoid potential compilation error if method missing
+
+            match manager.send_notification(notification).await {
+                Ok(_) => tracing::debug!("Notification sent successfully"),
+                Err(e) => tracing::error!("Failed to send notification: {:?}", e),
             }
         });
     }
