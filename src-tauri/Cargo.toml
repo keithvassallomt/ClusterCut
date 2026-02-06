@@ -55,3 +55,5 @@ notify-rust = "4.11.3"
 zbus = { version = "4", features = ["tokio"] }
 image = "0.25.9"
 
+[target.'cfg(windows)'.dependencies]
+winrt-notification = "0.5"

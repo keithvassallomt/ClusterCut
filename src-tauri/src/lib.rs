@@ -86,6 +86,39 @@ async fn get_autostart_state(app_handle: tauri::AppHandle) -> Result<Option<bool
     }
 }
 
+#[tauri::command]
+async fn show_native_notification(title: String, body: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use winrt_notification::{Toast, Text, Duration, Sound};
+        Toast::new(Toast::POWERSHELL_APP_ID) // Using PowerShell ID transiently, but ideally use custom AUMID
+            .title(&title)
+            .text1(&body)
+            .sound(Some(Sound::SMS))
+            .duration(Duration::Short)
+            .show()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use notify_rust::Notification;
+        Notification::new()
+            .summary(&title)
+            .body(&body)
+            .appname("ClusterCut")
+            .timeout(notify_rust::Timeout::Milliseconds(5000)) // Short duration
+            .show()
+            .map_err(|e| e.to_string())?;
+    }
+    
+    // macOS - Fallback to Tauri plugin or similar if needed, 
+    // but for now we focus on user request "switch windows to winrt".
+    // We can assume plugin handles macOS or we add notify-rust for macOS too.
+    
+    Ok(())
+}
+
 fn init_logging() {
     // 1. Parse CLI Args (ignoring unknown args that Tauri might use)
     let args = match Args::try_parse() {
@@ -166,8 +199,23 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 // Helper to broadcast a new peer to all known peers (Gossip)
 pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body: &str, increment_badge: bool, _id: Option<i32>) {
-    // 1. Native Plugin (Windows/macOS)
-    #[cfg(not(target_os = "linux"))]
+    // 1. Windows (Native winrt-notification, requested by user)
+    #[cfg(target_os = "windows")]
+    {
+         use winrt_notification::{Toast, Text, Duration, Sound};
+         // Use the exact App ID from tauri.conf.json
+         let aumid = "com.keithvassallo.clustercut"; 
+         
+         let _ = Toast::new(aumid)
+            .title(title)
+            .text1(body)
+            .sound(Some(Sound::SMS))
+            .duration(Duration::Short)
+            .show();
+    }
+
+    // 2. macOS (Native Plugin)
+    #[cfg(target_os = "macos")]
     {
         use tauri_plugin_notification::NotificationExt;
         let mut builder = app_handle.notification().builder()
@@ -177,16 +225,6 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
             
         if let Some(id_val) = _id {
             builder = builder.id(id_val).group("ClusterCut");
-        }
-            
-        // Note: The native plugin might auto-increment badge on macOS depending on permission config.
-        // There is no explicit "increment_badge" builder method in v2 plugin yet documented, 
-        // but we can manually set the count if needed.
-        if increment_badge {
-             // For now, let's assume default behavior is acceptable or we use app.badging() if available.
-             // But the user specifically asked to NOT show it for others.
-             // If the plugin defaults to showing it, we might need to clear it?
-             // Leaving as standard plugin behavior for now, can refine if MacOS users also complain.
         }
         
         if let Err(e) = builder.show() {
