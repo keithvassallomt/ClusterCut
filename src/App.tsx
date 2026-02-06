@@ -1461,9 +1461,11 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
                 </div>
 
                   <div className="flex items-center justify-end gap-2">
-                    <IconButton label="Copy to Clipboard" onClick={() => handleLocalCopy(it.text)}>
-                        <Copy className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />
-                    </IconButton>
+                    {it.text && it.text.length > 0 && (
+                        <IconButton label="Copy to Clipboard" onClick={() => handleLocalCopy(it.text)}>
+                            <Copy className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />
+                        </IconButton>
+                    )}
 
                     {!isMe && it.files && it.files.length > 0 && it.sender_id && (
                         <>

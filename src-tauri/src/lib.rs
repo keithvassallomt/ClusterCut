@@ -195,36 +195,38 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
     }
     
     // 2. Linux Workaround (notify-rust via DBus)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         use notify_rust::Notification;
-        tracing::debug!("[Notification] Linux detected. Using notify-rust via DBus...");
+        tracing::debug!("[Notification] Using notify-rust...");
         
         let title = title.to_string();
         let body = body.to_string();
         let app = app_handle.clone();
+        
+        // Use AUMID on Windows, AppName on Linux
+        let app_id = if cfg!(target_os = "windows") {
+            "com.keithvassallo.clustercut"
+        } else {
+            "ClusterCut"
+        };
+
         // Spawn to avoid blocking
         tauri::async_runtime::spawn(async move {
             let mut notification = Notification::new();
             notification
                 .summary(&title)
                 .body(&body)
-                .appname("ClusterCut")
+                .appname(app_id)
                 .timeout(notify_rust::Timeout::Milliseconds(5000));
             
             // Ubuntu/Dock Badge Logic:
-            // "Transient" hint often prevents the notification from persisting in the history/dock.
-            // If we DO NOT want to increment the badge (increment_badge = false), we set Transient(true).
             if !increment_badge {
                 notification.hint(notify_rust::Hint::Transient(true));
             } else {
                 notification.hint(notify_rust::Hint::Transient(false));
             }
             
-            // If it's a "File Available" type notification (which implies we want action)
-            // We can add an action.
-            // For now, we add "Open" action for everything, or we can make it conditional.
-            // User requested click to open.
             notification
                 .action("default", "Open")
                 .action("open_btn", "Open");
@@ -233,8 +235,6 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
                 notification.hint(notify_rust::Hint::DesktopEntry(id));
             }
 
-            // In Flatpak, show() is blocking or async depending on impl, but usually we use show_async or spawn blocking
-            // For now, we use a simple handle implementation if possible, or just standard show
             let handle = match notification.show() {
                 Ok(h) => h,
                 Err(e) => {
@@ -249,13 +249,18 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
                 if action == "default" || action == "Open" || action == "open_btn" {
                     tracing::info!("Emitting 'notification-clicked' event");
                     let _ = app.emit("notification-clicked", ());
-                    let _ = app.get_webview_window("main").map(|w| w.set_focus());
+                    
+                    let _ = app.get_webview_window("main").map(|w| {
+                        let _ = w.unminimize();
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    });
                 }
             });
         });
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         use tauri_plugin_notification::NotificationExt;
         
@@ -264,10 +269,6 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
             .title(title)
             .body(body)
             .show();
-            
-        // For Windows/macOS, we rely on the OS or Plugin to bring window to front.
-        // Sadly, v2 plugin doesn't easily expose "on_click" callback in Rust without setup.
-        // We will rely on frontend listener if available, or just standard OS behavior.
     }
 }
 
