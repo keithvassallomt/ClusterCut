@@ -921,10 +921,16 @@ async fn send_clipboard(
 
 #[tauri::command]
 async fn delete_history_item(
+    app_handle: tauri::AppHandle,
     id: String,
     state: tauri::State<'_, AppState>,
     transport: tauri::State<'_, Transport>,
 ) -> Result<(), String> {
+    // 1. Emit Local Event (to update UI immediately)
+    tracing::info!("Deleting history item locally: {}", id);
+    let _ = app_handle.emit("history-delete", &id);
+
+    // 2. Broadcast to Peers
     let msg = Message::HistoryDelete(id);
     let data = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
     
