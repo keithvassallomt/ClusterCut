@@ -283,7 +283,7 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
                 Box::new(move |response| {
                     tracing::info!("Notification Response: {:?}", response);
                     match response.action {
-                        NotificationResponseAction::Default | NotificationResponseAction::Action(_) => {
+                        NotificationResponseAction::Default => {
                             tracing::info!("Emitting 'notification-clicked' event");
                             let _ = app_clone.emit("notification-clicked", ());
                             
@@ -1683,6 +1683,7 @@ pub fn run() {
             retry_connection,
             configure_autostart,
             get_autostart_state,
+            show_native_notification,
         ])
 
         .on_window_event(|window, event| {
