@@ -253,39 +253,8 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
         });
     }
 
-    // 3. Windows Implementation (notify-rust / native)
-    #[cfg(target_os = "windows")]
-    {
-        use notify_rust::Notification;
-        tracing::debug!("[Notification] Windows detected. Using notify-rust...");
-
-        let title = title.to_string();
-        let body = body.to_string();
-        let app = app_handle.clone();
-        
-        tauri::async_runtime::spawn(async move {
-            let mut notification = Notification::new();
-            notification
-                .summary(&title)
-                .body(&body)
-                .appname("com.keithvassallo.clustercut")
-                .timeout(notify_rust::Timeout::Milliseconds(5000));
-            
-            // NOTE: 'hint()' and 'wait_for_action()' are not supported on Windows in notify-rust 4.x
-            // Windows native notifications (Toasts) via notify-rust do not return a handle that supports wait_for_action easily.
-            // We unfortunately have to fall back to just showing it for now, unless we use winrt directly.
-            
-            if let Err(e) = notification.show() {
-                 tracing::error!("Failed to show Windows notification: {}", e);
-            }
-            
-            // TODO: Windows click handling with notify-rust is limited without an event loop integration.
-            // Ideally we would use tauri-plugin-notification, but user reported it wasn't firing events.
-            // For now, at least fix the build.
-        });
-    }
-
-    #[cfg(target_os = "macos")]
+    // 3. Windows / macOS Implementation (Plugin)
+    #[cfg(not(target_os = "linux"))]
     {
         use tauri_plugin_notification::NotificationExt;
         

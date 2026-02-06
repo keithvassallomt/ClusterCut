@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { version } from "../package.json";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { 
   Monitor, Copy, History, ShieldCheck, PlusCircle, Trash2, LogOut, 
@@ -634,10 +635,20 @@ export default function App() {
         console.log("Create generic notification event:", event);
     });
 
-    const unlistenNotification = listen("notification-clicked", (event) => {
+    const unlistenNotification = listen("notification-clicked", async (event) => {
         console.log("Notification clicked event received!", event);
+        
+        // Force window to front
+        try {
+            const win = getCurrentWindow();
+            await win.unminimize();
+            await win.show();
+            await win.setFocus();
+        } catch (e) {
+            console.error("Failed to focus window:", e);
+        }
+
         setActiveView("history");
-        // Bring to front is standard OS behavior or handled by backend
     });
 
     const unlistenSettingsChanged = listen<AppSettings>("settings-changed", (event) => {
