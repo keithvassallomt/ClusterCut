@@ -407,9 +407,13 @@ export default function App() {
                  if (urlStr) {
                      console.log("Action URL:", urlStr);
                      if (urlStr.includes("action/show") || urlStr.includes("action/download")) {
-                         handleNotificationClick();
-                         // TODO: If download, trigger specific download logic if possible. 
-                         // For now, waking via handleNotificationClick satisfies "Show".
+                         console.log("Processing Action URL, switching to history...", urlStr);
+                         logToBackend("Processing deep link action", urlStr);
+                         handleNotificationClick(); // This sets view to history
+                     } else {
+                        // Fallback for generic launch
+                         console.log("Generic launch URL", urlStr);
+                        handleNotificationClick();
                      }
                  }
              });

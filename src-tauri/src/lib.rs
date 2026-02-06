@@ -106,10 +106,6 @@ async fn show_native_notification(title: String, body: String) -> Result<(), Str
             <text>{}</text>
         </binding>
     </visual>
-    <actions>
-        <action content="Show" arguments="clustercut://action/show" activationType="protocol"/>
-        <action content="Download" arguments="clustercut://action/download" activationType="protocol"/>
-    </actions>
 </toast>
 "#, title, body);
 
