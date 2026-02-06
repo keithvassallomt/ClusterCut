@@ -381,7 +381,56 @@ export default function App() {
       peersRef.current = peers;
   }, [peers]);
 
+    const handleNotificationClick = async () => {
+        try {
+            const win = getCurrentWindow();
+            await win.unminimize();
+            await win.show();
+            await win.setFocus();
+            setActiveView("history");
+        } catch (e) {
+            console.error("Failed to focus window:", e);
+        }
+    };
+
   const [settings, setSettings] = useState<AppSettings | null>(null);
+
+    // Windows / macOS (Plugin) - Dynamic Import for Safety
+    useEffect(() => {
+        let unlistenPlugin: any;
+
+        const setupPlugin = async () => {
+             // Dynamic import with robust error handling to prevent Linux crash
+             import("@tauri-apps/plugin-notification")
+                .then(({ onAction }) => {
+                    if (onAction) {
+                         onAction((notification) => {
+                             console.log("Plugin Action Received:", notification);
+                             handleNotificationClick();
+                         }).then((u) => { unlistenPlugin = u; });
+                    }
+                })
+                .catch((e) => {
+                    console.warn("Notification plugin not supported or failed to load (expected on Linux):", e);
+                });
+        };
+
+        setupPlugin();
+
+        return () => {
+             if (unlistenPlugin) {
+                 try {
+                     if (typeof unlistenPlugin === "function") {
+                         unlistenPlugin();
+                     } else if (unlistenPlugin.unlisten) {
+                         unlistenPlugin.unlisten();
+                     }
+                 } catch (e) {
+                     console.error("Failed to unlisten notification plugin:", e);
+                 }
+             }
+        };
+    }, []);
 
   /* Connection Failure Logic */
   const [isConnectionFailed, setIsConnectionFailed] = useState(false);
@@ -630,25 +679,14 @@ export default function App() {
         setJoinBusy(false);
     });
 
-    // Generic Event Logging for Debugging Notification Clicks on Windows/macOS
-    const unlistenAny = listen("tauri://notification", (event) => {
-        console.log("Create generic notification event:", event);
-    });
 
-    const unlistenNotification = listen("notification-clicked", async (event) => {
-        console.log("Notification clicked event received!", event);
-        
-        // Force window to front
-        try {
-            const win = getCurrentWindow();
-            await win.unminimize();
-            await win.show();
-            await win.setFocus();
-        } catch (e) {
-            console.error("Failed to focus window:", e);
-        }
 
-        setActiveView("history");
+
+
+    // Linux (Custom notify-rust)
+    const unlistenNotification = listen("notification-clicked", (event) => {
+        console.log("Custom notification clicked event:", event);
+        handleNotificationClick();
     });
 
     const unlistenSettingsChanged = listen<AppSettings>("settings-changed", (event) => {
@@ -667,7 +705,6 @@ export default function App() {
       unlistenDelete.then((f) => f());
       unlistenPairingFailed.then((f) => f());
       unlistenNotification.then((f) => f());
-      unlistenAny.then((f) => f());
       unlistenSettingsChanged.then((f) => f());
     };
   }, [myHostname]); // Re-bind if hostname loads (needed for sender check)

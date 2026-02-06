@@ -42,4 +42,7 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**", "**/.flatpak-builder/**"],
     },
   },
+  build: {
+    target: "es2021",
+  },
 }));
