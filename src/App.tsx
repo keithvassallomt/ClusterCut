@@ -399,27 +399,46 @@ export default function App() {
     useEffect(() => {
         let unlistenDeepLink: any;
 
-        const setupListener = async () => {
-             unlistenDeepLink = await listen<string[]>("deep-link", (event) => {
-                 console.log("Deep Link Received:", event);
-                 const args = event.payload;
-                 const urlStr = args.find(a => a.startsWith("clustercut://"));
-                 if (urlStr) {
-                     console.log("Action URL:", urlStr);
-                     if (urlStr.includes("action/show") || urlStr.includes("action/download")) {
-                         console.log("Processing Action URL, switching to history...", urlStr);
-                         logToBackend("Processing deep link action", urlStr);
-                         handleNotificationClick(); // This sets view to history
-                     } else {
-                        // Fallback for generic launch
-                         console.log("Generic launch URL", urlStr);
-                        handleNotificationClick();
-                     }
+        const handleArgs = (args: string[]) => {
+             console.log("Checking args for deep link:", args);
+             const urlStr = args.find(a => a.startsWith("clustercut://"));
+             if (urlStr) {
+                 console.log("Found Deep Link URL:", urlStr);
+                 logToBackend("Deep Link Detected:", urlStr);
+                 if (urlStr.includes("action/show") || urlStr.includes("action/download")) {
+                     console.log("Action matched! Switching to history.");
+                     logToBackend("Action matched, switching to history.");
+                     setActiveView("history");
+                     // We don't need handleNotificationClick() here if it just does show/focus/view, 
+                     // because if we are running cold or handling via single-instance, we are likely already focused or about to be.
+                     // But calling it ensures we unminimize if needed.
+                     handleNotificationClick();
+                 } else {
+                     // Generic open
+                     setActiveView("history"); // Default behavior for deep link? or Devices?
                  }
+             }
+        };
+
+        const setupListener = async () => {
+             // 1. Check Cold Start Args
+             try {
+                 const currentArgs = await invoke<string[]>("get_launch_args");
+                 handleArgs(currentArgs);
+             } catch (e) {
+                 console.error("Failed to get launch args:", e);
+             }
+
+             // 2. Listen for Runtime Deep Links (Single Instance)
+             unlistenDeepLink = await listen<string[]>("deep-link", (event) => {
+                 console.log("Deep Link Event Received:", event);
+                 handleArgs(event.payload);
              });
         };
         
         setupListener();
+
+
 
         // Keep macOS plugin listener for fallback? 
         // User specifically wanted native Windows actions.

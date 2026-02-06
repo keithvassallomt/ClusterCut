@@ -1636,6 +1636,7 @@ pub fn run() {
             set_local_clipboard,
             set_local_clipboard_files,
             confirm_pending_clipboard,
+            get_launch_args,
             exit_app,
             retry_connection,
             configure_autostart,
