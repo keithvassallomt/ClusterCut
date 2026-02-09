@@ -122,10 +122,6 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
                 "quit" => app.exit(0),
                 "show" => {
                     if let Some(window) = app.get_webview_window("main") {
-                        // Enforce size on Linux to fix "too big" issue after minimized start
-                        #[cfg(target_os = "linux")]
-                        let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize { width: 800.0, height: 600.0 }));
-                        
                         let _ = window.show();
                         let _ = window.set_focus();
                         set_badge(app, false);
@@ -180,9 +176,6 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
             {
                 let app = tray.app_handle();
                 if let Some(window) = app.get_webview_window("main") {
-                    // Enforce size on Linux to fix "too big" issue after minimized start
-                    let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize { width: 800.0, height: 600.0 }));
-
                     let _ = window.show();
                     let _ = window.set_focus();
                     set_badge(app, false);

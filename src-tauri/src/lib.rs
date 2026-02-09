@@ -1423,15 +1423,16 @@ pub fn run() {
 
             // Handle Minimized Startup
             if let Some(window) = app.get_webview_window("main") {
+                // Workaround: Always show the window to force WM to apply constraints
+                tracing::info!("Startup: Force showing window to prime size calculations.");
+                let _ = window.show();
+                let _ = window.set_focus();
+
                 if minimized_arg {
-                    // It should be hidden by default via tauri.conf.json logic (visible: false)
-                    // But explicitly hiding helps if we didn't change conf or for redundancy.
-                    // Actually, if we set visible: false in conf, we MUST show it here if NOT minimized.
-                    tracing::info!("Starting in minimized mode.");
+                    tracing::info!("Starting in minimized mode. Hiding window immediately.");
+                    let _ = window.hide();
                 } else {
-                    tracing::info!("Starting in normal mode (showing window).");
-                    let _ = window.show();
-                    let _ = window.set_focus();
+                    tracing::info!("Starting in normal mode.");
                 }
             }
 
@@ -1462,8 +1463,13 @@ pub fn run() {
                 if let Some(window) = app.get_webview_window("main") {
                     let win_clone = window.clone();
                     window.listen("tauri://focus", move |_event| {
+                         // Fix: Explicitly unmaximize in case the WM forced it
+                         if let Ok(true) = win_clone.is_maximized() {
+                             let _ = win_clone.unmaximize();
+                         }
+
                          // We want the window to be non-resizable (to hide maximize button).
-                         // So we toggle True -> False.
+                         // So we toggle True -> False. This forces a frame update on some WMs.
                          let _ = win_clone.set_resizable(true);
                          let _ = win_clone.set_resizable(false);
                     });
