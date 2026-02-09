@@ -122,22 +122,12 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
                 "quit" => app.exit(0),
                 "show" => {
                     if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.unminimize();
+                        // Enforce size on Linux to fix "too big" issue after minimized start
+                        #[cfg(target_os = "linux")]
+                        let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize { width: 800.0, height: 600.0 }));
+                        
                         let _ = window.show();
                         let _ = window.set_focus();
-                        
-                        #[cfg(target_os = "linux")]
-                        {
-                            // Workaround for Flatpak/GTK titlebar unresponsive buttons
-                            if let Ok(size) = window.outer_size() {
-                                 let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
-                                     width: size.width,
-                                     height: size.height + 1,
-                                 }));
-                                 let _ = window.set_size(tauri::Size::Physical(size));
-                            }
-                        }
-                        
                         set_badge(app, false);
                     }
                 }
@@ -190,22 +180,11 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
             {
                 let app = tray.app_handle();
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.unminimize();
+                    // Enforce size on Linux to fix "too big" issue after minimized start
+                    let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize { width: 800.0, height: 600.0 }));
+
                     let _ = window.show();
                     let _ = window.set_focus();
-                    
-                    #[cfg(target_os = "linux")]
-                    {
-                        // Workaround for Flatpak/GTK titlebar unresponsive buttons
-                        if let Ok(size) = window.outer_size() {
-                             let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
-                                 width: size.width,
-                                 height: size.height + 1,
-                             }));
-                             let _ = window.set_size(tauri::Size::Physical(size));
-                        }
-                    }
-                    
                     set_badge(app, false);
                 }
             }

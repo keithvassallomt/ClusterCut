@@ -13,6 +13,7 @@ mod tray;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState, ShortcutEvent};
+use tauri::Listener;
 
 use tauri_plugin_clipboard::Clipboard;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
@@ -1429,22 +1430,8 @@ pub fn run() {
                     tracing::info!("Starting in minimized mode.");
                 } else {
                     tracing::info!("Starting in normal mode (showing window).");
-                    let _ = window.unminimize();
                     let _ = window.show();
                     let _ = window.set_focus();
-                    
-                    #[cfg(target_os = "linux")]
-                    {
-                        // Workaround for Flatpak/GTK titlebar buttons sometimes being unresponsive until resize.
-                        // We force a tiny resize to "wake up" the window manager decorations.
-                        if let Ok(size) = window.outer_size() {
-                             let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
-                                 width: size.width,
-                                 height: size.height + 1,
-                             }));
-                             let _ = window.set_size(tauri::Size::Physical(size));
-                        }
-                    }
                 }
             }
 
@@ -1470,12 +1457,17 @@ pub fn run() {
 
             #[cfg(target_os = "linux")]
             {
-                 // Explicitly enforce window settings on Linux/Flatpak to ensure WM respects them
-                 if let Some(window) = app.get_webview_window("main") {
-                     let _ = window.set_maximizable(false);
-                     // Match native GNOME behavior: hide minimize button on Linux (Flatpak usually shows it by default otherwise)
-                     let _ = window.set_minimizable(false); 
-                 }
+                // Workaround for Flatpak/GTK unresponsive titlebar buttons.
+                // Toggling resizable property on focus seems to "wake up" the window manager.
+                if let Some(window) = app.get_webview_window("main") {
+                    let win_clone = window.clone();
+                    window.listen("tauri://focus", move |_event| {
+                         // We want the window to be non-resizable (to hide maximize button).
+                         // So we toggle True -> False.
+                         let _ = win_clone.set_resizable(true);
+                         let _ = win_clone.set_resizable(false);
+                    });
+                }
             }
 
             let app_handle = app.handle();
