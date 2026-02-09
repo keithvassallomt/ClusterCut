@@ -1432,6 +1432,19 @@ pub fn run() {
                     let _ = window.unminimize();
                     let _ = window.show();
                     let _ = window.set_focus();
+                    
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Workaround for Flatpak/GTK titlebar buttons sometimes being unresponsive until resize.
+                        // We force a tiny resize to "wake up" the window manager decorations.
+                        if let Ok(size) = window.outer_size() {
+                             let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
+                                 width: size.width,
+                                 height: size.height + 1,
+                             }));
+                             let _ = window.set_size(tauri::Size::Physical(size));
+                        }
+                    }
                 }
             }
 
