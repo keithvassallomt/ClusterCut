@@ -14,6 +14,7 @@ use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState, ShortcutEvent};
 use tauri::Listener;
+use local_ip_address::list_afinet_netifas;
 
 use tauri_plugin_clipboard::Clipboard;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
@@ -92,7 +93,7 @@ async fn get_autostart_state(app_handle: tauri::AppHandle) -> Result<Option<bool
 }
 
 #[tauri::command]
-async fn show_native_notification(app_handle: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
+async fn show_native_notification(_app_handle: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         use windows::UI::Notifications::{ToastNotificationManager, ToastNotification};
@@ -930,6 +931,10 @@ async fn probe_ip(
             match tokio::time::timeout(std::time::Duration::from_millis(500), send_future).await {
                 Ok(Ok(())) => {
                    tracing::debug!("Probe to {} SUCCESS (Packet Sent)", addr);
+                   
+                   // NOTIFY SUCCESS
+                   send_notification(&app_handle, "Connection Established", &format!("Successfully contacted {}.", ip), false, None, "devices", NotificationPayload::None);
+
                    // We successfully sent the packet.
                    // Since UDP is connectionless, this doesn't guarantee they received it,
                    // BUT `send_message` in our Transport uses `open_bi` which implies a handshake.
@@ -964,15 +969,60 @@ async fn probe_ip(
                                  tracing::debug!("[Notification] Device join (manual) notification suppressed by startup timer for peer: {}", peer.hostname);
                              }
                           }
+                     } else {
+                         // Already exists
+                         tracing::debug!("Manual peer {} already exists.", id);
+                         // Still notify success to confirm connectivity
+                         send_notification(&app_handle, "Connection Verified", &format!("Connection to {} is active.", ip), false, None, "devices", NotificationPayload::None);
                      }
                 },
                 Ok(Err(e)) => {
-                    tracing::debug!("Probe to {} failed: {}", addr, e);
+                    tracing::warn!("Probe to {} FAILED (Send Error): {}", addr, e);
+                    send_notification(&app_handle, "Connection Failed", &format!("Failed to send packet to {}: {}", ip, e), true, None, "devices", NotificationPayload::None);
                 },
                 Err(_) => {
-                    tracing::debug!("Probe to {} timed out.", addr);
+                    tracing::warn!("Probe to {} FAILED (Timeout)", addr);
+                    send_notification(&app_handle, "Connection Failed", &format!("Connection to {} timed out. Check firewall/VPN.", ip), true, None, "devices", NotificationPayload::None);
                 }
             }
+}
+
+#[cfg(target_os = "windows")]
+fn configure_windows_firewall() {
+    tracing::info!("Configuring Windows Firewall...");
+    // netsh advfirewall firewall add rule name="ClusterCut" dir=in action=allow protocol=UDP localport=4654
+    // We use a specific name to avoid duplicates? netsh doesn't check dupes easily without query.
+    // We can try to delete first?
+    
+    // Delete existing rule to ensure clean slate (and avoid dupes if we run this often)
+    let _ = std::process::Command::new("netsh")
+        .args(["advfirewall", "firewall", "delete", "rule", "name=ClusterCut"])
+        .output();
+
+    // Add Rule
+    match std::process::Command::new("netsh")
+        .args([
+            "advfirewall", "firewall", "add", "rule", 
+            "name=ClusterCut", 
+            "dir=in", 
+            "action=allow", 
+            "protocol=UDP", 
+            "localport=4654"
+        ])
+        .output() 
+    {
+        Ok(output) => {
+            if output.status.success() {
+                tracing::info!("Windows Firewall rule added successfully.");
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!("Failed to add Windows Firewall rule: {}", stderr);
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to execute netsh: {}", e);
+        }
+    }
 }
 
 #[tauri::command]
@@ -1386,7 +1436,7 @@ pub fn run() {
     let args = init_logging();
     let minimized_arg = args.minimized;
     
-    let mut builder = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard::init());
         
@@ -1490,6 +1540,26 @@ pub fn run() {
                      if let Err(e) = crate::dbus::start_dbus_server(dbus_handle).await {
                          tracing::error!("Failed to start D-Bus service: {}", e);
                      }
+                });
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                // Attempt to configure firewall on startup
+                // This runs every time, but 'delete' command handles cleanup.
+                // Doing it in a separate thread to not block startup significantly.
+                std::thread::spawn(|| {
+                    configure_windows_firewall();
+                });
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                // Attempt to configure firewall on startup
+                // This runs every time, but 'delete' command handles cleanup.
+                // Doing it in a separate thread to not block startup significantly.
+                std::thread::spawn(|| {
+                    configure_windows_firewall();
                 });
             }
 
@@ -2430,7 +2500,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                             if notify_large {
                                                 tracing::info!("Large file or manual mode. Sending notification."); 
                                                 let body = format!("Received {} files from {}. Click to download.", files.len(), sender);
-                                                let body = format!("Received {} files from {}. Click to download.", files.len(), sender);
+                                                let _body = format!("Received {} files from {}. Click to download.", files.len(), sender);
                                                 // Create Payload for Download Button
                                                 let payload = NotificationPayload::DownloadAvailable {
                                                     msg_id: id.clone(),
@@ -2661,6 +2731,21 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
             
             let local_id = listener_state.local_device_id.lock().unwrap().clone();
             if peer.id == local_id {
+                // Collision Detection:
+                // If the sender IP is NOT one of our local IPs, then it's a remote device with the same ID.
+                // This shouldn't happen unless the device was cloned (e.g. VM clone).
+                let sender_ip = addr.ip();
+                if !is_local_ip(sender_ip) {
+                     tracing::warn!("Device ID Collision Detected! Remote peer at {} has the same ID as me ({}).", sender_ip, local_id);
+                     send_notification(&listener_handle, 
+                         "Configuration Error", 
+                         &format!("Device ID Collision! Another device at {} shares your ID. Please reset one device.", sender_ip), 
+                         true, 
+                         None, 
+                         "settings", 
+                         NotificationPayload::None
+                     );
+                }
                 return;
             }
 
@@ -3180,4 +3265,15 @@ async fn check_gnome_extension_status() -> ExtensionStatus {
 #[tauri::command]
 fn get_launch_args() -> Vec<String> {
     std::env::args().collect()
+}
+
+fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    if let Ok(ifaces) = list_afinet_netifas() {
+        for (_name, local_ip) in ifaces {
+             if local_ip == ip {
+                 return true;
+             }
+        }
+    }
+    false
 }
