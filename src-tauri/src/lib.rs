@@ -1436,9 +1436,11 @@ pub fn run() {
     let args = init_logging();
     let minimized_arg = args.minimized;
     
-    let builder = tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_clipboard::init());
+        .plugin(tauri_plugin_clipboard::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init());
         
     #[cfg(not(target_os = "linux"))]
     {

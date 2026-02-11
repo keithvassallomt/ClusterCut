@@ -56,6 +56,8 @@ zbus = { version = "4", features = ["tokio"] }
 image = "0.25.9"
 tauri-plugin-single-instance = "2"
 tauri-plugin-deep-link = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
 user-notify = { git = "https://github.com/Simon-Laux/user-notify" }
 
 [target.'cfg(windows)'.dependencies]
