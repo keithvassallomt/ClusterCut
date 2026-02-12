@@ -13,15 +13,18 @@ import clsx from "clsx";
 import { ShortcutRecorder } from "./components/ShortcutRecorder";
 
 // Helper for backend logging
-const logToBackend = (msg: string, ...args: any[]) => {
+// Helper for backend logging
+const internalLogToBackend = (level: string | null, msg: string, ...args: any[]) => {
   const formatted = [msg, ...args].map(a =>
     typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)
   ).join(" ");
-  invoke("log_frontend", { message: formatted }).catch(_err => {
-    // Fallback if backend call fails, though user hates console.log, we need some safety.
-    // But we'll try to keep it silent if possible or just minimal.
+  invoke("log_frontend", { message: formatted, level }).catch(_err => {
+    // Fallback
   });
 };
+
+const logToBackend = (msg: string, ...args: any[]) => internalLogToBackend(null, msg, ...args);
+const logDebugToBackend = (msg: string, ...args: any[]) => internalLogToBackend("debug", msg, ...args);
 
 /* --- Types --- */
 // ... (rest of imports)
@@ -497,7 +500,7 @@ export default function App() {
   // Check for manual peers on startup
   useEffect(() => {
     invoke<Record<string, Peer>>("get_known_peers").then(map => {
-      logToBackend("Known Peers Raw:", map);
+      logDebugToBackend("Known Peers Raw:", map);
       const hasManual = Object.values(map).some(p => p.is_manual);
       logToBackend("Computed hasManual:", hasManual);
       setHasManualPeers(hasManual);

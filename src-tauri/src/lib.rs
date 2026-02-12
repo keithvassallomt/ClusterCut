@@ -27,8 +27,12 @@ use crate::protocol::Message;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long, default_value = "debug")]
+    #[arg(long, default_value = "info")]
     log_level: String,
+    
+    #[arg(short, long, default_value_t = false)]
+    debug: bool,
+
     #[arg(long, default_value_t = false)]
     minimized: bool,
 }
@@ -153,17 +157,21 @@ fn init_logging() -> Args {
         Ok(a) => a,
         Err(_) => {
             // Keep default if parsing fails (e.g. extra args)
-            Args { log_level: "debug".to_string(), minimized: false }
+            Args { log_level: "info".to_string(), debug: false, minimized: false }
         }
     };
 
-    let level = match args.log_level.to_lowercase().as_str() {
-        "error" => tracing::Level::ERROR,
-        "warn" => tracing::Level::WARN,
-        "info" => tracing::Level::INFO,
-        "debug" => tracing::Level::DEBUG,
-        "trace" => tracing::Level::TRACE,
-        _ => tracing::Level::DEBUG,
+    let level = if args.debug {
+        tracing::Level::DEBUG
+    } else {
+        match args.log_level.to_lowercase().as_str() {
+            "error" => tracing::Level::ERROR,
+            "warn" => tracing::Level::WARN,
+            "info" => tracing::Level::INFO,
+            "debug" => tracing::Level::DEBUG,
+            "trace" => tracing::Level::TRACE,
+            _ => tracing::Level::INFO,
+        }
     };
 
     // 2. Setup Stdout Layer (Colored)
@@ -190,9 +198,15 @@ fn init_logging() -> Args {
 
     // 4. Init Registry
     // Base Level: INFO (for external crates) + User Level for US
+    let filter_level = if args.debug {
+        "debug"
+    } else {
+        &args.log_level.to_lowercase()
+    };
+    
     let filter = tracing_subscriber::EnvFilter::new("info")
-        .add_directive(format!("tauri_app={}", args.log_level.to_lowercase()).parse().unwrap())
-        .add_directive(format!("clustercut_lib={}", args.log_level.to_lowercase()).parse().unwrap())
+        .add_directive(format!("tauri_app={}", filter_level).parse().unwrap())
+        .add_directive(format!("clustercut_lib={}", filter_level).parse().unwrap())
         // Silence noisy networking crates
         .add_directive("rustls=warn".parse().unwrap())
         .add_directive("quinn=warn".parse().unwrap())
@@ -816,8 +830,14 @@ fn get_known_peers(state: tauri::State<AppState>) -> std::collections::HashMap<S
 }
 
 #[tauri::command]
-fn log_frontend(message: String) {
-    tracing::info!("[Frontend] {}", message);
+fn log_frontend(message: String, level: Option<String>) {
+    match level.as_deref() {
+        Some("error") => tracing::error!("[Frontend] {}", message),
+        Some("warn") => tracing::warn!("[Frontend] {}", message),
+        Some("debug") => tracing::debug!("[Frontend] {}", message),
+        Some("trace") => tracing::trace!("[Frontend] {}", message),
+        _ => tracing::info!("[Frontend] {}", message),
+    }
 }
 
 #[tauri::command]
@@ -1431,7 +1451,7 @@ pub fn run() {
     let args = init_logging();
     let minimized_arg = args.minimized;
     
-    let mut builder = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard::init())
         .plugin(tauri_plugin_shell::init())
