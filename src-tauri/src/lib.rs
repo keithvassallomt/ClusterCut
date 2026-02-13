@@ -2335,11 +2335,26 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
         return;
     }
     
-    // Use ID/Index subfolder to avoid collisions? Or just flat?
-    // Flat for now, verify uniqueness?
-    // unique_name = header.file_name
-    let file_path = cache_dir.join(&header.file_name);
-    // TODO: Handle name collision (append _1, etc)?
+    // Handle name collision (append (n))
+    let mut file_path = cache_dir.join(&header.file_name);
+    
+    if file_path.exists() {
+        tracing::info!("File collision detected for {}, renaming...", header.file_name);
+        let path_obj = std::path::Path::new(&header.file_name);
+        let file_stem = path_obj.file_stem().map(|s| s.to_string_lossy()).unwrap_or_else(|| std::borrow::Cow::from(&header.file_name));
+        let extension = path_obj.extension().map(|s| s.to_string_lossy());
+        
+        let mut counter = 1;
+        while file_path.exists() {
+            let new_name = match &extension {
+                Some(ext) => format!("{} ({}).{}", file_stem, counter, ext),
+                None => format!("{} ({})", file_stem, counter),
+            };
+            file_path = cache_dir.join(new_name);
+            counter += 1;
+        }
+        tracing::info!("Renamed to {:?}", file_path.file_name());
+    }
     
     let mut file = match File::create(&file_path).await {
         Ok(f) => f,
