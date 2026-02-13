@@ -915,12 +915,37 @@ export default function App() {
         invoke("log_frontend", { message: "No Theme Override. Using System Preference." });
         applySystemTheme();
         
-        // Listen for system changes only if no override
+        // Listen for system changes via CSS (primary mechanism)
         const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
         const handler = () => {
            if (active) applySystemTheme();
         };
         mediaQuery.addEventListener("change", handler);
+        
+        // Also listen for Tauri window theme change event (backup/specific for Linux)
+        if (active) {
+            getCurrentWindow().onThemeChanged(({ payload: theme }) => {
+                invoke("log_frontend", { message: `Tauri Theme Changed Event: ${theme}` });
+                if (theme === 'dark') {
+                    document.documentElement.classList.add("dark");
+                } else {
+                    document.documentElement.classList.remove("dark");
+                }
+            }).then(unlisten => {
+                if (active) {
+                   // Chain cleanup
+                   const oldCleanup = cleanupListener;
+                   cleanupListener = () => {
+                       if (oldCleanup) oldCleanup();
+                       unlisten();
+                   };
+                } else {
+                   unlisten();
+                }
+            });
+        }
+
+        // Set initial cleanup (media query) - this runs synchronously before the async then() above
         cleanupListener = () => mediaQuery.removeEventListener("change", handler);
       }
     }).catch(e => console.error("Failed to get theme override:", e));
