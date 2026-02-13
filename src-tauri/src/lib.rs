@@ -802,7 +802,6 @@ fn set_network_identity(
     // So we keep our current Key (or gen a new one). 
     // Since we are changing identity, a new Key is safer.
     // But if we just rename the cluster, we might want to keep the key.
-    // Let's assume re-provisioning = New Identity = Gen New Key too?
     // Actually, if I just want to rename my cluster "My Home", I don't want to break existing peers if I can help it?
     // But existing peers know me by Key? No, they pair with Spake2 using PIN.
     // If I change PIN, they can't pair.
@@ -811,7 +810,14 @@ fn set_network_identity(
     
     // Re-register mDNS with new name
     let device_id = state.local_device_id.lock().unwrap().clone();
-    let port = 4654; // TODO: Get actual port from transport? We don't have transport here. 
+    
+    // Get actual port from transport
+    let port = if let Some(transport) = state.transport.lock().unwrap().as_ref() {
+        transport.local_addr().map(|a| a.port()).unwrap_or(4654)
+    } else {
+        4654
+    };
+
     // Discovery usually stores port.
     if let Some(discovery) = state.discovery.lock().unwrap().as_mut() {
           let _ = discovery.register(&device_id, &name, port);
@@ -831,13 +837,28 @@ fn regenerate_network_identity(
     *state.network_pin.lock().unwrap() = pin.clone();
     
     let device_id = state.local_device_id.lock().unwrap().clone();
-    let port = 4654; 
+    
+    // Get actual port from transport
+    let port = if let Some(transport) = state.transport.lock().unwrap().as_ref() {
+        transport.local_addr().map(|a| a.port()).unwrap_or(4654)
+    } else {
+        4654
+    };
     
     if let Some(discovery) = state.discovery.lock().unwrap().as_mut() {
           let _ = discovery.register(&device_id, &name, port);
     }
     
     let _ = app_handle.emit("network-update", ());
+}
+
+#[tauri::command]
+fn get_listening_port(state: tauri::State<'_, AppState>) -> u16 {
+    if let Some(transport) = state.transport.lock().unwrap().as_ref() {
+        transport.local_addr().map(|a| a.port()).unwrap_or(4654)
+    } else {
+        4654
+    }
 }
 
 #[tauri::command]
@@ -971,10 +992,12 @@ async fn probe_ip(
             
             match tokio::time::timeout(std::time::Duration::from_millis(2000), send_future).await {
                 Ok(Ok(())) => {
-                   tracing::debug!("Probe to {} SUCCESS (Packet Sent)", addr);
+                    tracing::debug!("Probe to {} SUCCESS (Packet Sent)", addr);
                    
-                   // NOTIFY SUCCESS
-                   send_notification(&app_handle, "Connection Established", &format!("Successfully contacted {}.", ip), false, None, "devices", NotificationPayload::None);
+                   // NOTIFY SUCCESS (Only if not startup)
+                   if state.should_notify() {
+                       send_notification(&app_handle, "Connection Established", &format!("Successfully contacted {}.", ip), false, None, "devices", NotificationPayload::None);
+                   }
 
                    // We successfully sent the packet.
                    // Since UDP is connectionless, this doesn't guarantee they received it,
@@ -1013,17 +1036,23 @@ async fn probe_ip(
                      } else {
                          // Already exists
                          tracing::debug!("Manual peer {} already exists.", id);
-                         // Still notify success to confirm connectivity
-                         send_notification(&app_handle, "Connection Verified", &format!("Connection to {} is active.", ip), false, None, "devices", NotificationPayload::None);
+                         // Still notify success to confirm connectivity (if not startup)
+                         if state.should_notify() {
+                             send_notification(&app_handle, "Connection Verified", &format!("Connection to {} is active.", ip), false, None, "devices", NotificationPayload::None);
+                         }
                      }
                 },
                 Ok(Err(e)) => {
                     tracing::warn!("Probe to {} FAILED (Send Error): {}", addr, e);
-                    send_notification(&app_handle, "Connection Failed", &format!("Failed to send packet to {}: {}", ip, e), true, None, "devices", NotificationPayload::None);
+                    if state.should_notify() {
+                        send_notification(&app_handle, "Connection Failed", &format!("Failed to send packet to {}: {}", ip, e), true, None, "devices", NotificationPayload::None);
+                    }
                 },
                 Err(_) => {
                     tracing::warn!("Probe to {} FAILED (Timeout)", addr);
-                    send_notification(&app_handle, "Connection Failed", &format!("Connection to {} timed out. Check firewall/VPN.", ip), true, None, "devices", NotificationPayload::None);
+                    if state.should_notify() {
+                        send_notification(&app_handle, "Connection Failed", &format!("Connection to {} timed out. Check firewall/VPN.", ip), true, None, "devices", NotificationPayload::None);
+                    }
                 }
             }
 }
@@ -2138,8 +2167,10 @@ pub fn run() {
             retry_connection,
             configure_autostart,
             get_autostart_state,
+            get_listening_port,
             show_native_notification,
             get_theme_override,
+            get_current_theme,
         ])
 
         .on_window_event(|window, event| {

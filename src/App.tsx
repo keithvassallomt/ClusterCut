@@ -347,6 +347,10 @@ export default function App() {
   const [joinError, setJoinError] = useState("");
   const [expandedNetworks, setExpandedNetworks] = useState<Set<string>>(new Set());
 
+  /* Port Warning State */
+  const [showPortWarning, setShowPortWarning] = useState(false);
+  const [currentPort, setCurrentPort] = useState(4654);
+
   // Manual Sync State
   // Manual Sync State
   const [manualSyncOpen, setManualSyncOpen] = useState(false);
@@ -617,6 +621,14 @@ export default function App() {
 
     // 3. Settings
     fetchSettings();
+
+    // 4. Port Check
+    invoke<number>("get_listening_port").then(port => {
+      if (port !== 4654) {
+        setCurrentPort(port);
+        setShowPortWarning(true);
+      }
+    });
   }, []);
 
   // Poll/Update PIN when network name changes
@@ -1288,6 +1300,35 @@ export default function App() {
           <div className="text-xl font-medium text-zinc-900 dark:text-zinc-50">Connecting to remote cluster...</div>
         </div>
       )}
+      {/* Port Warning Modal */}
+      <Modal
+        open={showPortWarning}
+        title="Non-Standard Port Detected"
+        subtitle="ClusterCut is running on a fallback port."
+        onClose={() => setShowPortWarning(false)}
+        footer={
+          <Button onClick={() => setShowPortWarning(false)}>
+            OK
+          </Button>
+        }
+      >
+        <div className="space-y-4">
+          <div className="flex items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-900 dark:border-amber-900/30 dark:bg-amber-900/10 dark:text-amber-200">
+            <AlertTriangle className="h-5 w-5 shrink-0" />
+            <div className="text-sm">
+              <span className="font-semibold">Port 4654 is busy.</span>
+              <p className="mt-1 opacity-90">
+                ClusterCut is listening on port <span className="font-mono font-bold">{currentPort}</span> instead.
+              </p>
+            </div>
+          </div>
+          <p className="text-sm text-zinc-600 dark:text-zinc-400">
+            This usually happens if another instance of ClusterCut is already running. 
+            Peer discovery might be affected if other devices expect the standard port.
+          </p>
+        </div>
+      </Modal>
+
     </div>
   );
 }
@@ -2141,6 +2182,7 @@ function SettingsView({
           ClusterCut v{version} ({__COMMIT_HASH__})
         </div>
       </div>
+
 
 
     </div>
