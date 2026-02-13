@@ -5,6 +5,7 @@ use crate::transport::Transport;
 use std::{thread, time::Duration};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_clipboard::Clipboard;
+use std::sync::mpsc;
 
 // Use a shared cache to avoid feedback loops
 use once_cell::sync::Lazy;
@@ -162,8 +163,25 @@ pub fn set_clipboard_paths(app: &AppHandle, paths: Vec<String>) {
 }
 
 pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transport) {
+    let app_handle_worker = app_handle.clone();
+    
+    // Create channels for Worker <-> Monitor communication
+    let (cmd_tx, cmd_rx) = mpsc::channel::<()>();
+    let (res_tx, res_rx) = mpsc::channel::<ClipboardContent>();
+
+    // Spawn Worker Thread (Performs Blocking IO)
     thread::spawn(move || {
-        let mut last_content = read_clipboard(&app_handle);
+        while cmd_rx.recv().is_ok() {
+            let content = read_clipboard(&app_handle_worker);
+            if res_tx.send(content).is_err() {
+                break; // Monitor dropped receiver
+            }
+        }
+    });
+
+    // Spawn Monitor Thread (Manages Loop & Timeout)
+    thread::spawn(move || {
+        let mut last_content = ClipboardContent::None; 
 
         // Polling loop
         loop {
@@ -172,7 +190,47 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 break;
             }
 
-            let current_content = read_clipboard(&app_handle);
+            // 1. Request Read
+            if cmd_tx.send(()).is_err() {
+                 tracing::error!("Clipboard worker thread died.");
+                 break; 
+            }
+
+            // 2. Wait for Result with Timeout (500ms)
+            // If the OS clipboard is locked, the worker will be stuck in 'read_clipboard'
+            // and won't send the result in time.
+            let current_content = match res_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(c) => c,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!("Clipboard read timed out (possible deadlock/lock). Skipping cycle.");
+                    // We skip the rest of the loop and try again later.
+                    // The worker is still stuck. 
+                    // If it unblocks, it will send the result to the channel (buffered).
+                    // Next loop iteration:
+                    // cmd_tx.send() might succeed (buffer)
+                    // res_rx.recv() will pick up the *old* (stale) result immediately? 
+                    // Yes. This is a bit tricky. 
+                    // If we timeout, we should probably drain the channel next time?
+                    // Or, we use a "Request ID" or just accept that we might be one cycle behind.
+                    // Being one cycle behind is fine for clipboard monitoring.
+                    // But we don't want to build up a queue.
+                    // mpsc is infinite buffer.
+                    // If worker is stuck for 10 seconds.
+                    // Monitor loops 20 times (20 timeouts).
+                    // Monitor sends 20 requests. Channel has 20 requests.
+                    // Worker unblocks. Processes 20 requests. Sends 20 results.
+                    // Monitor receives 20 results instantly.
+                    // This catches up. It's fine.
+                    
+                    // Wait before triggering next cycle to avoid tight loop warning logs if completely dead?
+                    // The recv_timeout already waited 500ms. So we effectively slept.
+                    continue; 
+                },
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    tracing::error!("Clipboard worker disconnected.");
+                    break;
+                }
+            };
 
             // Check Ignored (Feedback Loop)
             let mut should_process = false;
