@@ -153,7 +153,7 @@ async fn show_native_notification(_app_handle: tauri::AppHandle, title: String, 
 
     #[cfg(target_os = "macos")]
     {
-        send_notification(&app_handle, &title, &body, false, None, "history", NotificationPayload::None);
+        send_notification(&_app_handle, &title, &body, false, None, "history", NotificationPayload::None);
     }
     
     Ok(())
@@ -1467,7 +1467,7 @@ pub fn run() {
     let args = init_logging();
     let minimized_arg = args.minimized;
     
-    let builder = tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard::init())
         .plugin(tauri_plugin_shell::init())
