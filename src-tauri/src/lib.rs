@@ -1520,9 +1520,18 @@ fn spawn_linux_theme_poller(app: tauri::AppHandle) {
             
             // Poll gsettings
             // gsettings get org.gnome.desktop.interface color-scheme
-            match std::process::Command::new("gsettings")
-                .args(["get", "org.gnome.desktop.interface", "color-scheme"])
-                .output() 
+            // Start with base command
+            let mut cmd = std::process::Command::new("gsettings");
+            let mut args = vec!["get", "org.gnome.desktop.interface", "color-scheme"];
+
+            // Check if running in Flatpak
+            if std::path::Path::new("/.flatpak-info").exists() {
+                cmd = std::process::Command::new("flatpak-spawn");
+                args.insert(0, "--host");
+                args.insert(1, "gsettings");
+            }
+            
+            match cmd.args(args).output() 
             {
                 Ok(output) => {
                     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();

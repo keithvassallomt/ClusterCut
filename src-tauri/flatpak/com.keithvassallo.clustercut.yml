@@ -29,6 +29,8 @@ finish-args:
   - --filesystem=xdg-config/autostart:create
   # Own D-Bus name for GNOME Extension communication
   - --own-name=com.keithvassallo.clustercut
+  # Allow talking to Flatpak portal (for flatpak-spawn)
+  - --talk-name=org.freedesktop.Flatpak
 modules:
   - name: intltool
     buildsystem: autotools
