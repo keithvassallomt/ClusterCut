@@ -59,4 +59,7 @@ pub enum Message {
     HistoryDelete(String), // Payload is item ID
     // Encrypted File Request (FileRequestPayload)
     FileRequest(Vec<u8>),
+    // Liveness Check
+    Ping,
+    Pong,
 }

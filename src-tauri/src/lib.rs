@@ -1952,20 +1952,77 @@ pub fn run() {
                                     let mut pending = r_state.pending_removals.lock().unwrap();
                                     if let Some(n) = pending.get(&r_id) {
                                         if *n == nonce {
-                                            // Confirmed! Still pending and nonce matches (not overwritten by newer removal?)
-                                            pending.remove(&r_id);
-                                            drop(pending); // Drop lock
+                                            // Confirmed! Still pending and nonce matches.
+                                            // START ACTIVE CHECK
+                                            let peer_addr = {
+                                                let peers = r_state.peers.lock().unwrap();
+                                                peers.get(&r_id).map(|p| std::net::SocketAddr::new(p.ip, p.port))
+                                            };
                                             
-                                            // Proceed with removal
-                                            {
-                                                tracing::info!("[Discovery] Debounce expired. Removing peer {}", r_id);
-                                                let mut peers = r_state.peers.lock().unwrap();
-                                                if let Some(peer) = peers.remove(&r_id) {
-                                                     drop(peers); // Drop lock before notifying
-                                                     check_and_notify_leave(&r_handle, &r_state, &peer);
+                                            let mut is_alive = false;
+                                            
+                                            // Release pending lock temporarily to avoid holding it during networking
+                                            drop(pending);
+                                            
+                                            if let Some(addr) = peer_addr {
+                                                tracing::info!("[Discovery] Debounce expired for {}. Probing...", r_id);
+                                                // Create a temporary transport scope 
+                                                // (We can use the main one, but we need to clone the lock)
+                                                let transport_opt = { r_state.transport.lock().unwrap().clone() };
+                                                
+                                                if let Some(transport) = transport_opt {
+                                                    if let Ok(ping_data) = serde_json::to_vec(&Message::Ping) {
+                                                        // Convert Send Error to false
+                                                        // We use a short timeout for the ping
+                                                        let send_fut = async {
+                                                            match transport.send_message(addr, &ping_data).await {
+                                                                Ok(_) => true,
+                                                                Err(e) => { 
+                                                                    tracing::warn!("[Discovery] Active probe to {} failed: {}", addr, e);
+                                                                    false
+                                                                }
+                                                            }
+                                                        };
+                                                        
+                                                        // 2s timeout for ping
+                                                        if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(2), send_fut).await {
+                                                            is_alive = result;
+                                                        } else {
+                                                            tracing::warn!("[Discovery] Active probe to {} timed out.", addr);
+                                                        }
+                                                    }
                                                 }
                                             }
-                                            let _ = r_handle.emit("peer-remove", &r_id);
+                                            
+                                            // Re-acquire lock to finalize
+                                            let mut pending = r_state.pending_removals.lock().unwrap();
+                                            // Check if nonce still matches (it might have been updated/removed while we were working)
+                                            if let Some(current_n) = pending.get(&r_id) {
+                                                if *current_n == nonce {
+                                                    pending.remove(&r_id);
+                                                    drop(pending); // Drop lock
+                                                    
+                                                    if is_alive {
+                                                        tracing::info!("[Discovery] Active probe SUCCESS for {}. Cancelling removal.", r_id);
+                                                        return;
+                                                    }
+                                                    
+                                                    // Proceed with removal
+                                                    {
+                                                        tracing::info!("[Discovery] Active probe FAILED/TIMEOUT. Removing peer {}", r_id);
+                                                        let mut peers = r_state.peers.lock().unwrap();
+                                                        if let Some(peer) = peers.remove(&r_id) {
+                                                             drop(peers); // Drop lock before notifying
+                                                             check_and_notify_leave(&r_handle, &r_state, &peer);
+                                                        }
+                                                    }
+                                                    let _ = r_handle.emit("peer-remove", &r_id);
+                                                } else {
+                                                     tracing::debug!("[Discovery] Removal Debounce cancelled (Nonce updated during probe) for {}", r_id);
+                                                }
+                                            } else {
+                                                 tracing::debug!("[Discovery] Removal Debounce cancelled (Entry removed during probe) for {}", r_id);
+                                            }
                                         } else {
                                             tracing::debug!("[Discovery] Removal Debounce cancelled (Nonce mismatch) for {}", r_id);
                                         }
@@ -3165,6 +3222,18 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                      }
                  }
              }
+                     }
+                 }
+             }
+        }
+        Message::Ping => {
+            tracing::debug!("Received Ping from {}. Sending Pong.", addr);
+            if let Ok(pong_data) = serde_json::to_vec(&Message::Pong) {
+                let _ = transport_inside.send_message(addr, &pong_data).await;
+            }
+        }
+        Message::Pong => {
+             tracing::debug!("Received Pong from {}. Connection Verified.", addr);
         }
     }
 }
