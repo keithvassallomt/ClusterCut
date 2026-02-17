@@ -13,6 +13,7 @@ mod tray;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState, ShortcutEvent};
+#[cfg(target_os = "linux")]
 use tauri::Listener;
 use local_ip_address::list_afinet_netifas;
 
@@ -1579,7 +1580,8 @@ pub fn run() {
     let args = init_logging();
     let minimized_arg = args.minimized;
     
-    let builder = tauri::Builder::default()
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard::init())
         .plugin(tauri_plugin_shell::init())
