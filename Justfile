@@ -38,8 +38,8 @@ run-flatpak:
 # Export the installed Flatpak to a single bundle file
 flatpak-bundle:
     @echo "Exporting bundle from user repo..."
-    flatpak build-bundle ~/.local/share/flatpak/repo clustercut.flatpak com.keithvassallo.clustercut
-    @echo "Done: clustercut.flatpak"
+    VERSION=$(node -p "require('./package.json').version") && flatpak build-bundle ~/.local/share/flatpak/repo ClusterCut_${VERSION}_x86_64.flatpak com.keithvassallo.clustercut
+    @echo "Done: ClusterCut_$(node -p "require('./package.json').version")_x86_64.flatpak"
 
 # Clean all build artifacts
 clean:

@@ -8,9 +8,7 @@
 
 ClusterCut keeps your clipboard in sync across Windows, macOS, and Linux without your data ever leaving your local network. No clouds, no accounts, just seamless productivity.
 
-<p align="center">
-    <video src="assets/README/clustercut_promo.mp4" controls muted autoplay loop width="100%"></video>
-</p>
+VIDEO GOES HERE
 
 ## Features
 
