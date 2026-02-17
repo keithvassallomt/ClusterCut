@@ -13,6 +13,7 @@ mod tray;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState, ShortcutEvent};
+use tauri::Listener;
 use local_ip_address::list_afinet_netifas;
 
 use tauri_plugin_clipboard::Clipboard;
@@ -281,10 +282,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 static LAST_NOTIFICATION_TIME: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 // Helper to broadcast a new peer to all known peers (Gossip)
-pub(crate) fn send_notification(_app_handle: &tauri::AppHandle, title: &str, body: &str, _increment_badge: bool, _id: Option<i32>, target_view: &str, payload: NotificationPayload) {
+pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body: &str, increment_badge: bool, _id: Option<i32>, target_view: &str, payload: NotificationPayload) {
     // 1. Windows (Native windows-rs with XML Actions)
     #[cfg(target_os = "windows")]
     {
+        let _ = app_handle;
+        let _ = increment_badge;
         use windows::UI::Notifications::{ToastNotificationManager, ToastNotification};
         use windows::Data::Xml::Dom::XmlDocument;
         use windows::core::HSTRING;
@@ -367,6 +370,7 @@ pub(crate) fn send_notification(_app_handle: &tauri::AppHandle, title: &str, bod
     // 2. macOS (user-notify)
     #[cfg(target_os = "macos")]
     {
+        let _ = increment_badge;
         tracing::info!("[Notification] macOS detected. Using user-notify...");
 
         // Update last notification time
@@ -399,7 +403,7 @@ pub(crate) fn send_notification(_app_handle: &tauri::AppHandle, title: &str, bod
                         tracing::info!("Notification Response: {:?}" , response);
                         match response.action {
                             user_notify::NotificationResponseAction::Default => {
-                                let _ = app_handle_callback.get_webview_window("main").map(|w| {
+                                let _ = app_handle_callback.get_webview_window("main").map(|w: tauri::WebviewWindow| {
                                     tracing::info!("[Notification] Emitting 'notification-clicked' to main window...");
                                     // Extract view from payload
                                     let mut view = "history".to_string(); // Default
@@ -607,7 +611,7 @@ pub(crate) fn send_notification(_app_handle: &tauri::AppHandle, title: &str, bod
                     
                     let _ = app.emit("notification-clicked", Payload { view: view.clone() });
                     
-                    let _ = app.get_webview_window("main").map(|w| {
+                    let _ = app.get_webview_window("main").map(|w: tauri::WebviewWindow| {
                         let _ = w.unminimize();
                         let _ = w.show();
                         let _ = w.set_focus();
@@ -631,7 +635,7 @@ pub(crate) fn send_notification(_app_handle: &tauri::AppHandle, title: &str, bod
                          
                          tauri::async_runtime::spawn(async move {
                              let _ = app.emit("notification-clicked", serde_json::json!({ "view": "history" }));
-                             let _ = app.get_webview_window("main").map(|w| {
+                             let _ = app.get_webview_window("main").map(|w: tauri::WebviewWindow| {
                                  let _ = w.unminimize();
                                  let _ = w.show();
                                  let _ = w.set_focus();
@@ -1575,7 +1579,7 @@ pub fn run() {
     let args = init_logging();
     let minimized_arg = args.minimized;
     
-    let mut builder = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard::init())
         .plugin(tauri_plugin_shell::init())
