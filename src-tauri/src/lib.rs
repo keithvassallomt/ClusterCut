@@ -283,7 +283,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 static LAST_NOTIFICATION_TIME: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 // Helper to broadcast a new peer to all known peers (Gossip)
-pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body: &str, increment_badge: bool, _id: Option<i32>, target_view: &str, payload: NotificationPayload) {
+pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body: &str, increment_badge: bool, _id: Option<i32>, target_view: &str, _payload: NotificationPayload) {
     // 1. Windows (Native windows-rs with XML Actions)
     #[cfg(target_os = "windows")]
     {
@@ -304,7 +304,7 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
         // Dynamic Actions
         let mut actions_xml = format!(r#"<action content="Open" arguments="clustercut://action/show?view={}" activationType="protocol"/>"#, target_view);
 
-        if let NotificationPayload::DownloadAvailable { msg_id, file_count, peer_id } = &payload {
+        if let NotificationPayload::DownloadAvailable { msg_id, file_count, peer_id } = &_payload {
              // Encode params if needed, but for now simple format
              let download_args = format!("clustercut://action/download?msg_id={}&peer_id={}&file_count={}", msg_id, peer_id, file_count);
              // Escape XML chars in URL? & in XML is &amp;
@@ -544,7 +544,7 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
         let title = title.to_string();
         let body = body.to_string();
         // Move payload into the closure
-        let payload = payload.clone(); 
+        let payload = _payload.clone(); 
         let view = target_view.to_string();
         let app = app_handle.clone();
         
