@@ -13,7 +13,6 @@ mod tray;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState, ShortcutEvent};
-use tauri::Listener;
 use local_ip_address::list_afinet_netifas;
 
 use tauri_plugin_clipboard::Clipboard;
@@ -282,7 +281,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 static LAST_NOTIFICATION_TIME: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 // Helper to broadcast a new peer to all known peers (Gossip)
-pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body: &str, increment_badge: bool, _id: Option<i32>, target_view: &str, payload: NotificationPayload) {
+pub(crate) fn send_notification(_app_handle: &tauri::AppHandle, title: &str, body: &str, _increment_badge: bool, _id: Option<i32>, target_view: &str, payload: NotificationPayload) {
     // 1. Windows (Native windows-rs with XML Actions)
     #[cfg(target_os = "windows")]
     {
@@ -1567,7 +1566,7 @@ pub fn run() {
     let args = init_logging();
     let minimized_arg = args.minimized;
     
-    let builder = tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard::init())
         .plugin(tauri_plugin_shell::init())
