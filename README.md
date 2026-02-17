@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/README/logo.png" alt="ClusterCut Logo" width="120" />
+  <img src="assets/README/logo.png" alt="ClusterCut Logo" width="64" />
 </p>
 
 # ClusterCut
@@ -8,7 +8,7 @@
 
 ClusterCut keeps your clipboard in sync across Windows, macOS, and Linux without your data ever leaving your local network. No clouds, no accounts, just seamless productivity.
 
-VIDEO GOES HERE
+<video autoplay="autoplay" mute src="https://github.com/user-attachments/assets/6aa1297b-a55a-49bc-a33e-059e680231ac"></video>
 
 ## Features
 
