@@ -1,0 +1,78 @@
+    Checking clustercut v0.1.0 (/home/keith/LocalCode/keithvassallomt/ClusterCut/src-tauri)
+warning: unused imports: `AtomicBool` and `Ordering`
+    --> src/lib.rs:1498:29
+     |
+1498 |     use std::sync::atomic::{AtomicBool, Ordering};
+     |                             ^^^^^^^^^^  ^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::sync::Arc`
+    --> src/lib.rs:1499:9
+     |
+1499 |     use std::sync::Arc;
+     |         ^^^^^^^^^^^^^^
+
+warning: unused variable: `listener_handle`
+   --> src/tray.rs:194:9
+    |
+194 |     let listener_handle = app.clone();
+    |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_listener_handle`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `e`
+    --> src/lib.rs:1551:21
+     |
+1551 |                 Err(e) => {
+     |                     ^ help: if this is intentional, prefix it with an underscore: `_e`
+
+warning: variable does not need to be mutable
+    --> src/lib.rs:1952:41
+     |
+1952 | ...                   let mut pending = r_state.pending_removals.lock().unwrap();
+     |                           ----^^^^^^^
+     |                           |
+     |                           help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/lib.rs:1571:9
+     |
+1571 |     let mut builder = tauri::Builder::default()
+     |         ----^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+error: future cannot be sent between threads safely
+    --> src/lib.rs:1949:33
+     |
+1949 | / ...                   tauri::async_runtime::spawn(async move {
+1950 | | ...                       tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+1951 | | ...                       
+1952 | | ...                       let mut pending = r_state.pending_removals.lock().unwrap();
+...    |
+2032 | | ...                   });
+     | |________________________^ future created by async block is not `Send`
+     |
+     = help: within `{async block@src/lib.rs:1949:61: 1949:71}`, the trait `std::marker::Send` is not implemented for `std::sync::MutexGuard<'_, HashMap<std::string::String, u64>>`
+note: future is not `Send` as this value is used across an await
+    --> src/lib.rs:1988:143
+     |
+1952 | ...                   let mut pending = r_state.pending_removals.lock().unwrap();
+     |                           ----------- has type `std::sync::MutexGuard<'_, HashMap<std::string::String, u64>>` which is not `Send`
+...
+1988 | ...                                       if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(2), send_fut).await {
+     |                                                                                                                                 ^^^^^ await occurs here, with `mut pending` maybe used later
+note: required by a bound in `tauri::async_runtime::spawn`
+    --> /home/keith/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tauri-2.10.2/src/async_runtime.rs:270:15
+     |
+ 268 | pub fn spawn<F>(task: F) -> JoinHandle<F::Output>
+     |        ----- required by a bound in this function
+ 269 | where
+ 270 |   F: Future + Send + 'static,
+     |               ^^^^ required by this bound in `spawn`
+
+warning: `clustercut` (lib) generated 6 warnings
+error: could not compile `clustercut` (lib) due to 1 previous error; 6 warnings emitted

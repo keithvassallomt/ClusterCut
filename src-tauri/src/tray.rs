@@ -190,8 +190,7 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
         })
         .build(app)?;
 
-    // Setup Theme Listener
-    let listener_handle = app.clone();
+
     // Setup Theme Listener
     let listener_handle = app.clone();
     app.listen("tauri://theme-changed", move |event| {

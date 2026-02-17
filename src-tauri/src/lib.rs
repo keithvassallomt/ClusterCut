@@ -1495,8 +1495,7 @@ async fn confirm_pending_clipboard(
 
 #[cfg(target_os = "linux")]
 fn spawn_linux_theme_poller(app: tauri::AppHandle) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+
     
     let app_handle = app.clone();
     
@@ -1548,7 +1547,7 @@ fn spawn_linux_theme_poller(app: tauri::AppHandle) {
                         let _ = app_handle.emit("tauri://theme-changed", simple_theme);
                     }
                 },
-                Err(e) => {
+                Err(_e) => {
                     // Reduce log spam if gsettings is missing (e.g. non-GNOME)
                     // tracing::debug!("Failed to run gsettings: {}", e);
                 }
@@ -1568,7 +1567,7 @@ pub fn run() {
     let args = init_logging();
     let minimized_arg = args.minimized;
     
-    let mut builder = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard::init())
         .plugin(tauri_plugin_shell::init())
@@ -1949,20 +1948,27 @@ pub fn run() {
                                 tauri::async_runtime::spawn(async move {
                                     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                                     
-                                    let mut pending = r_state.pending_removals.lock().unwrap();
-                                    if let Some(n) = pending.get(&r_id) {
-                                        if *n == nonce {
-                                            // Confirmed! Still pending and nonce matches.
-                                            // START ACTIVE CHECK
-                                            let peer_addr = {
-                                                let peers = r_state.peers.lock().unwrap();
-                                                peers.get(&r_id).map(|p| std::net::SocketAddr::new(p.ip, p.port))
-                                            };
-                                            
-                                            let mut is_alive = false;
-                                            
-                                            // Release pending lock temporarily to avoid holding it during networking
-                                            drop(pending);
+                                    let should_probe = {
+                                        let pending = r_state.pending_removals.lock().unwrap();
+                                        if let Some(n) = pending.get(&r_id) {
+                                            *n == nonce
+                                        } else {
+                                            false
+                                        }
+                                    };
+
+                                    if should_probe {
+                                        // Confirmed! Still pending and nonce matches.
+                                        // START ACTIVE CHECK
+                                        let peer_addr = {
+                                            let peers = r_state.peers.lock().unwrap();
+                                            peers.get(&r_id).map(|p| std::net::SocketAddr::new(p.ip, p.port))
+                                        };
+                                        
+                                        let mut is_alive = false;
+                                        
+                                        // Lock is already dropped here by scope
+
                                             
                                             if let Some(addr) = peer_addr {
                                                 tracing::info!("[Discovery] Debounce expired for {}. Probing...", r_id);
@@ -2023,12 +2029,8 @@ pub fn run() {
                                             } else {
                                                  tracing::debug!("[Discovery] Removal Debounce cancelled (Entry removed during probe) for {}", r_id);
                                             }
-                                        } else {
-                                            tracing::debug!("[Discovery] Removal Debounce cancelled (Nonce mismatch) for {}", r_id);
                                         }
-                                    } else {
-                                        tracing::debug!("[Discovery] Removal Debounce cancelled (Entry gone) for {}", r_id);
-                                    }
+
                                 });
                             }
                             _ => {}
@@ -3219,9 +3221,6 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                              }
                          }
                          Err(e) => tracing::error!("Failed to decrypt FileRequest: {}", e),
-                     }
-                 }
-             }
                      }
                  }
              }
