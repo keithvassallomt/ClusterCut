@@ -82,5 +82,5 @@ notarize:
 # Build the GNOME Extension ZIP
 extension-zip:
     @echo "Building GNOME Extension ZIP..."
-    cd gnome-extension && zip -r ../clustercut-extension.zip .
+    rm -f clustercut-extension.zip && cd gnome-extension && zip -r ../clustercut-extension.zip . -x "*.png"
     @echo "Done: clustercut-extension.zip"

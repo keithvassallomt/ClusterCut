@@ -1,8 +1,6 @@
 import Gio from 'gi://Gio';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
-import Gtk from 'gi://Gtk?version=4.0';
-import Gdk from 'gi://Gdk?version=4.0';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -29,14 +27,14 @@ const DBUS_IFACE = `
   </interface>
 </node>`;
 
-const ClusterCutProxy = Gio.DBusProxy.makeProxyWrapper(DBUS_IFACE);
-
 const ClusterCutIndicator = GObject.registerClass(
 class ClusterCutIndicator extends QuickSettings.SystemIndicator {
     _init(extensionObject) {
         super._init();
         this._extensionObject = extensionObject;
 
+        // Initialize proxy class wrapper here instead of top-level
+        this._ProxyClass = Gio.DBusProxy.makeProxyWrapper(DBUS_IFACE);
 
         this._toggle = new QuickSettings.QuickMenuToggle({
             title: 'ClusterCut',
@@ -53,8 +51,7 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
         // Add to the indicator's list
         this.quickSettingsItems.push(this._toggle);
 
-        // ... (rest is same)
-        this._proxy = new ClusterCutProxy(
+        this._proxy = new this._ProxyClass(
             Gio.DBus.session,
             'com.keithvassallo.clustercut',
             '/org/gnome/Shell/Extensions/ClusterCut',
@@ -94,38 +91,22 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
         // Connect Toggle Click
         this._toggleSignalId = this._toggle.connect('clicked', () => {
              if (!this._appRunning) {
-                 this._toggle.subtitle = 'Launching...';
-                 this._tryLaunchApp();
+                 this._toggle.subtitle = 'Not running';
                  return;
              }
 
-            if (this._proxy) {
-                 const newState = this._toggle.checked;
-                 
-                 if (newState) {
-                     // Enable Both
-                     this._proxy.ToggleAutoSendRemote((res, err) => {
-                          if (!err) {
-                               this._proxy.ToggleAutoReceiveRemote((r, e) => {
-                                   this._updateState();
-                               });
-                          } else {
-                              // console.error('ClusterCut: ToggleAutoSend failed', err);
-                          }
-                     });
-                 } else {
-                     // Disable Both
-                     this._proxy.ToggleAutoSendRemote((res, err) => {
-                          if (!err) {
-                               this._proxy.ToggleAutoReceiveRemote((r, e) => {
-                                   this._updateState();
-                               });
-                          } else {
-                              // console.error('ClusterCut: ToggleAutoSend failed', err);
-                          }
-                     });
-                 }
-            }
+             if (!this._proxy) return;
+
+             // We just toggle, ignoring the specific checked state because the methods are Toggles
+             this._proxy.ToggleAutoSendRemote((res, err) => {
+                  if (!err) {
+                       this._proxy.ToggleAutoReceiveRemote((r, e) => {
+                           this._updateState();
+                       });
+                  } else {
+                      // console.error('ClusterCut: ToggleAutoSend failed', err);
+                  }
+             });
         });
 
         // Add Menu Items
@@ -139,7 +120,7 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
              if (this._appRunning && this._proxy) {
                  this._proxy.ToggleAutoSendRemote((result, error) => {
                       this._updateState();
-                 });
+                  });
              }
         });
 
@@ -147,7 +128,7 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
              if (this._appRunning && this._proxy) {
                  this._proxy.ToggleAutoReceiveRemote((result, error) => {
                       this._updateState();
-                 });
+                  });
              }
         });
 
@@ -171,20 +152,6 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
             }
         } catch (e) {
             // File likely doesn't exist or other error, fallback remains 'edit-paste-symbolic'
-        }
-    }
-
-    _tryLaunchApp() {
-        let appInfo = Gio.AppInfo.get_all().find(a => a.get_id() === 'com.keithvassallo.clustercut.desktop');
-        if (appInfo) {
-            appInfo.launch([], null);
-        } else {
-            try {
-                Gio.AppInfo.create_from_commandline('clustercut', null, Gio.AppInfoCreateFlags.NONE).launch([], null);
-            } catch (e) {
-                // console.error('Failed to launch ClusterCut', e);
-                if (this._toggle) this._toggle.subtitle = 'Launch failed';
-            }
         }
     }
 
@@ -269,32 +236,12 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
         if (this._autoSendItem) this._autoSendItem = null;
         if (this._autoReceiveItem) this._autoReceiveItem = null;
 
-        this.emit('destroy');
+        super.destroy();
     }
 });
 
 export default class ClusterCutExtension extends Extension {
     enable() {
-        // Try to register Icon Path via Gtk.IconTheme
-        try {
-            const display = Gdk.Display.get_default();
-            if (display) {
-                let theme = Gtk.IconTheme.get_for_display(display);
-                let themePath = this.path + '/icons';
-                let currentPaths = theme.get_search_path();
-                
-                if (!currentPaths.includes(themePath)) {
-                    // We need to keep track if we added it, but checking existence is usually enough
-                    // strictly speaking we should only remove it if we added it, but for extensions
-                    // it is generally assumed we manage our own path.
-                    theme.add_search_path(themePath);
-                    this._iconPathAdded = true;
-                }
-            }
-        } catch (e) {
-             // console.error('ClusterCut: IconTheme registration exception:', e);
-        }
-
         this._indicator = new ClusterCutIndicator(this);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
     }
@@ -304,25 +251,6 @@ export default class ClusterCutExtension extends Extension {
             this._indicator.quickSettingsItems.forEach(item => item.destroy());
             this._indicator.destroy();
             this._indicator = null;
-        }
-
-        // Clean up Icon Theme
-        if (this._iconPathAdded) {
-            try {
-                const display = Gdk.Display.get_default();
-                if (display) {
-                    let theme = Gtk.IconTheme.get_for_display(display);
-                    let themePath = this.path + '/icons';
-                    let currentPaths = theme.get_search_path();
-                    
-                    // Filter out our path
-                    let newPaths = currentPaths.filter(p => p !== themePath);
-                    theme.set_search_path(newPaths);
-                }
-            } catch (e) {
-                // console.error('ClusterCut: Failed to restore icon search path', e);
-            }
-            this._iconPathAdded = false;
         }
     }
 }
