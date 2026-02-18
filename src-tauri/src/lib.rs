@@ -1896,6 +1896,12 @@ pub fn run() {
                                         signature: None,
                                     };
 
+                                    // Check if peer is already active to prevent duplicate notifications
+                                    let is_new_peer = {
+                                        let peers = d_state.peers.lock().unwrap();
+                                        !peers.contains_key(&id)
+                                    };
+
                                     d_state.add_peer(peer.clone());
                                     let _ = d_handle.emit("peer-update", &peer);
 
@@ -1914,8 +1920,12 @@ pub fn run() {
                                             if d_state.settings.lock().unwrap().notifications.device_join {
                                                 // Suppress notifications during startup
                                                 if d_state.should_notify() {
-                                                    tracing::info!("[Notification] Triggering 'Device Joined' for discovered peer: {}", peer.hostname);
-                                                    send_notification(&d_handle, "Device Joined", &format!("{} has joined your cluster", peer.hostname), false, Some(1), "devices", NotificationPayload::None);
+                                                    if is_new_peer {
+                                                        tracing::info!("[Notification] Triggering 'Device Joined' for discovered peer: {}", peer.hostname);
+                                                        send_notification(&d_handle, "Device Joined", &format!("{} has joined your cluster", peer.hostname), false, Some(1), "devices", NotificationPayload::None);
+                                                    } else {
+                                                        tracing::debug!("[Notification] Peer updated (already known): {}", peer.hostname);
+                                                    }
                                                 } else {
                                                     tracing::debug!("[Notification] Device join notification suppressed by startup timer for peer: {}", peer.hostname);
                                                 }
