@@ -41,6 +41,8 @@ finish-args:
   - --filesystem=xdg-config/gtk-4.0:ro
   # GNOME Extension Communication (DBus Service)
   - --own-name=com.keithvassallo.clustercut
+  # Allow spawning commands on host (for gsettings)
+  - --talk-name=org.freedesktop.Flatpak
 modules:
   - name: intltool
     buildsystem: autotools

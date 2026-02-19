@@ -1526,11 +1526,14 @@ fn spawn_linux_theme_poller(app: tauri::AppHandle) {
             // gsettings get org.gnome.desktop.interface color-scheme
             // Start with base command
             let mut cmd = std::process::Command::new("gsettings");
-            let args = vec!["get", "org.gnome.desktop.interface", "color-scheme"];
+            let mut args = vec!["get", "org.gnome.desktop.interface", "color-scheme"];
 
-            // Note: We used to check for /.flatpak-info and use flatpak-spawn --host
-            // But with --filesystem=xdg-config/dconf:ro, we can read the settings directly
-            // from within the sandbox using the bundled gsettings, which is more reliable.
+            // Check if running in Flatpak
+            if std::path::Path::new("/.flatpak-info").exists() {
+                cmd = std::process::Command::new("flatpak-spawn");
+                args.insert(0, "--host");
+                args.insert(1, "gsettings");
+            }
             
             match cmd.args(args).output() 
             {
