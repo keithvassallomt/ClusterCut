@@ -32,6 +32,15 @@ finish-args:
   - --filesystem=xdg-download
   # Autostart access
   - --filesystem=xdg-config/autostart:create
+  # Theme detection (Read GSettings/DConf)
+  - --filesystem=xdg-config/dconf:ro
+  - --filesystem=~/.config/dconf:ro
+  - --talk-name=ca.desrt.dconf
+  # Read GTK settings for theme
+  - --filesystem=xdg-config/gtk-3.0:ro
+  - --filesystem=xdg-config/gtk-4.0:ro
+  # GNOME Extension Communication (DBus Service)
+  - --own-name=com.keithvassallo.clustercut
 modules:
   - name: intltool
     buildsystem: autotools
@@ -126,7 +135,7 @@ modules:
     sources:
       - type: git
         url: https://github.com/keithvassallomt/ClusterCut.git
-        tag: v0.1.0
+        tag: v0.1.1
       # Generated sources
       - cargo-sources.json
       - node-sources.json

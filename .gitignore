@@ -28,12 +28,10 @@ dev/
 src-tauri/flatpak/.flatpak-builder/
 src-tauri/flatpak/build-dir/
 src-tauri/flatpak/shared-modules/
+.flatpak-builder/
 
 # Extension build
 clustercut-extension.zip
-
-# Local Flatpak bundle
-clustercut.flatpak
 
 # macOS signing credentials
 .env
