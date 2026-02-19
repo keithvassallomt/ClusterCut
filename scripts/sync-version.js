@@ -52,3 +52,32 @@ try {
     console.error('Error updating Cargo.toml:', error);
     process.exit(1);
 }
+
+// Update metainfo.xml
+const metainfoPath = path.join(rootDir, 'src-tauri', 'flatpak', 'com.keithvassallo.clustercut.metainfo.xml');
+try {
+    if (fs.existsSync(metainfoPath)) {
+        let metainfo = fs.readFileSync(metainfoPath, 'utf-8');
+        const today = new Date().toISOString().split('T')[0];
+        const releaseTag = `<release version="${version}" date="${today}" />`;
+        
+        // Check if this version is already recorded
+        if (!metainfo.includes(`version="${version}"`)) {
+            // Add new release entry after <releases>
+            if (metainfo.includes('<releases>')) {
+                metainfo = metainfo.replace('<releases>', `<releases>\n    ${releaseTag}`);
+                fs.writeFileSync(metainfoPath, metainfo);
+                console.log(`Updated metainfo.xml with version ${version}`);
+            } else {
+                console.warn('Could not find <releases> tag in metainfo.xml');
+            }
+        } else {
+            console.log(`metainfo.xml already contains version ${version}`);
+        }
+    } else {
+        console.warn('metainfo.xml not found, skipping update');
+    }
+} catch (error) {
+    console.error('Error updating metainfo.xml:', error);
+    // Don't fail the build for this, just warn
+}

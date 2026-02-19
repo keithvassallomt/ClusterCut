@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.keithvassallo.clustercut</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>ClusterCut</name>
+  <summary>Cross-platform Clipboard Sync</summary>
+  <description>
+    <p>
+      ClusterCut is a seamless clipboard synchronization tool that works across Linux, macOS and Windows.
+      It allows you to copy text on one device and paste it on another instantly, keeping your workflow uninterrupted.
+    </p>
+    <p>Features include:</p>
+    <ul>
+      <li>Real-time clipboard synchronization</li>
+      <li>Secure peer-to-peer connection</li>
+      <li>Cross-platform support</li>
+      <li>Minimal resource usage</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">com.keithvassallo.clustercut.desktop</launchable>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/keithvassallomt/ClusterCut/main/assets/screenshot-1.png</image>
+    </screenshot>
+  </screenshots>
+  <url type="homepage">https://clustercut.app</url>
+  <url type="bugtracker">https://github.com/keithvassallomt/ClusterCut/issues</url>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.1" date="2026-02-19" />
+  </releases>
+</component>
