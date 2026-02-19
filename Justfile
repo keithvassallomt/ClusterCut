@@ -11,14 +11,14 @@ set dotenv-load := true
 build:
     npm run tauri build
 
-# Build and verify the Flatpak (from Git source)
-flatpak:
+# Generate Flatpak sources and build locally
+flatpak flathub_dir="../flathub-clustercut":
     @echo "Generating Cargo sources..."
-    python3 src-tauri/flatpak/builder-tools/cargo/flatpak-cargo-generator.py src-tauri/Cargo.lock -o src-tauri/flatpak/cargo-sources.json
+    python3 src-tauri/flatpak/builder-tools/cargo/flatpak-cargo-generator.py src-tauri/Cargo.lock -o {{flathub_dir}}/cargo-sources.json
     @echo "Generating Node sources..."
-    export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/src-tauri/flatpak/builder-tools/node" && python3 -m flatpak_node_generator npm package-lock.json -o src-tauri/flatpak/node-sources.json
+    export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/src-tauri/flatpak/builder-tools/node" && python3 -m flatpak_node_generator npm package-lock.json -o {{flathub_dir}}/node-sources.json
     @echo "Building Flatpak bundle from git source and installing..."
-    flatpak-builder --user --install --force-clean src-tauri/flatpak/build-dir src-tauri/flatpak/com.keithvassallo.clustercut.yml
+    flatpak-builder --user --install --force-clean build-dir {{flathub_dir}}/com.keithvassallo.clustercut.yml
     @echo "Exporting bundle from user repo..."
     mkdir -p dist
     VERSION=$(node -p "require('./package.json').version") && flatpak build-bundle ~/.local/share/flatpak/repo dist/ClusterCut_${VERSION}_x86_64.flatpak com.keithvassallo.clustercut
@@ -32,9 +32,7 @@ run-flatpak:
 # Clean all build artifacts
 clean:
     rm -rf src-tauri/target
-    rm -rf src-tauri/flatpak/build-dir
-    rm -rf src-tauri/flatpak/.flatpak-builder
-    rm -rf src-tauri/flatpak/shared-modules
+    rm -rf build-dir
     rm -f clustercut-extension.zip
     rm -f dist/*.flatpak
     rm -rf .flatpak-builder
@@ -44,7 +42,3 @@ extension-zip:
     @echo "Building GNOME Extension ZIP..."
     rm -f clustercut-extension.zip && cd gnome-extension && zip -r ../clustercut-extension.zip . -x "*.png"
     @echo "Done: clustercut-extension.zip"
-
-# Update Flathub submission files
-update-flathub:
-    ./scripts/update-flathub.sh

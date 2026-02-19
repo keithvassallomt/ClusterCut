@@ -25,9 +25,7 @@ dist-ssr
 dev/
 
 # Flatpak
-src-tauri/flatpak/.flatpak-builder/
-src-tauri/flatpak/build-dir/
-src-tauri/flatpak/shared-modules/
+build-dir/
 .flatpak-builder/
 
 # Extension build

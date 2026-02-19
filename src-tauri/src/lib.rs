@@ -1498,77 +1498,106 @@ async fn confirm_pending_clipboard(
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_linux_theme_poller(app: tauri::AppHandle) {
+fn spawn_linux_theme_watcher(app: tauri::AppHandle) {
+    use futures::StreamExt;
+    use zbus::zvariant::{OwnedValue, Value};
 
-    
+    /// Recursively unwrap D-Bus variants to extract a u32.
+    /// The portal returns color-scheme as v(v(u32)).
+    fn extract_u32(v: &Value<'_>) -> Option<u32> {
+        match v {
+            Value::U32(n) => Some(*n),
+            Value::Value(inner) => extract_u32(inner),
+            _ => None,
+        }
+    }
+
+    /// Convert a portal color-scheme value to a theme string.
+    /// 0 = No preference, 1 = Prefer dark, 2 = Prefer light.
+    fn color_scheme_to_theme(value: OwnedValue) -> &'static str {
+        let v: Value<'static> = value.into();
+        match extract_u32(&v) {
+            Some(1) => "prefer-dark",
+            _ => "default",
+        }
+    }
+
     let app_handle = app.clone();
-    
-    // We already have a shutdown flag in AppState, but accessing it requires state which might be locked?
-    // Actually, AppState.shutdown is AtomicBool so it's fine.
-    
-    std::thread::spawn(move || {
-        let mut last_theme = String::new();
-        
-        // Initial delay to let startup settle
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        
-        tracing::info!("Starting Linux Theme Poller...");
-        
-        loop {
-            // Check shutdown
-            if let Some(state) = app_handle.try_state::<AppState>() {
-                 if state.is_shutdown() {
-                     break;
-                 }
-            }
-            
-            // Poll gsettings
-            // gsettings get org.gnome.desktop.interface color-scheme
-            // Start with base command
-            let mut cmd = std::process::Command::new("gsettings");
-            let mut args = vec!["get", "org.gnome.desktop.interface", "color-scheme"];
 
-            // Check if running in Flatpak
-            if std::path::Path::new("/.flatpak-info").exists() {
-                cmd = std::process::Command::new("flatpak-spawn");
-                args.insert(0, "--host");
-                args.insert(1, "gsettings");
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tracing::info!("Starting Linux Theme Watcher (XDG Settings Portal)...");
+
+        let conn = match zbus::Connection::session().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to connect to session bus for theme watching: {}", e);
+                return;
             }
-            
-            match cmd.args(args).output() 
-            {
-                Ok(output) => {
-                    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    // Output is usually "'prefer-dark'" or "'default'" (with quotes)
-                    let theme = raw.replace("'", "");
-                    
-                    if theme != last_theme {
-                        tracing::info!("Linux Theme Changed: {} -> {}", last_theme, theme);
-                        last_theme = theme.clone();
-                        
-                        // Update State
-                        if let Some(state) = app_handle.try_state::<AppState>() {
-                             *state.current_theme.lock().unwrap() = Some(theme.clone());
-                        }
-                        
-                        // Update Tray
-                        crate::tray::update_tray_icon(&app_handle);
-                        
-                        // Emit Event
-                        // Emit Event (Simple string: "dark" or "light") matched to Tauri's internal format
-                        let simple_theme = if theme == "prefer-dark" { "dark" } else { "light" };
-                        let _ = app_handle.emit("tauri://theme-changed", simple_theme);
-                    }
-                },
-                Err(_e) => {
-                    // Reduce log spam if gsettings is missing (e.g. non-GNOME)
-                    // tracing::debug!("Failed to run gsettings: {}", e);
+        };
+
+        let proxy: zbus::Proxy<'_> = match zbus::proxy::Builder::new(&conn)
+            .interface("org.freedesktop.portal.Settings").unwrap()
+            .path("/org/freedesktop/portal/desktop").unwrap()
+            .destination("org.freedesktop.portal.Desktop").unwrap()
+            .build()
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to create Settings portal proxy: {}", e);
+                return;
+            }
+        };
+
+        // Read initial color-scheme value
+        match proxy.call_method("Read", &("org.freedesktop.appearance", "color-scheme")).await {
+            Ok(reply) => {
+                let body: zbus::message::Body = reply.body();
+                match body.deserialize::<(OwnedValue,)>() {
+                    Ok((value,)) => {
+                        let theme = color_scheme_to_theme(value);
+                        apply_theme_change(&app_handle, theme);
+                    },
+                    Err(e) => tracing::warn!("Failed to deserialize color-scheme: {}", e),
+                }
+            },
+            Err(e) => tracing::warn!("Failed to read initial color-scheme from portal: {}", e),
+        }
+
+        // Subscribe to SettingChanged signal for real-time updates
+        let mut stream: zbus::proxy::SignalStream<'_> = match proxy.receive_signal("SettingChanged").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to subscribe to SettingChanged signal: {}", e);
+                return;
+            }
+        };
+
+        while let Some(signal) = stream.next().await {
+            let body: zbus::message::Body = signal.body();
+            if let Ok((namespace, key, value)) = body.deserialize::<(String, String, OwnedValue)>() {
+                if namespace == "org.freedesktop.appearance" && key == "color-scheme" {
+                    let theme = color_scheme_to_theme(value);
+                    apply_theme_change(&app_handle, theme);
                 }
             }
-            
-            std::thread::sleep(std::time::Duration::from_secs(3));
         }
     });
+}
+
+#[cfg(target_os = "linux")]
+fn apply_theme_change(app_handle: &tauri::AppHandle, theme: &str) {
+    tracing::info!("Linux theme change detected: {}", theme);
+
+    if let Some(state) = app_handle.try_state::<AppState>() {
+        *state.current_theme.lock().unwrap() = Some(theme.to_string());
+    }
+
+    crate::tray::update_tray_icon(app_handle);
+
+    let simple_theme = if theme == "prefer-dark" { "dark" } else { "light" };
+    let _ = app_handle.emit("tauri://theme-changed", simple_theme);
 }
 
 
@@ -1702,7 +1731,7 @@ pub fn run() {
 
             #[cfg(target_os = "linux")]
             {
-                spawn_linux_theme_poller(app_handle.clone());
+                spawn_linux_theme_watcher(app_handle.clone());
             }
 
             // Load State
