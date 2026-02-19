@@ -35,7 +35,6 @@ clean:
     rm -rf src-tauri/flatpak/build-dir
     rm -rf src-tauri/flatpak/.flatpak-builder
     rm -rf src-tauri/flatpak/shared-modules
-    rm -rf src-tauri/flatpak/*.patch
     rm -f clustercut-extension.zip
     rm -f dist/*.flatpak
     rm -rf .flatpak-builder
