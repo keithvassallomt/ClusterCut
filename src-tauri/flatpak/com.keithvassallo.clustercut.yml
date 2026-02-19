@@ -132,7 +132,7 @@ modules:
       - install -D src-tauri/target/release/clustercut /app/bin/clustercut
       # Install desktop file and icon
       - install -D src-tauri/flatpak/com.keithvassallo.clustercut.desktop /app/share/applications/com.keithvassallo.clustercut.desktop
-      - install -D src-tauri/flatpak/icon-512.png /app/share/icons/hicolor/512x512/apps/com.keithvassallo.clustercut.png
+      - install -D src-tauri/flatpak/com.keithvassallo.clustercut.svg /app/share/icons/hicolor/scalable/apps/com.keithvassallo.clustercut.svg
       - install -D metainfo.xml /app/share/metainfo/com.keithvassallo.clustercut.metainfo.xml
     sources:
       - type: git
