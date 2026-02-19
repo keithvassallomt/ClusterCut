@@ -20,9 +20,10 @@ flatpak:
     @echo "Building Flatpak bundle from git source and installing..."
     flatpak-builder --user --install --force-clean src-tauri/flatpak/build-dir src-tauri/flatpak/com.keithvassallo.clustercut.yml
     @echo "Exporting bundle from user repo..."
-    VERSION=$(node -p "require('./package.json').version") && flatpak build-bundle ~/.local/share/flatpak/repo ClusterCut_${VERSION}_x86_64.flatpak com.keithvassallo.clustercut
+    mkdir -p dist
+    VERSION=$(node -p "require('./package.json').version") && flatpak build-bundle ~/.local/share/flatpak/repo dist/ClusterCut_${VERSION}_x86_64.flatpak com.keithvassallo.clustercut
     @echo "Done! Run with: flatpak run com.keithvassallo.clustercut"
-    @echo "Bundle created: ClusterCut_$(node -p "require('./package.json').version")_x86_64.flatpak"
+    @echo "Bundle created: dist/ClusterCut_$(node -p "require('./package.json').version")_x86_64.flatpak"
 
 # Run the local Flatpak
 run-flatpak:
@@ -36,7 +37,7 @@ clean:
     rm -rf src-tauri/flatpak/shared-modules
     rm -rf src-tauri/flatpak/*.patch
     rm -f clustercut-extension.zip
-    rm -f *.flatpak
+    rm -f dist/*.flatpak
 
 # Build the GNOME Extension ZIP
 extension-zip:
