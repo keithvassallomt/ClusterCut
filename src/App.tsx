@@ -3,6 +3,7 @@ import { version } from "../package.json";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import {
   Monitor, Copy, History, ShieldCheck, PlusCircle, Trash2, LogOut,
@@ -589,10 +590,10 @@ export default function App() {
 
   const handleInstallExtension = () => {
     const extUrl = "https://extensions.gnome.org/extension/9341/clustercut/";
-    invoke('open_url', { url: extUrl }).catch(() => {
-      invoke('opener', { url: extUrl }).catch(() => {
+    openUrl(extUrl).catch((e: unknown) => {
+        console.error("Failed to open URL via plugin-opener:", e);
+        // Fallback to window.open (might be blocked by CSP or Tauri config)
         window.open(extUrl, "_blank");
-      });
     });
     setShowExtensionDialog(false);
   };

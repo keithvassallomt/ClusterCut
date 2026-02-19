@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ClusterCut",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.keithvassallo.clustercut",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -27,12 +27,19 @@
   },
   "plugins": {
     "deep-link": {
-      "schemes": ["clustercut"]
+      "schemes": [
+        "clustercut"
+      ]
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "rpm", "nsis", "dmg"],
+    "targets": [
+      "deb",
+      "rpm",
+      "nsis",
+      "dmg"
+    ],
     "icon": [
       "icons/icon.png",
       "icons/icon.ico",
