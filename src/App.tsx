@@ -588,9 +588,10 @@ export default function App() {
   }, [settings]);
 
   const handleInstallExtension = () => {
-    invoke('open_url', { url: "https://extensions.gnome.org" }).catch(() => {
-      invoke('opener', { url: "https://extensions.gnome.org" }).catch(() => {
-        window.open("https://extensions.gnome.org", "_blank");
+    const extUrl = "https://extensions.gnome.org/extension/9341/clustercut/";
+    invoke('open_url', { url: extUrl }).catch(() => {
+      invoke('opener', { url: extUrl }).catch(() => {
+        window.open(extUrl, "_blank");
       });
     });
     setShowExtensionDialog(false);
