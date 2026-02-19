@@ -38,6 +38,7 @@ clean:
     rm -rf src-tauri/flatpak/*.patch
     rm -f clustercut-extension.zip
     rm -f dist/*.flatpak
+    rm -rf .flatpak-builder
 
 # Build the GNOME Extension ZIP
 extension-zip:
