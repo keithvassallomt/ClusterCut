@@ -44,3 +44,7 @@ extension-zip:
     @echo "Building GNOME Extension ZIP..."
     rm -f clustercut-extension.zip && cd gnome-extension && zip -r ../clustercut-extension.zip . -x "*.png"
     @echo "Done: clustercut-extension.zip"
+
+# Update Flathub submission files
+update-flathub:
+    ./scripts/update-flathub.sh
