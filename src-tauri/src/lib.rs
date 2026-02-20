@@ -55,56 +55,109 @@ async fn get_current_theme(state: tauri::State<'_, AppState>) -> Result<Option<S
 async fn configure_autostart(app_handle: tauri::AppHandle, enable: bool) -> Result<bool, String> {
     // Check if running in Flatpak
     if cfg!(target_os = "linux") && std::env::var("FLATPAK_ID").is_ok() {
-        // Explicitly ignore app_handle to silence warnings
-        let _ = app_handle;
+        let flatpak_id = std::env::var("FLATPAK_ID").unwrap();
 
-        let id = std::env::var("FLATPAK_ID").unwrap();
-        
-        let base_config = std::env::var("XDG_CONFIG_HOME").ok()
-            .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
-            .ok_or("Could not determine config directory")?;
-            
-        let autostart_dir = base_config.join("autostart");
-        let file_path = autostart_dir.join(format!("{}.desktop", id));
+        let conn = zbus::Connection::session().await
+            .map_err(|e| format!("Failed to connect to session bus: {}", e))?;
 
+        // Build a proxy for the Background portal
+        let proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(&conn)
+            .interface("org.freedesktop.portal.Background").unwrap()
+            .path("/org/freedesktop/portal/desktop").unwrap()
+            .destination("org.freedesktop.portal.Desktop").unwrap()
+            .build()
+            .await
+            .map_err(|e| format!("Failed to create Background portal proxy: {}", e))?;
+
+        // Compute a predictable handle_token from our unique bus name
+        let unique_name = conn.unique_name()
+            .ok_or("No unique bus name")?
+            .as_str()
+            .to_string();
+        let sender_part = unique_name
+            .trim_start_matches(':')
+            .replace('.', "_");
+        let handle_token = "clustercut_autostart";
+        let request_path = format!(
+            "/org/freedesktop/portal/desktop/request/{}/{}",
+            sender_part, handle_token
+        );
+
+        // Subscribe to the Response signal on the request path BEFORE calling the method
+        let response_proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(&conn)
+            .interface("org.freedesktop.portal.Request").unwrap()
+            .path(request_path.as_str()).unwrap()
+            .destination("org.freedesktop.portal.Desktop").unwrap()
+            .build()
+            .await
+            .map_err(|e| format!("Failed to create request proxy: {}", e))?;
+
+        let mut response_stream: zbus::proxy::SignalStream<'_> = response_proxy
+            .receive_signal("Response")
+            .await
+            .map_err(|e| format!("Failed to subscribe to Response signal: {}", e))?;
+
+        // Build the options dict for RequestBackground
+        let mut options = std::collections::HashMap::<&str, zbus::zvariant::Value<'_>>::new();
+        options.insert("handle_token", zbus::zvariant::Value::from(handle_token));
+        options.insert("reason", zbus::zvariant::Value::from(
+            "ClusterCut needs to start at login to sync your clipboard across devices."
+        ));
+        options.insert("autostart", zbus::zvariant::Value::from(enable));
         if enable {
-            if !autostart_dir.exists() {
-                std::fs::create_dir_all(&autostart_dir).map_err(|e| e.to_string())?;
-            }
-            
-            // X-Flatpak tag and Exec command are key
-            // Appending --minimized is tricky here because we don't know if the user WANTS it minimized always?
-            // The requirement says: "Make this command line argument default when creating the launcher/service/whatever for auto-startup."
-            let content = format!(
-                "[Desktop Entry]\nType=Application\nName=ClusterCut\nComment=ClusterCut Clipboard Sync\nExec=flatpak run {} --minimized\nX-Flatpak={}\nTerminal=false\nCategories=Utility;\n",
-                id, id
-            );
-            std::fs::write(&file_path, content).map_err(|e| e.to_string())?;
-        } else {
-            if file_path.exists() {
-                std::fs::remove_file(&file_path).map_err(|e| e.to_string())?;
-            }
+            let cmd: Vec<String> = vec![
+                "flatpak".into(),
+                "run".into(),
+                flatpak_id.clone(),
+                "--minimized".into(),
+            ];
+            options.insert("commandline", zbus::zvariant::Value::from(cmd));
         }
-        Ok(true) // Handled
+
+        // Call RequestBackground (parent_window = "")
+        proxy.call_method("RequestBackground", &("", options)).await
+            .map_err(|e| format!("RequestBackground call failed: {}", e))?;
+
+        // Wait for the Response signal with a 60s timeout
+        use futures::StreamExt;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            response_stream.next(),
+        )
+        .await
+        .map_err(|_| "Portal request timed out — no response within 60 seconds".to_string())?
+        .ok_or("Response signal stream ended unexpectedly")?;
+
+        // Parse the response: (uint32 response, dict results)
+        let body: zbus::message::Body = response.body();
+        let (response_code, _results): (u32, std::collections::HashMap<String, zbus::zvariant::OwnedValue>) = body
+            .deserialize()
+            .map_err(|e| format!("Failed to deserialize portal response: {}", e))?;
+
+        if response_code == 0 {
+            // Approved — persist the state
+            let state = app_handle.state::<AppState>();
+            {
+                let mut settings = state.settings.lock().unwrap();
+                settings.flatpak_autostart = enable;
+            }
+            storage::save_settings(&app_handle, &state.settings.lock().unwrap());
+            tracing::info!("Flatpak autostart {} via Background portal", if enable { "enabled" } else { "disabled" });
+            Ok(true)
+        } else {
+            Err(format!("Autostart request was denied by the user (response code: {})", response_code))
+        }
     } else {
-        Ok(false) // Not handled
+        Ok(false) // Not handled — let tauri-plugin-autostart handle it
     }
 }
 
 #[tauri::command]
 async fn get_autostart_state(app_handle: tauri::AppHandle) -> Result<Option<bool>, String> {
     if cfg!(target_os = "linux") && std::env::var("FLATPAK_ID").is_ok() {
-         let _ = app_handle;
-         let id = std::env::var("FLATPAK_ID").unwrap();
-         
-         let base_config = std::env::var("XDG_CONFIG_HOME").ok()
-            .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
-            .ok_or("Could not determine config directory")?;
-
-        let file_path = base_config.join("autostart").join(format!("{}.desktop", id));
-        Ok(Some(file_path.exists()))
+        let state = app_handle.state::<AppState>();
+        let settings = state.settings.lock().unwrap();
+        Ok(Some(settings.flatpak_autostart))
     } else {
         Ok(None)
     }
@@ -748,10 +801,12 @@ fn get_settings(state: tauri::State<'_, AppState>) -> AppSettings {
 
 #[tauri::command]
 fn save_settings(
-    settings: AppSettings,
+    mut settings: AppSettings,
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) {
+    // Preserve backend-only fields that the frontend doesn't manage
+    settings.flatpak_autostart = state.settings.lock().unwrap().flatpak_autostart;
     *state.settings.lock().unwrap() = settings.clone();
     tracing::info!("Saving Settings: auto_send={}, auto_receive={}", settings.auto_send, settings.auto_receive);
     crate::storage::save_settings(&app_handle, &settings);

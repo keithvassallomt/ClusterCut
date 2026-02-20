@@ -310,6 +310,8 @@ pub struct AppSettings {
     pub notify_large_files: bool,
     #[serde(default)]
     pub ignore_extension_missing: bool,
+    #[serde(default)]
+    pub flatpak_autostart: bool,
 }
 
 impl Default for AppSettings {
@@ -326,6 +328,7 @@ impl Default for AppSettings {
             max_auto_download_size: 50 * 1024 * 1024, // 50 MB
             notify_large_files: true,
             ignore_extension_missing: false,
+            flatpak_autostart: false,
         }
     }
 }
