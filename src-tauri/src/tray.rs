@@ -12,6 +12,30 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 #[cfg(not(target_os = "linux"))]
 use tauri::menu::CheckMenuItem;
 
+#[cfg(target_os = "linux")]
+const SYMBOLIC_ICON_NAME: &str = "com.keithvassallo.clustercut-tray-symbolic";
+
+/// Override the tray icon to a named icon from the system icon theme.
+/// On GNOME, a `-symbolic` suffix causes automatic recoloring to match the panel.
+#[cfg(target_os = "linux")]
+fn set_tray_icon_by_name(app: &AppHandle, icon_name: &str) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let icon_name = icon_name.to_string();
+        let _ = tray.with_inner_tray_icon(move |inner| {
+            // SAFETY: The underlying AppIndicator methods only mutate through
+            // the inner `*mut AppIndicatorRaw` C pointer, not the Rust wrapper.
+            // We are on the GTK main thread (guaranteed by with_inner_tray_icon).
+            unsafe {
+                let indicator_ptr =
+                    inner.app_indicator() as *mut libappindicator::AppIndicator;
+                let indicator = &mut *indicator_ptr;
+                indicator.set_icon_theme_path("");
+                indicator.set_icon_full(&icon_name, "tray icon");
+            }
+        });
+    }
+}
+
 pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
     // Platform-specific Menu Item Creation
     #[cfg(not(target_os = "linux"))]
@@ -190,6 +214,10 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
         })
         .build(app)?;
 
+    // On Linux, override the initial PNG icon with a named symbolic icon.
+    // GNOME Shell will look this up from the icon theme and recolor it.
+    #[cfg(target_os = "linux")]
+    set_tray_icon_by_name(app, SYMBOLIC_ICON_NAME);
 
     // Setup Theme Listener
     let listener_handle = app.clone();
@@ -300,7 +328,10 @@ pub fn update_tray_icon(app: &AppHandle) {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = app; // Unused on Windows
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    set_tray_icon_by_name(app, SYMBOLIC_ICON_NAME);
+
+    #[cfg(target_os = "macos")]
     {
         if let Some(tray) = app.tray_by_id("main-tray") {
             let (icon, is_template) = get_themed_icon(app);
@@ -364,9 +395,15 @@ pub fn set_badge(app: &AppHandle, show: bool) {
     if let Some(tray) = app.tray_by_id("main-tray") {
         if !show {
             // Restore default icon
-            let (icon, is_template) = get_platform_icon(app);
-            let _ = tray.set_icon_as_template(is_template);
-            let _ = tray.set_icon(Some(icon));
+            #[cfg(target_os = "linux")]
+            set_tray_icon_by_name(app, SYMBOLIC_ICON_NAME);
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                let (icon, is_template) = get_platform_icon(app);
+                let _ = tray.set_icon_as_template(is_template);
+                let _ = tray.set_icon(Some(icon));
+            }
             return;
         }
 
