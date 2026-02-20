@@ -3730,7 +3730,7 @@ async fn check_gnome_extension_status() -> ExtensionStatus {
     if let Ok(connection) = zbus::Connection::session().await {
          let proxy_result: zbus::Result<zbus::Proxy> = zbus::Proxy::new(
              &connection,
-             "org.gnome.Shell.Extensions",
+             "org.gnome.Shell",
              "/org/gnome/Shell",
              "org.gnome.Shell.Extensions"
          ).await;
