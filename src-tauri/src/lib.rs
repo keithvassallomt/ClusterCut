@@ -55,8 +55,6 @@ async fn get_current_theme(state: tauri::State<'_, AppState>) -> Result<Option<S
 async fn configure_autostart(app_handle: tauri::AppHandle, enable: bool) -> Result<bool, String> {
     // Check if running in Flatpak
     if cfg!(target_os = "linux") && std::env::var("FLATPAK_ID").is_ok() {
-        let flatpak_id = std::env::var("FLATPAK_ID").unwrap();
-
         let conn = zbus::Connection::session().await
             .map_err(|e| format!("Failed to connect to session bus: {}", e))?;
 
@@ -106,9 +104,7 @@ async fn configure_autostart(app_handle: tauri::AppHandle, enable: bool) -> Resu
         options.insert("autostart", zbus::zvariant::Value::from(enable));
         if enable {
             let cmd: Vec<String> = vec![
-                "flatpak".into(),
-                "run".into(),
-                flatpak_id.clone(),
+                "clustercut".into(),
                 "--minimized".into(),
             ];
             options.insert("commandline", zbus::zvariant::Value::from(cmd));
@@ -588,9 +584,164 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
         });
     }
     
-    // 2. Linux Workaround (notify-rust via DBus)
+    // 2. Linux Notifications
     #[cfg(target_os = "linux")]
     {
+      if std::env::var("FLATPAK_ID").is_ok() {
+        // Flatpak: use Notification portal (avoids --talk-name=org.freedesktop.Notifications)
+        tracing::debug!("[Notification] Flatpak detected. Using Notification portal...");
+
+        let title = title.to_string();
+        let body = body.to_string();
+        let payload = _payload.clone();
+        let view = target_view.to_string();
+        let app = app_handle.clone();
+
+        let app_state_opt = app.try_state::<crate::state::AppState>();
+        let state = if let Some(s) = app_state_opt {
+             (*s).clone()
+        } else {
+             tracing::error!("Failed to get AppState for notification callback!");
+             return;
+        };
+
+        tauri::async_runtime::spawn(async move {
+            let conn = match zbus::Connection::session().await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("[Notification] D-Bus session connection failed: {}", e);
+                    return;
+                }
+            };
+
+            let proxy: zbus::Proxy<'_> = match zbus::proxy::Builder::new(&conn)
+                .interface("org.freedesktop.portal.Notification").unwrap()
+                .path("/org/freedesktop/portal/desktop").unwrap()
+                .destination("org.freedesktop.portal.Desktop").unwrap()
+                .build()
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("[Notification] Failed to create Notification portal proxy: {}", e);
+                    return;
+                }
+            };
+
+            let notif_id = format!("n{}", uuid::Uuid::new_v4().as_simple());
+
+            // Build notification dict
+            let mut notif = std::collections::HashMap::<&str, zbus::zvariant::Value<'_>>::new();
+            notif.insert("title", zbus::zvariant::Value::from(title.as_str()));
+            notif.insert("body", zbus::zvariant::Value::from(body.as_str()));
+            notif.insert("priority", zbus::zvariant::Value::from("normal"));
+            notif.insert("default-action", zbus::zvariant::Value::from("open"));
+
+            // Buttons
+            let mut open_btn = std::collections::HashMap::<&str, zbus::zvariant::Value<'_>>::new();
+            open_btn.insert("label", zbus::zvariant::Value::from("Open"));
+            open_btn.insert("action", zbus::zvariant::Value::from("open"));
+
+            let buttons: Vec<std::collections::HashMap<&str, zbus::zvariant::Value<'_>>> =
+                if matches!(&payload, NotificationPayload::DownloadAvailable { .. }) {
+                    let mut dl_btn = std::collections::HashMap::<&str, zbus::zvariant::Value<'_>>::new();
+                    dl_btn.insert("label", zbus::zvariant::Value::from("Download"));
+                    dl_btn.insert("action", zbus::zvariant::Value::from("download"));
+                    vec![open_btn, dl_btn]
+                } else {
+                    vec![open_btn]
+                };
+
+            notif.insert("buttons", zbus::zvariant::Value::from(buttons));
+
+            // Subscribe to ActionInvoked before sending
+            let mut action_stream: zbus::proxy::SignalStream<'_> = match proxy
+                .receive_signal("ActionInvoked")
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("[Notification] Failed to subscribe to ActionInvoked: {}", e);
+                    return;
+                }
+            };
+
+            // Send notification
+            if let Err(e) = proxy.call_method("AddNotification", &(notif_id.as_str(), notif)).await {
+                tracing::error!("[Notification] AddNotification failed: {}", e);
+                return;
+            }
+            tracing::info!("[Notification] Sent via portal: {}", notif_id);
+
+            // Wait for action with timeout (loop to filter by our notification ID)
+            use futures::StreamExt;
+            let timeout_duration = std::time::Duration::from_secs(60);
+            let start = std::time::Instant::now();
+
+            loop {
+                let remaining = timeout_duration.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+
+                match tokio::time::timeout(remaining, action_stream.next()).await {
+                    Ok(Some(signal)) => {
+                        let body: zbus::message::Body = signal.body();
+                        match body.deserialize::<(String, String, Vec<zbus::zvariant::OwnedValue>)>() {
+                            Ok((id, action, _params)) => {
+                                if id != notif_id {
+                                    continue; // Not our notification
+                                }
+                                tracing::info!("[Notification] Portal action '{}' for {}", action, id);
+
+                                if action == "open" {
+                                    let _ = app.emit("notification-clicked", serde_json::json!({ "view": &view }));
+                                    let _ = app.get_webview_window("main").map(|w: tauri::WebviewWindow| {
+                                        let _ = w.unminimize();
+                                        let _ = w.show();
+                                        let _ = w.set_focus();
+                                    });
+                                } else if action == "download" {
+                                    if let NotificationPayload::DownloadAvailable { file_count, peer_id, .. } = &payload {
+                                        let msg_id = if let NotificationPayload::DownloadAvailable { msg_id, .. } = &payload {
+                                            msg_id.clone()
+                                        } else {
+                                            String::new()
+                                        };
+
+                                        let _ = app.emit("notification-clicked", serde_json::json!({ "view": "history" }));
+                                        let _ = app.get_webview_window("main").map(|w: tauri::WebviewWindow| {
+                                            let _ = w.unminimize();
+                                            let _ = w.show();
+                                            let _ = w.set_focus();
+                                        });
+
+                                        let state_clone = state.clone();
+                                        let peer_id_clone = peer_id.clone();
+                                        let count = *file_count;
+                                        for i in 0..count {
+                                            if let Err(e) = crate::request_file_internal(&state_clone, msg_id.clone(), i, peer_id_clone.clone()).await {
+                                                tracing::error!("Failed to auto-download file {}/{}: {}", i, count, e);
+                                            } else {
+                                                tracing::info!("Successfully requested file {}/{}", i, count);
+                                            }
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!("[Notification] Failed to deserialize ActionInvoked: {}", e);
+                                continue;
+                            }
+                        }
+                    }
+                    _ => break, // Timeout or stream ended
+                }
+            }
+        });
+      } else {
+        // Non-Flatpak: use notify-rust via D-Bus
         use notify_rust::Notification;
         tracing::debug!("[Notification] Linux detected. Using notify-rust via DBus...");
         
@@ -708,6 +859,7 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
                 }
             });
         });
+      }
     }
 
 
@@ -1710,8 +1862,12 @@ pub fn run() {
                 let _ = window.set_focus();
 
                 if minimized_arg {
-                    tracing::info!("Starting in minimized mode. Hiding window immediately.");
-                    let _ = window.hide();
+                    tracing::info!("Starting in minimized mode. Hiding window after brief delay.");
+                    let win = window.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let _ = win.hide();
+                    });
                 } else {
                     tracing::info!("Starting in normal mode.");
                 }
@@ -3574,7 +3730,7 @@ async fn check_gnome_extension_status() -> ExtensionStatus {
     if let Ok(connection) = zbus::Connection::session().await {
          let proxy_result: zbus::Result<zbus::Proxy> = zbus::Proxy::new(
              &connection,
-             "org.gnome.Shell",
+             "org.gnome.Shell.Extensions",
              "/org/gnome/Shell",
              "org.gnome.Shell.Extensions"
          ).await;
