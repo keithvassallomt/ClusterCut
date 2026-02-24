@@ -33,3 +33,6 @@ clustercut-extension.zip
 
 # macOS signing credentials
 .env
+
+# Claude Code
+CLAUDE.md
