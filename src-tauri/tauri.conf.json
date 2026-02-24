@@ -63,6 +63,18 @@
         }
       }
     },
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/share/icons/hicolor/scalable/status/com.keithvassallo.clustercut-tray-symbolic.svg": "../assets/Tray Icons/svg/clustercut-tray-symbolic.svg"
+        }
+      },
+      "rpm": {
+        "files": {
+          "/usr/share/icons/hicolor/scalable/status/com.keithvassallo.clustercut-tray-symbolic.svg": "../assets/Tray Icons/svg/clustercut-tray-symbolic.svg"
+        }
+      }
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",
