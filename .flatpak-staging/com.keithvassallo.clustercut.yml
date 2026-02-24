@@ -1,0 +1,45 @@
+app-id: com.keithvassallo.clustercut
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.node22
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin
+command: clustercut
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=fallback-x11
+  - --device=dri
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=org.gnome.Shell
+  - --filesystem=xdg-download
+  - --filesystem=xdg-run/tray-icon:create
+modules:
+  - shared-modules/libappindicator/libappindicator-gtk3-12.10.json
+  - name: clustercut
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/clustercut/cargo
+        XDG_CACHE_HOME: /run/build/clustercut/flatpak-node/cache
+        npm_config_cache: /run/build/clustercut/flatpak-node/npm-cache
+        npm_config_offline: 'true'
+    build-commands:
+      - npm ci --offline
+      - npm run tauri build -- --no-bundle
+      - install -D src-tauri/target/release/clustercut /app/bin/clustercut
+      - install -D src-tauri/flatpak/com.keithvassallo.clustercut.desktop /app/share/applications/com.keithvassallo.clustercut.desktop
+      - install -D src-tauri/flatpak/com.keithvassallo.clustercut.svg /app/share/icons/hicolor/scalable/apps/com.keithvassallo.clustercut.svg
+      - install -D src-tauri/flatpak/com.keithvassallo.clustercut.metainfo.xml /app/share/metainfo/com.keithvassallo.clustercut.metainfo.xml
+      - install -D "assets/Tray Icons/svg/clustercut-tray-symbolic.svg" /app/share/icons/hicolor/scalable/status/com.keithvassallo.clustercut-tray-symbolic.svg
+      - install -Dm0644 LICENSE -t /app/share/licenses/com.keithvassallo.clustercut/clustercut
+    sources:
+      - type: git
+        url: https://github.com/keithvassallomt/ClusterCut.git
+        tag: v0.1.5
+        commit: cdbc5b04da4462fa739bee8a7283a03e8f92db2b
+      - cargo-sources.json
+      - node-sources.json

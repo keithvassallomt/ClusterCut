@@ -11,6 +11,74 @@ set dotenv-load := true
 build:
     npm run tauri build
 
+# Build a release: sync version, commit, tag, build native packages (+flatpak on Linux), copy to output dir
+release output_dir="~/Downloads" flathub_dir="../flathub-clustercut":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    OUTPUT_DIR="{{output_dir}}"
+    OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
+    mkdir -p "${OUTPUT_DIR}"
+
+    # 1. Sync version
+    echo "==> Syncing version..."
+    npm run sync-version
+
+    # 2. Read version and check tag doesn't exist
+    VERSION=$(node -p "require('./package.json').version")
+    TAG="v${VERSION}"
+    echo "==> Version: ${VERSION} (tag: ${TAG})"
+    if git rev-parse "${TAG}" >/dev/null 2>&1; then
+        echo "ERROR: Tag ${TAG} already exists."
+        exit 1
+    fi
+
+    # 3. Commit all changes and tag
+    echo "==> Committing release..."
+    git add -u
+    git commit -m "v${VERSION}"
+    git tag "${TAG}"
+    echo "==> Created tag ${TAG}"
+
+    # 4. Build native packages
+    echo "==> Building native packages..."
+    npm run tauri build
+
+    # 5. Copy artifacts to output dir
+    OS="$(uname -s)"
+    echo "==> Copying artifacts to ${OUTPUT_DIR}..."
+    case "${OS}" in
+        Linux)
+            cp src-tauri/target/release/bundle/deb/*.deb "${OUTPUT_DIR}/" 2>/dev/null || true
+            cp src-tauri/target/release/bundle/rpm/*.rpm "${OUTPUT_DIR}/" 2>/dev/null || true
+            ;;
+        Darwin)
+            cp src-tauri/target/release/bundle/dmg/*.dmg "${OUTPUT_DIR}/" 2>/dev/null || true
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            cp src-tauri/target/release/bundle/nsis/*.exe "${OUTPUT_DIR}/" 2>/dev/null || true
+            ;;
+    esac
+
+    # 6. Flatpak (Linux only)
+    if [ "${OS}" = "Linux" ]; then
+        echo "==> Building Flatpak bundle..."
+        just flatpak "{{flathub_dir}}" "{{output_dir}}"
+    fi
+
+    # 7. Summary
+    echo ""
+    echo "============================================"
+    echo " Release ${TAG} built successfully!"
+    echo "============================================"
+    echo ""
+    echo "Artifacts in ${OUTPUT_DIR}:"
+    ls -1 "${OUTPUT_DIR}"/ClusterCut*${VERSION}* 2>/dev/null || echo "  (none found)"
+    echo ""
+    echo "Pushing..."
+    git push
+    git push origin "${TAG}"
+    echo "Done!"
+
 # Clean all build artifacts
 clean:
     rm -rf src-tauri/target
