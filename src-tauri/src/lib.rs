@@ -1517,7 +1517,14 @@ fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppState, port: 
         
         tracing::info!("Reset to New Network: {} (PIN: {})", new_name_val, new_pin_val);
     }
-    
+
+    // Reset cluster mode to auto
+    {
+        let mut settings = state.settings.lock().unwrap();
+        settings.cluster_mode = "auto".to_string();
+        crate::storage::save_settings(app_handle, &settings);
+    }
+
     // 3. Re-register mDNS
     {
         let local_id = state.local_device_id.lock().unwrap().clone();
@@ -3466,12 +3473,19 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                    }
                                                    let total_time = start_time.elapsed();
                                                    tracing::info!("[Sender] Loop finished in {:?}. Chunks: {}", total_time, chunks_sent);
-                                                   // Finish Stream
+                                                   // Finish Stream (signals no more data will be written)
                                                    let _ = stream.finish();
-                                                   
-                                                   // Ensure connection stays alive until data is flushed/acknowledged
-                                                   tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                                                   _connection.close(0u32.into(), b"done");
+                                                   drop(stream);
+
+                                                   // Wait for the connection to close naturally.
+                                                   // After all data is delivered and ACKed, both sides go idle,
+                                                   // and the 30s idle timeout closes the connection.
+                                                   // This is critical over high-latency links (e.g. VPN) where
+                                                   // QUIC needs time to retransmit/deliver buffered data.
+                                                   let _ = tokio::time::timeout(
+                                                       std::time::Duration::from_secs(300),
+                                                       _connection.closed()
+                                                   ).await;
                                                    
                                                    tracing::info!("File Sent Successfully: {}", p_str);
                                                }

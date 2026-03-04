@@ -39,7 +39,7 @@ export default defineConfig(async () => ({
       : undefined,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri` and flatpak build dirs
-      ignored: ["**/src-tauri/**", "**/.flatpak-builder/**"],
+      ignored: ["**/src-tauri/**", "**/.flatpak-builder/**", "**/build-dir/**"],
     },
   },
   build: {
