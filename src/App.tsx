@@ -515,11 +515,8 @@ export default function App() {
   useEffect(() => {
     if (!settings) return;
 
-    // Logic:
-    // 1. Provisioned Mode: Always check.
-    // 2. Auto Mode: Check ONLY if we have explicit "Manual" peers (which implies Remote/VPN).
-    const isProvisioned = settings.cluster_mode === "provisioned";
-    const shouldCheck = isProvisioned || hasManualPeers;
+    // Check ONLY if we have explicit "Manual" peers (which implies Remote/VPN).
+    const shouldCheck = hasManualPeers;
 
     // Show connecting state if we are checking, have no peers, and haven't failed yet.
     // We use a small delay to avoid flashing if connection is instant (though 0 peers usually implies waiting).
@@ -1296,7 +1293,7 @@ export default function App() {
       </div>
 
       {/* Reconnecting Overlay */}
-      {settings && (settings.cluster_mode === "provisioned" || hasManualPeers) && peers.length === 0 && !isConnectionFailed && !connectionCheckDismissed && (
+      {settings && hasManualPeers && peers.length === 0 && !isConnectionFailed && !connectionCheckDismissed && (
         <div className="fixed inset-0 z-[60] flex flex-col items-center justify-center bg-white/80 backdrop-blur-sm dark:bg-zinc-950/80">
           <Loader2 className="h-12 w-12 animate-spin text-indigo-500 mb-4" />
           <div className="text-xl font-medium text-zinc-900 dark:text-zinc-50">Connecting to remote cluster...</div>
