@@ -64,18 +64,36 @@ release output_dir="~/Downloads":
         exit 1
     fi
 
-    # 3. Commit all changes and tag
+    # 3. Check changelog has an [Unreleased] section, then rename it to this version
+    echo "==> Updating CHANGELOG.md..."
+    if ! grep -q '## \[Unreleased\]' CHANGELOG.md; then
+        echo "ERROR: CHANGELOG.md has no [Unreleased] section. Add release notes before releasing."
+        exit 1
+    fi
+    TODAY=$(date +%Y-%m-%d)
+    sed -i "s/## \[Unreleased\]/## [${VERSION}] - ${TODAY}/" CHANGELOG.md
+
+    # 4. Update Flatpak yml to point at the commit we're about to tag
+    echo "==> Preparing Flatpak yml for ${TAG}..."
+
+    # 5. Commit all changes, tag, then update yml commit to match
     echo "==> Committing release..."
-    git add -u
+    git add -A
     git commit -m "v${VERSION}"
     git tag "${TAG}"
-    echo "==> Created tag ${TAG}"
+    COMMIT=$(git rev-parse "${TAG}")
+    sed -i "s/tag: v.*/tag: ${TAG}/" src-tauri/flatpak/app.clustercut.clustercut.yml
+    sed -i "s/commit: .*/commit: ${COMMIT}/" src-tauri/flatpak/app.clustercut.clustercut.yml
+    git add -A
+    git commit --amend --no-edit
+    git tag -f "${TAG}"
+    echo "==> Created tag ${TAG} (${COMMIT})"
 
-    # 4. Build native packages
+    # 6. Build native packages
     echo "==> Building native packages..."
     npm run tauri build
 
-    # 5. Copy artifacts to output dir
+    # 7. Copy artifacts to output dir
     OS="$(uname -s)"
     echo "==> Copying artifacts to ${OUTPUT_DIR}..."
     case "${OS}" in
@@ -91,13 +109,13 @@ release output_dir="~/Downloads":
             ;;
     esac
 
-    # 6. Flatpak (Linux only)
+    # 8. Flatpak (Linux only)
     if [ "${OS}" = "Linux" ]; then
         echo "==> Building Flatpak bundle..."
         just flatpak "{{output_dir}}"
     fi
 
-    # 7. Summary
+    # 9. Push
     echo ""
     echo "============================================"
     echo " Release ${TAG} built successfully!"
