@@ -74,21 +74,14 @@ release output_dir="~/Downloads":
         exit 1
     fi
 
-    # 4. Update Flatpak yml to point at the commit we're about to tag
-    echo "==> Preparing Flatpak yml for ${TAG}..."
-
-    # 5. Commit all changes, tag, then update yml commit to match
+    # 4. Update yml tag, commit all changes, tag
     echo "==> Committing release..."
+    sed -i "s/tag: v.*/tag: ${TAG}/" src-tauri/flatpak/app.clustercut.clustercut.yml
+    sed -i "/^        commit:/d" src-tauri/flatpak/app.clustercut.clustercut.yml
     git add -A
     git commit -m "v${VERSION}"
     git tag "${TAG}"
-    COMMIT=$(git rev-parse "${TAG}")
-    sed -i "s/tag: v.*/tag: ${TAG}/" src-tauri/flatpak/app.clustercut.clustercut.yml
-    sed -i "s/commit: .*/commit: ${COMMIT}/" src-tauri/flatpak/app.clustercut.clustercut.yml
-    git add -A
-    git commit --amend --no-edit
-    git tag -f "${TAG}"
-    echo "==> Created tag ${TAG} (${COMMIT})"
+    echo "==> Created tag ${TAG}"
 
     # 6. Push (must happen before Flatpak build, which clones the tag from GitHub)
     echo "==> Pushing..."
@@ -196,8 +189,7 @@ friendlyhub-update submission_dir="/home/keith/LocalCode/keithvassallomt/app.clu
         echo "ERROR: Tag ${TAG} does not exist. Tag and push the upstream release first."
         exit 1
     fi
-    COMMIT=$(git rev-parse "${TAG}")
-    echo "Tag ${TAG} -> commit ${COMMIT}"
+    echo "Tag ${TAG} found."
     # Verify the release has a description in metainfo
     METAINFO="src-tauri/flatpak/app.clustercut.clustercut.metainfo.xml"
     if ! grep -A2 "version=\"${VERSION}\"" "${METAINFO}" | grep -q "<description>"; then
@@ -209,12 +201,10 @@ friendlyhub-update submission_dir="/home/keith/LocalCode/keithvassallomt/app.clu
     # Copy and update the yml with current tag and commit
     YML="{{submission_dir}}/app.clustercut.clustercut.yml"
     cp src-tauri/flatpak/app.clustercut.clustercut.yml "${YML}"
-    echo "Updating yml tag and commit..."
+    echo "Updating yml tag..."
     sed -i "s/tag: v.*/tag: ${TAG}/" "${YML}"
-    sed -i "s/commit: .*/commit: ${COMMIT}/" "${YML}"
     # Update the template in-repo as well
     sed -i "s/tag: v.*/tag: ${TAG}/" src-tauri/flatpak/app.clustercut.clustercut.yml
-    sed -i "s/commit: .*/commit: ${COMMIT}/" src-tauri/flatpak/app.clustercut.clustercut.yml
     # Copy the metainfo manifest
     echo "Copying metainfo manifest..."
     cp "${METAINFO}" "{{submission_dir}}/"
