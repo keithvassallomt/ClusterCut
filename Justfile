@@ -64,14 +64,15 @@ release output_dir="~/Downloads":
         exit 1
     fi
 
-    # 3. Check changelog has an [Unreleased] section, then rename it to this version
+    # 3. Check changelog has notes for this version
     echo "==> Updating CHANGELOG.md..."
-    if ! grep -q '## \[Unreleased\]' CHANGELOG.md; then
-        echo "ERROR: CHANGELOG.md has no [Unreleased] section. Add release notes before releasing."
+    if grep -q '## \[Unreleased\]' CHANGELOG.md; then
+        TODAY=$(date +%Y-%m-%d)
+        sed -i "s/## \[Unreleased\]/## [${VERSION}] - ${TODAY}/" CHANGELOG.md
+    elif ! grep -q "## \[${VERSION}\]" CHANGELOG.md; then
+        echo "ERROR: CHANGELOG.md has no [Unreleased] or [${VERSION}] section. Add release notes before releasing."
         exit 1
     fi
-    TODAY=$(date +%Y-%m-%d)
-    sed -i "s/## \[Unreleased\]/## [${VERSION}] - ${TODAY}/" CHANGELOG.md
 
     # 4. Update Flatpak yml to point at the commit we're about to tag
     echo "==> Preparing Flatpak yml for ${TAG}..."
@@ -89,11 +90,16 @@ release output_dir="~/Downloads":
     git tag -f "${TAG}"
     echo "==> Created tag ${TAG} (${COMMIT})"
 
-    # 6. Build native packages
+    # 6. Push (must happen before Flatpak build, which clones the tag from GitHub)
+    echo "==> Pushing..."
+    git push
+    git push origin "${TAG}"
+
+    # 7. Build native packages
     echo "==> Building native packages..."
     npm run tauri build
 
-    # 7. Copy artifacts to output dir
+    # 8. Copy artifacts to output dir
     OS="$(uname -s)"
     echo "==> Copying artifacts to ${OUTPUT_DIR}..."
     case "${OS}" in
@@ -109,13 +115,13 @@ release output_dir="~/Downloads":
             ;;
     esac
 
-    # 8. Flatpak (Linux only)
+    # 9. Flatpak (Linux only)
     if [ "${OS}" = "Linux" ]; then
         echo "==> Building Flatpak bundle..."
         just flatpak "{{output_dir}}"
     fi
 
-    # 9. Push
+    # 10. Summary
     echo ""
     echo "============================================"
     echo " Release ${TAG} built successfully!"
@@ -124,9 +130,6 @@ release output_dir="~/Downloads":
     echo "Artifacts in ${OUTPUT_DIR}:"
     ls -1 "${OUTPUT_DIR}"/ClusterCut*${VERSION}* 2>/dev/null || echo "  (none found)"
     echo ""
-    echo "Pushing..."
-    git push
-    git push origin "${TAG}"
     echo "Done!"
 
 # Clean all build artifacts
