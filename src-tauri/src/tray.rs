@@ -13,7 +13,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::menu::CheckMenuItem;
 
 #[cfg(target_os = "linux")]
-const SYMBOLIC_ICON_NAME: &str = "com.keithvassallo.clustercut-tray-symbolic";
+const SYMBOLIC_ICON_NAME: &str = "app.clustercut.clustercut-tray-symbolic";
 
 /// Override the tray icon to a named icon from the system icon theme.
 /// On GNOME, a `-symbolic` suffix causes automatic recoloring to match the panel.

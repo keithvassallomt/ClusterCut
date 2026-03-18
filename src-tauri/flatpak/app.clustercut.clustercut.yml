@@ -1,4 +1,4 @@
-app-id: com.keithvassallo.clustercut
+app-id: app.clustercut.clustercut
 runtime: org.gnome.Platform
 runtime-version: '49'
 sdk: org.gnome.Sdk
@@ -31,11 +31,11 @@ modules:
       - npm ci --offline
       - npm run tauri build -- --no-bundle
       - install -D src-tauri/target/release/clustercut /app/bin/clustercut
-      - install -D src-tauri/flatpak/com.keithvassallo.clustercut.desktop /app/share/applications/com.keithvassallo.clustercut.desktop
-      - install -D src-tauri/flatpak/com.keithvassallo.clustercut.svg /app/share/icons/hicolor/scalable/apps/com.keithvassallo.clustercut.svg
-      - install -D src-tauri/flatpak/com.keithvassallo.clustercut.metainfo.xml /app/share/metainfo/com.keithvassallo.clustercut.metainfo.xml
-      - install -D "assets/Tray Icons/svg/clustercut-tray-symbolic.svg" /app/share/icons/hicolor/scalable/status/com.keithvassallo.clustercut-tray-symbolic.svg
-      - install -Dm0644 LICENSE -t /app/share/licenses/com.keithvassallo.clustercut/clustercut
+      - install -D src-tauri/flatpak/app.clustercut.clustercut.desktop /app/share/applications/app.clustercut.clustercut.desktop
+      - install -D src-tauri/flatpak/app.clustercut.clustercut.svg /app/share/icons/hicolor/scalable/apps/app.clustercut.clustercut.svg
+      - install -D src-tauri/flatpak/app.clustercut.clustercut.metainfo.xml /app/share/metainfo/app.clustercut.clustercut.metainfo.xml
+      - install -D "assets/Tray Icons/svg/clustercut-tray-symbolic.svg" /app/share/icons/hicolor/scalable/status/app.clustercut.clustercut-tray-symbolic.svg
+      - install -Dm0644 LICENSE -t /app/share/licenses/app.clustercut.clustercut/clustercut
     sources:
       - type: git
         url: https://github.com/keithvassallomt/ClusterCut.git

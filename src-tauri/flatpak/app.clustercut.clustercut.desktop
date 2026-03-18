@@ -2,7 +2,7 @@
 Name=ClusterCut
 Comment=Cross-platform Clipboard Sync
 Exec=clustercut
-Icon=com.keithvassallo.clustercut
+Icon=app.clustercut.clustercut
 Terminal=false
 Type=Application
 Categories=Utility;

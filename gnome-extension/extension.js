@@ -7,7 +7,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const DBUS_IFACE = `
 <node>
-  <interface name="com.keithvassallo.clustercut">
+  <interface name="app.clustercut.clustercut">
     <method name="ToggleAutoSend">
       <arg type="b" direction="out"/>
     </method>
@@ -53,7 +53,7 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
 
         this._proxy = new this._ProxyClass(
             Gio.DBus.session,
-            'com.keithvassallo.clustercut',
+            'app.clustercut.clustercut',
             '/org/gnome/Shell/Extensions/ClusterCut',
             (proxy, error) => {
                 if (error) {
@@ -70,7 +70,7 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
         this._appRunning = false;
         this._watchId = Gio.bus_watch_name(
             Gio.BusType.SESSION,
-            'com.keithvassallo.clustercut',
+            'app.clustercut.clustercut',
             Gio.BusNameWatcherFlags.NONE,
             (conn, name, owner) => {
                 // console.log(`ClusterCut: Connected to ${owner}`);

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>com.keithvassallo.clustercut</id>
+  <id>app.clustercut.clustercut</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <name>ClusterCut</name>
@@ -21,10 +21,10 @@
       <li>Minimal resource usage</li>
     </ul>
   </description>
-  <developer id="com.keithvassallo">
+  <developer id="app.clustercut">
     <name>Keith Vassallo</name>
   </developer>
-  <launchable type="desktop-id">com.keithvassallo.clustercut.desktop</launchable>
+  <launchable type="desktop-id">app.clustercut.clustercut.desktop</launchable>
   <screenshots>
     <screenshot type="default" xml:lang="en">
       <image>https://raw.githubusercontent.com/keithvassallomt/ClusterCut/v0.1.1/assets/Screenshots/scr_main.png</image>

@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ClusterCut",
   "version": "0.1.6",
-  "identifier": "com.keithvassallo.clustercut",
+  "identifier": "app.clustercut.clustercut",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -66,12 +66,12 @@
     "linux": {
       "deb": {
         "files": {
-          "/usr/share/icons/hicolor/scalable/status/com.keithvassallo.clustercut-tray-symbolic.svg": "../assets/Tray Icons/svg/clustercut-tray-symbolic.svg"
+          "/usr/share/icons/hicolor/scalable/status/app.clustercut.clustercut-tray-symbolic.svg": "../assets/Tray Icons/svg/clustercut-tray-symbolic.svg"
         }
       },
       "rpm": {
         "files": {
-          "/usr/share/icons/hicolor/scalable/status/com.keithvassallo.clustercut-tray-symbolic.svg": "../assets/Tray Icons/svg/clustercut-tray-symbolic.svg"
+          "/usr/share/icons/hicolor/scalable/status/app.clustercut.clustercut-tray-symbolic.svg": "../assets/Tray Icons/svg/clustercut-tray-symbolic.svg"
         }
       }
     },

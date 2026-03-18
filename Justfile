@@ -102,7 +102,7 @@ flatpak output_dir="~/Downloads":
     STAGING=".flatpak-staging"
     rm -rf "${STAGING}"
     mkdir -p "${STAGING}"
-    cp src-tauri/flatpak/com.keithvassallo.clustercut.yml "${STAGING}/"
+    cp src-tauri/flatpak/app.clustercut.clustercut.yml "${STAGING}/"
     # Clone shared-modules if not already cached
     if [ ! -d ".flatpak-shared-modules/libappindicator" ]; then
         echo "Cloning shared-modules..."
@@ -117,22 +117,22 @@ flatpak output_dir="~/Downloads":
     python3 -m flatpak_node_generator npm package-lock.json -o "${STAGING}/node-sources.json"
     # Build and install
     echo "Building Flatpak..."
-    flatpak-builder --user --install --force-clean build-dir "${STAGING}/com.keithvassallo.clustercut.yml"
+    flatpak-builder --user --install --force-clean build-dir "${STAGING}/app.clustercut.clustercut.yml"
     # Export bundle
     OUTPUT_DIR="{{output_dir}}"
     OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
     mkdir -p "${OUTPUT_DIR}"
     VERSION=$(node -p "require('./package.json').version")
-    flatpak build-bundle ~/.local/share/flatpak/repo "${OUTPUT_DIR}/ClusterCut_${VERSION}_x86_64.flatpak" com.keithvassallo.clustercut
+    flatpak build-bundle ~/.local/share/flatpak/repo "${OUTPUT_DIR}/ClusterCut_${VERSION}_x86_64.flatpak" app.clustercut.clustercut
     echo "Done! Bundle: ${OUTPUT_DIR}/ClusterCut_${VERSION}_x86_64.flatpak"
-    echo "Run with: flatpak run com.keithvassallo.clustercut"
+    echo "Run with: flatpak run app.clustercut.clustercut"
 
 # Run the local Flatpak
 run-flatpak:
-    flatpak run com.keithvassallo.clustercut
+    flatpak run app.clustercut.clustercut
 
 # Prepare FriendlyHub submission: update manifest, regenerate sources, copy to submission dir
-friendlyhub-update submission_dir="/home/keith/LocalCode/keithvassallomt/com.keithvassallo.ClusterCut":
+friendlyhub-update submission_dir="/home/keith/LocalCode/keithvassallomt/app.clustercut.ClusterCut":
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(node -p "require('./package.json').version")
@@ -146,7 +146,7 @@ friendlyhub-update submission_dir="/home/keith/LocalCode/keithvassallomt/com.kei
     COMMIT=$(git rev-parse "${TAG}")
     echo "Tag ${TAG} -> commit ${COMMIT}"
     # Verify the release has a description in metainfo
-    METAINFO="src-tauri/flatpak/com.keithvassallo.clustercut.metainfo.xml"
+    METAINFO="src-tauri/flatpak/app.clustercut.clustercut.metainfo.xml"
     if ! grep -A2 "version=\"${VERSION}\"" "${METAINFO}" | grep -q "<description>"; then
         echo "ERROR: Release ${VERSION} in ${METAINFO} has no <description>. Add release notes before updating."
         exit 1
@@ -154,14 +154,14 @@ friendlyhub-update submission_dir="/home/keith/LocalCode/keithvassallomt/com.kei
     # Create submission directory if needed
     mkdir -p "{{submission_dir}}"
     # Copy and update the yml with current tag and commit
-    YML="{{submission_dir}}/com.keithvassallo.clustercut.yml"
-    cp src-tauri/flatpak/com.keithvassallo.clustercut.yml "${YML}"
+    YML="{{submission_dir}}/app.clustercut.clustercut.yml"
+    cp src-tauri/flatpak/app.clustercut.clustercut.yml "${YML}"
     echo "Updating yml tag and commit..."
     sed -i "s/tag: v.*/tag: ${TAG}/" "${YML}"
     sed -i "s/commit: .*/commit: ${COMMIT}/" "${YML}"
     # Update the template in-repo as well
-    sed -i "s/tag: v.*/tag: ${TAG}/" src-tauri/flatpak/com.keithvassallo.clustercut.yml
-    sed -i "s/commit: .*/commit: ${COMMIT}/" src-tauri/flatpak/com.keithvassallo.clustercut.yml
+    sed -i "s/tag: v.*/tag: ${TAG}/" src-tauri/flatpak/app.clustercut.clustercut.yml
+    sed -i "s/commit: .*/commit: ${COMMIT}/" src-tauri/flatpak/app.clustercut.clustercut.yml
     # Copy the metainfo manifest
     echo "Copying metainfo manifest..."
     cp "${METAINFO}" "{{submission_dir}}/"

@@ -167,7 +167,7 @@ async fn show_native_notification(_app_handle: tauri::AppHandle, title: String, 
         use windows::Data::Xml::Dom::XmlDocument;
         use windows::core::HSTRING;
 
-        let aumid = "com.keithvassallo.clustercut"; 
+        let aumid = "app.clustercut.clustercut"; 
 
         // Raw XML for Native Actions
         // activationType="protocol" ensures clicking invokes "clustercut://..." which SingleInstance catches.
@@ -343,7 +343,7 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
         use windows::core::HSTRING;
         use windows::core::Interface;
 
-        let aumid = "com.keithvassallo.clustercut";
+        let aumid = "app.clustercut.clustercut";
         
         // Since this is a generic notification (clipboard update, peer found, etc.), 
         // we might not want specific buttons like "Download".
@@ -444,7 +444,7 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
             // Dispatch creation AND registration to Main Thread to satisfy SendWrapper thread affinity
             let _ = app.run_on_main_thread(move || {
                 tracing::info!("[Notification] Creating manager on Main Thread...");
-                let m = user_notify::get_notification_manager("com.keithvassallo.clustercut".to_string(), None);
+                let m = user_notify::get_notification_manager("app.clustercut.clustercut".to_string(), None);
                 
                 // Dispatch REGISTER immediately on Main Thread
                 let app_handle_callback = app_handle_main.clone();
@@ -493,7 +493,7 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
                 Err(e) => {
                     tracing::error!("[Notification] Failed to receive manager from Main Thread: {:?}", e);
                     // Fallback to avoid panic, though this state is critical
-                     user_notify::get_notification_manager("com.keithvassallo.clustercut".to_string(), None)
+                     user_notify::get_notification_manager("app.clustercut.clustercut".to_string(), None)
                 }
             };
 

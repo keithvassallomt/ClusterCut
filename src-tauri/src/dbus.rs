@@ -13,7 +13,7 @@ impl ClusterCutDBus {
     }
 }
 
-#[interface(name = "com.keithvassallo.clustercut")]
+#[interface(name = "app.clustercut.clustercut")]
 impl ClusterCutDBus {
     async fn toggle_auto_send(&mut self) -> bool {
         let state = self.app_handle.state::<AppState>();
@@ -71,7 +71,7 @@ impl ClusterCutDBus {
 pub async fn start_dbus_server(app_handle: tauri::AppHandle) -> zbus::Result<()> {
     let service = ClusterCutDBus::new(app_handle.clone());
     let conn = zbus::connection::Builder::session()?
-        .name("com.keithvassallo.clustercut")?
+        .name("app.clustercut.clustercut")?
         .serve_at("/org/gnome/Shell/Extensions/ClusterCut", service)?
         .build()
         .await?;
@@ -89,7 +89,7 @@ pub async fn start_dbus_server(app_handle: tauri::AppHandle) -> zbus::Result<()>
                     .emit_signal(
                         Option::<&str>::None, // destination (broadcast)
                         "/org/gnome/Shell/Extensions/ClusterCut",
-                        "com.keithvassallo.clustercut",
+                        "app.clustercut.clustercut",
                         "StateChanged",
                         &(payload.auto_send, payload.auto_receive),
                     )

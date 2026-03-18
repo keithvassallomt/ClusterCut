@@ -54,7 +54,7 @@ try {
 }
 
 // Update metainfo.xml
-const metainfoPath = path.join(rootDir, 'src-tauri', 'flatpak', 'com.keithvassallo.clustercut.metainfo.xml');
+const metainfoPath = path.join(rootDir, 'src-tauri', 'flatpak', 'app.clustercut.clustercut.metainfo.xml');
 try {
     if (fs.existsSync(metainfoPath)) {
         let metainfo = fs.readFileSync(metainfoPath, 'utf-8');
