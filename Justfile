@@ -7,6 +7,38 @@ default:
 # Use .env file for all commands
 set dotenv-load := true
 
+# Bump the version: prompts for new version, updates package.json, syncs everywhere
+bump-version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CURRENT=$(node -p "require('./package.json').version")
+    echo "Current version: ${CURRENT}"
+    read -rp "New version: " NEW_VERSION
+    if [ -z "${NEW_VERSION}" ]; then
+        echo "ERROR: No version provided."
+        exit 1
+    fi
+    if ! echo "${NEW_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "ERROR: Version must be in semver format (e.g. 0.2.0)"
+        exit 1
+    fi
+    if [ "${NEW_VERSION}" = "${CURRENT}" ]; then
+        echo "ERROR: New version is the same as current version."
+        exit 1
+    fi
+    # Update package.json
+    node -e "
+        const fs = require('fs');
+        const pkg = JSON.parse(fs.readFileSync('package.json', 'utf-8'));
+        pkg.version = '${NEW_VERSION}';
+        fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+    "
+    echo "Updated package.json to ${NEW_VERSION}"
+    # Sync to all other files
+    npm run sync-version
+    echo ""
+    echo "Version bumped: ${CURRENT} → ${NEW_VERSION}"
+
 # Build the native package for the current platform (exe/dmg/deb/rpm)
 build:
     npm run tauri build
