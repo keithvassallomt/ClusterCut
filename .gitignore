@@ -27,6 +27,8 @@ dev/
 # Flatpak
 build-dir/
 .flatpak-builder/
+.flatpak-staging/
+.flatpak-shared-modules/
 
 # Extension build
 clustercut-extension.zip
