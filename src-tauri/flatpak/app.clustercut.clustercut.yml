@@ -12,6 +12,7 @@ finish-args:
   - --share=network
   - --share=ipc
   - --socket=wayland
+  - --socket=x11
   - --device=dri
   - --talk-name=org.kde.StatusNotifierWatcher
   - --talk-name=org.gnome.Shell
@@ -40,6 +41,6 @@ modules:
     sources:
       - type: git
         url: https://github.com/keithvassallomt/ClusterCut.git
-        tag: v0.1.7
+        tag: v0.1.8
       - cargo-sources.json
       - node-sources.json

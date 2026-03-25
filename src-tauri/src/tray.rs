@@ -15,6 +15,16 @@ use tauri::menu::CheckMenuItem;
 #[cfg(target_os = "linux")]
 const SYMBOLIC_ICON_NAME: &str = "app.clustercut.clustercut-tray-symbolic";
 
+/// Returns `true` when the current desktop is known to recolor `-symbolic` tray
+/// icons automatically (e.g. GNOME Shell).  KDE/Plasma renders the SVG as-is,
+/// which means an all-black symbolic icon is invisible on a dark panel.
+#[cfg(target_os = "linux")]
+fn desktop_supports_symbolic_tray_icons() -> bool {
+    // $XDG_CURRENT_DESKTOP can be a colon-separated list (e.g. "ubuntu:GNOME").
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_uppercase();
+    desktop.split(':').any(|d| matches!(d, "GNOME" | "UNITY" | "BUDGIE" | "PANTHEON" | "CINNAMON"))
+}
+
 /// Override the tray icon to a named icon from the system icon theme.
 /// On GNOME, a `-symbolic` suffix causes automatic recoloring to match the panel.
 #[cfg(target_os = "linux")]
@@ -214,10 +224,13 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
         })
         .build(app)?;
 
-    // On Linux, override the initial PNG icon with a named symbolic icon.
-    // GNOME Shell will look this up from the icon theme and recolor it.
+    // On Linux desktops that support symbolic icon recoloring (e.g. GNOME),
+    // override the initial PNG with a named symbolic icon.  On KDE/others the
+    // themed PNG chosen by get_themed_icon is kept as-is.
     #[cfg(target_os = "linux")]
-    set_tray_icon_by_name(app, SYMBOLIC_ICON_NAME);
+    if desktop_supports_symbolic_tray_icons() {
+        set_tray_icon_by_name(app, SYMBOLIC_ICON_NAME);
+    }
 
     // Setup Theme Listener
     let listener_handle = app.clone();
@@ -329,7 +342,15 @@ pub fn update_tray_icon(app: &AppHandle) {
     let _ = app; // Unused on Windows
 
     #[cfg(target_os = "linux")]
-    set_tray_icon_by_name(app, SYMBOLIC_ICON_NAME);
+    {
+        if desktop_supports_symbolic_tray_icons() {
+            set_tray_icon_by_name(app, SYMBOLIC_ICON_NAME);
+        } else if let Some(tray) = app.tray_by_id("main-tray") {
+            let (icon, is_template) = get_themed_icon(app);
+            let _ = tray.set_icon_as_template(is_template);
+            let _ = tray.set_icon(Some(icon));
+        }
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -396,7 +417,15 @@ pub fn set_badge(app: &AppHandle, show: bool) {
         if !show {
             // Restore default icon
             #[cfg(target_os = "linux")]
-            set_tray_icon_by_name(app, SYMBOLIC_ICON_NAME);
+            {
+                if desktop_supports_symbolic_tray_icons() {
+                    set_tray_icon_by_name(app, SYMBOLIC_ICON_NAME);
+                } else {
+                    let (icon, is_template) = get_platform_icon(app);
+                    let _ = tray.set_icon_as_template(is_template);
+                    let _ = tray.set_icon(Some(icon));
+                }
+            }
 
             #[cfg(not(target_os = "linux"))]
             {

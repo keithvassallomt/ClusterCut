@@ -55,13 +55,15 @@ release output_dir="~/Downloads":
     echo "==> Syncing version..."
     npm run sync-version
 
-    # 2. Read version and check tag doesn't exist
+    # 2. Read version
     VERSION=$(node -p "require('./package.json').version")
     TAG="v${VERSION}"
-    echo "==> Version: ${VERSION} (tag: ${TAG})"
+    AMEND=false
     if git rev-parse "${TAG}" >/dev/null 2>&1; then
-        echo "ERROR: Tag ${TAG} already exists."
-        exit 1
+        echo "==> Version: ${VERSION} (tag: ${TAG}) — tag exists, will amend"
+        AMEND=true
+    else
+        echo "==> Version: ${VERSION} (tag: ${TAG})"
     fi
 
     # 3. Check changelog has notes for this version
@@ -79,14 +81,20 @@ release output_dir="~/Downloads":
     sed -i "s/tag: v.*/tag: ${TAG}/" src-tauri/flatpak/app.clustercut.clustercut.yml
     sed -i "/^        commit:/d" src-tauri/flatpak/app.clustercut.clustercut.yml
     git add -A
-    git commit -m "v${VERSION}"
-    git tag "${TAG}"
-    echo "==> Created tag ${TAG}"
+    if [ "${AMEND}" = true ]; then
+        git commit --amend -m "v${VERSION}"
+        git tag -f "${TAG}"
+        echo "==> Amended commit and moved tag ${TAG}"
+    else
+        git commit -m "v${VERSION}"
+        git tag "${TAG}"
+        echo "==> Created tag ${TAG}"
+    fi
 
     # 6. Push (must happen before Flatpak build, which clones the tag from GitHub)
     echo "==> Pushing..."
-    git push
-    git push origin "${TAG}"
+    git push --force-with-lease
+    git push origin "${TAG}" --force
 
     # 7. Build native packages
     echo "==> Building native packages..."
