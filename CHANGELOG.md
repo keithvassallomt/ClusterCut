@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-03-25
+
+### Added
+- Wayland clipboard support via a three-path architecture:
+  - **X11**: existing tauri-plugin-clipboard (unchanged).
+  - **Wayland + KDE/Sway/Hyprland**: native clipboard monitoring via wlr-data-control.
+  - **Wayland + GNOME**: clipboard bridging through the ClusterCut GNOME extension over D-Bus.
+- GNOME extension v2.0: now monitors and relays clipboard changes via St.Clipboard for Wayland sessions.
+- Runtime detection of display server and automatic backend selection at startup.
+
+### Changed
+- Flatpak runtime bumped from GNOME 49 to GNOME 50.
+- Flatpak is now Wayland-only (removed X11 and IPC socket permissions).
+- Extension install prompt on GNOME Wayland is now a strong warning (extension is required for clipboard sync, not optional).
+
 ## [0.1.8] - 2026-03-25
 
 ### Fixed

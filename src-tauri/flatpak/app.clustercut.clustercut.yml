@@ -1,6 +1,6 @@
 app-id: app.clustercut.clustercut
 runtime: org.gnome.Platform
-runtime-version: '49'
+runtime-version: '50'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
@@ -10,9 +10,7 @@ build-options:
 command: clustercut
 finish-args:
   - --share=network
-  - --share=ipc
   - --socket=wayland
-  - --socket=x11
   - --device=dri
   - --talk-name=org.kde.StatusNotifierWatcher
   - --talk-name=org.gnome.Shell

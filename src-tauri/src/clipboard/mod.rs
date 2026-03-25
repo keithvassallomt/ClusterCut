@@ -70,7 +70,11 @@ pub fn detect_backend() -> ClipboardBackend {
 
 #[cfg(target_os = "linux")]
 pub fn get_backend() -> ClipboardBackend {
-    ACTIVE_BACKEND.get().copied().unwrap_or(ClipboardBackend::Plugin)
+    ACTIVE_BACKEND.get().copied().unwrap_or(if is_wayland() {
+        ClipboardBackend::Degraded
+    } else {
+        ClipboardBackend::Plugin
+    })
 }
 
 /// Returns true if the tauri-plugin-clipboard should be initialized.

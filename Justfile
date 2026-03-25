@@ -157,6 +157,8 @@ flatpak output_dir="~/Downloads":
     rm -rf "${STAGING}"
     mkdir -p "${STAGING}"
     cp src-tauri/flatpak/app.clustercut.clustercut.yml "${STAGING}/"
+    # Replace git source with local dir so we build from the working tree
+    sed -i '/- type: git/{N;N;s/- type: git\n.*url:.*\n.*tag:.*/- type: dir\n        path: '"$(pwd | sed 's/\//\\\//g')"'/}' "${STAGING}/app.clustercut.clustercut.yml"
     # Clone shared-modules if not already cached
     if [ ! -d ".flatpak-shared-modules/libappindicator" ]; then
         echo "Cloning shared-modules..."
