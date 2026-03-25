@@ -98,6 +98,7 @@ release output_dir="~/Downloads":
 
     # 7. Build native packages
     echo "==> Building native packages..."
+    rm -rf src-tauri/target/release/bundle
     npm run tauri build
 
     # 8. Copy artifacts to output dir
