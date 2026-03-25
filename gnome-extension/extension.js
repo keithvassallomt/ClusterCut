@@ -45,7 +45,7 @@ const CLIPBOARD_DBUS_IFACE = `
   </interface>
 </node>`;
 
-const ClipboardBridgeIface = Gio.DBusNodeInfo.new_for_xml(CLIPBOARD_DBUS_IFACE);
+let ClipboardBridgeIface = null;
 
 const ClusterCutIndicator = GObject.registerClass(
 class ClusterCutIndicator extends QuickSettings.SystemIndicator {
@@ -109,7 +109,7 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
         );
 
         // Connect Toggle Click
-        this._toggleSignalId = this._toggle.connect('clicked', () => {
+        this._toggle.connectObject('clicked', () => {
              if (!this._appRunning) {
                  this._toggle.subtitle = 'Not running';
                  return;
@@ -127,7 +127,7 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
                       // console.error('ClusterCut: ToggleAutoSend failed', err);
                   }
              });
-        });
+        }, this);
 
         // Add Menu Items
         this._toggle.menu.addAction('Show Window', () => {
@@ -235,26 +235,20 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
             this._watchId = 0;
         }
 
-        // Clean up proxy signal
+        // Clean up proxy signal (D-Bus proxy signal, not GObject — must use disconnectSignal)
         if (this._proxySignalId && this._proxy) {
             this._proxy.disconnectSignal(this._proxySignalId);
             this._proxySignalId = null;
         }
 
-        // Clean up toggle signal if we stored it (we didn't before, but now we should)
-        if (this._toggleSignalId && this._toggle) {
-            this._toggle.disconnect(this._toggleSignalId);
-            this._toggleSignalId = null;
-        }
-
         if (this._toggle) {
+            this._toggle.disconnectObject(this);
             this._toggle.destroy();
             this._toggle = null;
         }
-        
-        // Disconnect items
-        if (this._autoSendItem) this._autoSendItem = null;
-        if (this._autoReceiveItem) this._autoReceiveItem = null;
+
+        this._autoSendItem = null;
+        this._autoReceiveItem = null;
 
         super.destroy();
     }
@@ -262,6 +256,8 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
 
 export default class ClusterCutExtension extends Extension {
     enable() {
+        ClipboardBridgeIface = Gio.DBusNodeInfo.new_for_xml(CLIPBOARD_DBUS_IFACE);
+
         this._indicator = new ClusterCutIndicator(this);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
 
@@ -277,6 +273,8 @@ export default class ClusterCutExtension extends Extension {
             this._indicator.destroy();
             this._indicator = null;
         }
+
+        ClipboardBridgeIface = null;
     }
 
     _startClipboardBridge() {
@@ -296,29 +294,28 @@ export default class ClusterCutExtension extends Extension {
 
         // Monitor clipboard changes via Meta.Selection
         const selection = global.display.get_selection();
-        this._selectionOwnerChangedId = selection.connect(
+        selection.connectObject(
             'owner-changed',
             (sel, selectionType, selectionSource) => {
                 if (selectionType === Meta.SelectionType.SELECTION_CLIPBOARD) {
                     this._onClipboardOwnerChanged();
                 }
-            }
+            },
+            this
         );
     }
 
     _stopClipboardBridge() {
-        if (this._selectionOwnerChangedId) {
-            const selection = global.display.get_selection();
-            selection.disconnect(this._selectionOwnerChangedId);
-            this._selectionOwnerChangedId = null;
-        }
+        const selection = global.display.get_selection();
+        selection.disconnectObject(this);
 
         if (this._clipboardDbusId) {
             Gio.DBus.session.unregister_object(this._clipboardDbusId);
             this._clipboardDbusId = null;
         }
 
-        this._lastClipboardText = '';
+        this._lastClipboardText = null;
+        this._ignoreNextChange = null;
     }
 
     _onClipboardOwnerChanged() {

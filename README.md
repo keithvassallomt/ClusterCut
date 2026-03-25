@@ -66,12 +66,12 @@ Your cluster isn't limited to one network. Manually add remote clusters to sync 
 
 ### Prerequisites
 
-Before you begin, ensure you have the following installed:
-
 - **Rust & Cargo**: [Install Rust](https://www.rust-lang.org/tools/install)
-- **Node.js**: [Install Node.js](https://nodejs.org/) (Use LTS version)
-- **Tauri Prerequisites**: Follow the [Tauri System Dependencies](https://v2.tauri.app/start/prerequisites/) guide for your OS.
-  - **Linux**: requires `libwebkit2gtk-4.1-dev`, `build-essential`, `curl`, `wget`, `file`, `libssl-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`.
+- **Node.js** (v18+): [Install Node.js](https://nodejs.org/)
+- **Just**: `cargo install just` (or via your package manager)
+- **Tauri Prerequisites**: Follow the [Tauri v2 System Dependencies](https://v2.tauri.app/start/prerequisites/) guide for your OS.
+  - **Linux (Debian/Ubuntu)**: `libwebkit2gtk-4.1-dev build-essential libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev`
+  - **Linux (Fedora/RHEL)**: `webkit2gtk4.1-devel openssl-devel gtk3-devel libappindicator-gtk3-devel librsvg2-devel`
 
 ### Setup
 
@@ -96,19 +96,30 @@ npm run tauri dev
 
 ### Building
 
-To build the application for production:
+We use a [Justfile](Justfile) for all build workflows (requires [just](https://github.com/casey/just)):
 
 ```bash
-npm run tauri build
+just build          # Build native package (.exe/.dmg/.deb/.rpm)
+just flatpak        # Build and install a local Flatpak from working tree
+just run-flatpak    # Run the locally-installed Flatpak
+just extension-zip  # Build the GNOME extension ZIP
+just release        # Full release: version sync, tag, push, build everything
+just clean          # Clean all build artifacts
 ```
 
-We also include a `Justfile` for common tasks (requires [just](https://github.com/casey/just)):
+See [BUILD.md](BUILD.md) for detailed build instructions, Flatpak setup, GNOME extension installation, and the release workflow.
 
-```bash
-just build          # Build native package
-just flatpak-local  # Build local Flatpak
-just clean          # Clean build artifacts
-```
+### Clipboard Architecture (Linux)
+
+On Linux, ClusterCut uses a three-path clipboard backend:
+
+| Environment | Backend |
+| :--- | :--- |
+| **X11** | `tauri-plugin-clipboard` (same as Windows/macOS) |
+| **Wayland + KDE/Sway/Hyprland** | `wl-clipboard-rs` via `wlr-data-control` |
+| **Wayland + GNOME** | ClusterCut GNOME extension (clipboard bridging over D-Bus) |
+
+The backend is detected automatically at startup. On GNOME Wayland, the [ClusterCut extension](https://extensions.gnome.org/extension/9341/clustercut/) is required for clipboard sync to function.
 
 ### Recommended IDE Setup
 

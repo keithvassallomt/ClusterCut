@@ -17,8 +17,6 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState, S
 use tauri::Listener;
 use local_ip_address::list_afinet_netifas;
 
-#[cfg(not(target_os = "linux"))]
-use tauri_plugin_clipboard::Clipboard;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use std::str::FromStr;
 use std::path::PathBuf;

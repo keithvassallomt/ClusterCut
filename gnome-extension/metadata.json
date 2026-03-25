@@ -1,6 +1,6 @@
 {
   "name": "ClusterCut",
-  "description": "Integration for ClusterCut Clipboard Sync. Adds a Quick Settings toggle and provides clipboard bridging for Wayland support on GNOME.",
+  "description": "Integration for ClusterCut Clipboard Sync. Adds a Quick Settings toggle and reads/writes the system clipboard to enable clipboard sync on Wayland.",
   "uuid": "clustercut@keithvassallo.com",
   "shell-version": [
     "45", "46", "47", "48", "49", "50"
