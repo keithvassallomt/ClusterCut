@@ -1,12 +1,12 @@
 {
   "name": "ClusterCut",
-  "description": "Integration for ClusterCut Clipboard Sync. Adds a Quick Settings toggle to control Auto-Send and Show Window.",
+  "description": "Integration for ClusterCut Clipboard Sync. Adds a Quick Settings toggle and provides clipboard bridging for Wayland support on GNOME.",
   "uuid": "clustercut@keithvassallo.com",
   "shell-version": [
     "45", "46", "47", "48", "49", "50"
   ],
   "url": "https://github.com/keithvassallomt/ClusterCut",
-  "version-name": "1.1",
+  "version-name": "2.0",
   "donations": {
     "github": "keithvassallomt"
   }

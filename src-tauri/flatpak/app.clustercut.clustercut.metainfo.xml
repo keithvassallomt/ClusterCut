@@ -64,6 +64,16 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.2.0" date="2026-03-25">
+      <description>
+        <ul>
+          <li>Wayland clipboard support: native clipboard monitoring on KDE, Sway, and Hyprland via wlr-data-control</li>
+          <li>GNOME Wayland clipboard support via the ClusterCut extension (clipboard bridging over D-Bus)</li>
+          <li>GNOME extension v2.0: now provides clipboard monitoring and read/write via St.Clipboard for Wayland sessions</li>
+          <li>Refactored clipboard backend into a modular architecture with runtime detection of X11, Wayland, and GNOME environments</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.8" date="2026-03-25">
       <description>
         <ul>

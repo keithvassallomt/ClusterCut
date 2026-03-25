@@ -1,5 +1,7 @@
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Meta from 'gi://Meta';
 import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
@@ -26,6 +28,24 @@ const DBUS_IFACE = `
     <method name="Quit"/>
   </interface>
 </node>`;
+
+// D-Bus interface for clipboard bridging (Wayland)
+const CLIPBOARD_DBUS_IFACE = `
+<node>
+  <interface name="app.clustercut.clustercut.Clipboard">
+    <method name="ReadClipboard">
+      <arg type="s" direction="out"/>
+    </method>
+    <method name="WriteClipboard">
+      <arg type="s" direction="in"/>
+    </method>
+    <signal name="ClipboardChanged">
+      <arg type="s"/>
+    </signal>
+  </interface>
+</node>`;
+
+const ClipboardBridgeIface = Gio.DBusNodeInfo.new_for_xml(CLIPBOARD_DBUS_IFACE);
 
 const ClusterCutIndicator = GObject.registerClass(
 class ClusterCutIndicator extends QuickSettings.SystemIndicator {
@@ -244,13 +264,104 @@ export default class ClusterCutExtension extends Extension {
     enable() {
         this._indicator = new ClusterCutIndicator(this);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
+
+        // Start clipboard bridge D-Bus service
+        this._startClipboardBridge();
     }
 
     disable() {
+        this._stopClipboardBridge();
+
         if (this._indicator) {
             this._indicator.quickSettingsItems.forEach(item => item.destroy());
             this._indicator.destroy();
             this._indicator = null;
+        }
+    }
+
+    _startClipboardBridge() {
+        this._lastClipboardText = '';
+        this._ignoreNextChange = false;
+
+        // Export the clipboard D-Bus interface
+        this._clipboardDbusId = Gio.DBus.session.register_object(
+            '/org/gnome/Shell/Extensions/ClusterCut',
+            ClipboardBridgeIface.interfaces[0],
+            (connection, sender, objectPath, interfaceName, methodName, parameters, invocation) => {
+                this._handleClipboardMethod(methodName, parameters, invocation);
+            },
+            null, // get_property
+            null  // set_property
+        );
+
+        // Monitor clipboard changes via Meta.Selection
+        const selection = global.display.get_selection();
+        this._selectionOwnerChangedId = selection.connect(
+            'owner-changed',
+            (sel, selectionType, selectionSource) => {
+                if (selectionType === Meta.SelectionType.SELECTION_CLIPBOARD) {
+                    this._onClipboardOwnerChanged();
+                }
+            }
+        );
+    }
+
+    _stopClipboardBridge() {
+        if (this._selectionOwnerChangedId) {
+            const selection = global.display.get_selection();
+            selection.disconnect(this._selectionOwnerChangedId);
+            this._selectionOwnerChangedId = null;
+        }
+
+        if (this._clipboardDbusId) {
+            Gio.DBus.session.unregister_object(this._clipboardDbusId);
+            this._clipboardDbusId = null;
+        }
+
+        this._lastClipboardText = '';
+    }
+
+    _onClipboardOwnerChanged() {
+        if (this._ignoreNextChange) {
+            this._ignoreNextChange = false;
+            return;
+        }
+
+        const clipboard = St.Clipboard.get_default();
+        clipboard.get_text(St.ClipboardType.CLIPBOARD, (cb, text) => {
+            if (text && text !== this._lastClipboardText) {
+                this._lastClipboardText = text;
+
+                // Emit ClipboardChanged D-Bus signal
+                Gio.DBus.session.emit_signal(
+                    null, // broadcast
+                    '/org/gnome/Shell/Extensions/ClusterCut',
+                    'app.clustercut.clustercut.Clipboard',
+                    'ClipboardChanged',
+                    new GLib.Variant('(s)', [text])
+                );
+            }
+        });
+    }
+
+    _handleClipboardMethod(methodName, parameters, invocation) {
+        if (methodName === 'ReadClipboard') {
+            const clipboard = St.Clipboard.get_default();
+            clipboard.get_text(St.ClipboardType.CLIPBOARD, (cb, text) => {
+                invocation.return_value(new GLib.Variant('(s)', [text || '']));
+            });
+        } else if (methodName === 'WriteClipboard') {
+            const text = parameters.deep_unpack()[0];
+            this._ignoreNextChange = true;
+            this._lastClipboardText = text;
+            const clipboard = St.Clipboard.get_default();
+            clipboard.set_text(St.ClipboardType.CLIPBOARD, text);
+            invocation.return_value(null);
+        } else {
+            invocation.return_dbus_error(
+                'org.freedesktop.DBus.Error.UnknownMethod',
+                `Unknown method: ${methodName}`
+            );
         }
     }
 }

@@ -17,6 +17,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState, S
 use tauri::Listener;
 use local_ip_address::list_afinet_netifas;
 
+#[cfg(not(target_os = "linux"))]
 use tauri_plugin_clipboard::Clipboard;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use std::str::FromStr;
@@ -1823,12 +1824,27 @@ pub fn run() {
     let args = init_logging();
     let minimized_arg = args.minimized;
     
+    // Detect clipboard backend on Linux before building
+    #[cfg(target_os = "linux")]
+    let _clipboard_backend = clipboard::detect_backend();
+
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_clipboard::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init());
+
+    // Only init clipboard plugin when needed (X11, or non-Linux)
+    #[cfg(not(target_os = "linux"))]
+    {
+        builder = builder.plugin(tauri_plugin_clipboard::init());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if clipboard::should_init_plugin() {
+            builder = builder.plugin(tauri_plugin_clipboard::init());
+        }
+    }
         
     #[cfg(not(target_os = "linux"))]
     {
@@ -3643,7 +3659,7 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
                tracing::info!("Global Send Shortcut Triggered!");
                // Trigger Send Logic
                // Get local content
-               match app_handle.state::<Clipboard>().read_text() {
+               match clipboard::read_text(app_handle) {
                    Ok(text) => {
                         let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
                         let msg_id = uuid::Uuid::new_v4().to_string();
@@ -3711,7 +3727,7 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
                 if let Some(payload) = guard.take() { // take() removes it from pending
                     // Apply to System Clipboard
                     // Using clipboard plugin
-                    if let Err(e) = app_handle.state::<Clipboard>().write_text(payload.text) {
+                    if let Err(e) = clipboard::write_text_direct(app_handle, payload.text) {
                         tracing::error!("Failed to write pending clipboard to system: {}", e);
                     } else {
                         tracing::info!("Confirmed pending clipboard content via shortcut.");
@@ -3729,6 +3745,8 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
 struct ExtensionStatus {
     is_gnome: bool,
     is_installed: bool,
+    /// True when on GNOME Wayland without the extension — clipboard sync will NOT work
+    clipboard_requires_extension: bool,
 }
 
 #[tauri::command]
@@ -3737,8 +3755,13 @@ async fn check_gnome_extension_status() -> ExtensionStatus {
     let is_gnome = xdg_current_desktop.contains("GNOME");
 
     if !is_gnome {
-        return ExtensionStatus { is_gnome: false, is_installed: false };
+        return ExtensionStatus { is_gnome: false, is_installed: false, clipboard_requires_extension: false };
     }
+
+    #[cfg(target_os = "linux")]
+    let is_wayland = clipboard::is_wayland();
+    #[cfg(not(target_os = "linux"))]
+    let is_wayland = false;
 
     // Try D-Bus first (works in Flatpak if permissions are set)
     if let Ok(connection) = zbus::Connection::session().await {
@@ -3757,7 +3780,11 @@ async fn check_gnome_extension_status() -> ExtensionStatus {
               
               if let Ok(extensions) = call_result {
                    let is_installed = extensions.contains_key("clustercut@keithvassallo.com");
-                   return ExtensionStatus { is_gnome: true, is_installed };
+                   return ExtensionStatus {
+                       is_gnome: true,
+                       is_installed,
+                       clipboard_requires_extension: is_wayland && !is_installed,
+                   };
               }
          }
     }
@@ -3769,7 +3796,11 @@ async fn check_gnome_extension_status() -> ExtensionStatus {
 
     let is_installed = std::path::Path::new(&local_path).exists() || std::path::Path::new(system_path).exists();
 
-    ExtensionStatus { is_gnome: true, is_installed }
+    ExtensionStatus {
+        is_gnome: true,
+        is_installed,
+        clipboard_requires_extension: is_wayland && !is_installed,
+    }
 }
 
 #[tauri::command]

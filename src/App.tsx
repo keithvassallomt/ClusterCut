@@ -314,6 +314,7 @@ export default function App() {
   const [clipboardHistory, setClipboardHistory] = useState<HistoryItem[]>([]);
   const [activeView, setActiveView] = useState<View>("devices");
   const [showExtensionDialog, setShowExtensionDialog] = useState(false);
+  const [clipboardRequiresExtension, setClipboardRequiresExtension] = useState(false);
 
 
   const [myNetworkName, setMyNetworkName] = useState("Loading...");
@@ -572,12 +573,16 @@ export default function App() {
   const hasCheckedExtension = useRef(false);
 
   useEffect(() => {
-    if (!hasCheckedExtension.current && settings?.ignore_extension_missing === false) {
-      hasCheckedExtension.current = true; // Mark as checked so we don't spam
+    if (!hasCheckedExtension.current) {
+      hasCheckedExtension.current = true;
 
-      invoke<{ is_gnome: boolean, is_installed: boolean }>('check_gnome_extension_status')
+      invoke<{ is_gnome: boolean, is_installed: boolean, clipboard_requires_extension: boolean }>('check_gnome_extension_status')
         .then(status => {
-          if (status.is_gnome && !status.is_installed) {
+          if (status.clipboard_requires_extension) {
+            // On GNOME Wayland without extension: always show, ignore the "don't ask" setting
+            setClipboardRequiresExtension(true);
+            setShowExtensionDialog(true);
+          } else if (status.is_gnome && !status.is_installed && settings?.ignore_extension_missing === false) {
             setShowExtensionDialog(true);
           }
         })
@@ -1017,50 +1022,77 @@ export default function App() {
       {/* GNOME Extension Dialog */}
       {showExtensionDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-          <Card className="max-w-md w-full p-6 space-y-4 shadow-2xl border-indigo-500/20">
-            <div className="flex items-center gap-3 text-indigo-500">
-              <div className="p-3 rounded-full bg-indigo-500/10">
+          <Card className={`max-w-md w-full p-6 space-y-4 shadow-2xl ${clipboardRequiresExtension ? 'border-amber-500/40' : 'border-indigo-500/20'}`}>
+            <div className={`flex items-center gap-3 ${clipboardRequiresExtension ? 'text-amber-500' : 'text-indigo-500'}`}>
+              <div className={`p-3 rounded-full ${clipboardRequiresExtension ? 'bg-amber-500/10' : 'bg-indigo-500/10'}`}>
                 <Puzzle className="w-8 h-8" />
               </div>
-              <h2 className="text-xl font-semibold text-slate-900 dark:text-white">Enable GNOME Integration</h2>
+              <h2 className="text-xl font-semibold text-slate-900 dark:text-white">
+                {clipboardRequiresExtension ? 'Extension Required for Clipboard Sync' : 'Enable GNOME Integration'}
+              </h2>
             </div>
 
-            <p className="text-slate-600 dark:text-zinc-400">
-              It looks like you are running GNOME, but the <strong>ClusterCut Extension</strong> is not installed.
-            </p>
-            <p className="text-slate-600 dark:text-zinc-400 text-sm">
-              Installing the extension allows you to control ClusterCut directly from the Quick Settings menu.
-            </p>
+            {clipboardRequiresExtension ? (
+              <>
+                <p className="text-slate-600 dark:text-zinc-400">
+                  <strong>Clipboard synchronisation will not work</strong> without the ClusterCut GNOME extension.
+                </p>
+                <p className="text-slate-600 dark:text-zinc-400 text-sm">
+                  GNOME on Wayland does not allow background apps to access the clipboard. The extension runs inside the compositor and bridges clipboard changes to ClusterCut. Without it, clipboard monitoring is disabled.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-slate-600 dark:text-zinc-400">
+                  It looks like you are running GNOME, but the <strong>ClusterCut Extension</strong> is not installed.
+                </p>
+                <p className="text-slate-600 dark:text-zinc-400 text-sm">
+                  Installing the extension allows you to control ClusterCut directly from the Quick Settings menu.
+                </p>
+              </>
+            )}
 
-            <div className="flex items-center space-x-2 pt-2">
-              <input
-                type="checkbox"
-                id="dontAsk"
-                className="w-4 h-4 rounded border-slate-300 dark:border-zinc-700 text-indigo-600 focus:ring-indigo-500 bg-transparent"
-                onChange={(e) => {
-                  if (e.target.checked) {
-                    handleIgnoreExtension();
-                  }
-                }}
-              />
-              <label htmlFor="dontAsk" className="text-sm text-slate-500 dark:text-zinc-500 select-none cursor-pointer">
-                Don't ask me again
-              </label>
-            </div>
+            {!clipboardRequiresExtension && (
+              <div className="flex items-center space-x-2 pt-2">
+                <input
+                  type="checkbox"
+                  id="dontAsk"
+                  className="w-4 h-4 rounded border-slate-300 dark:border-zinc-700 text-indigo-600 focus:ring-indigo-500 bg-transparent"
+                  onChange={(e) => {
+                    if (e.target.checked) {
+                      handleIgnoreExtension();
+                    }
+                  }}
+                />
+                <label htmlFor="dontAsk" className="text-sm text-slate-500 dark:text-zinc-500 select-none cursor-pointer">
+                  Don't ask me again
+                </label>
+              </div>
+            )}
 
             <div className="flex justify-end gap-3 pt-2">
-              <Button
-                variant="default"
-                onClick={() => setShowExtensionDialog(false)}
-              >
-                No Thanks
-              </Button>
+              {!clipboardRequiresExtension && (
+                <Button
+                  variant="default"
+                  onClick={() => setShowExtensionDialog(false)}
+                >
+                  No Thanks
+                </Button>
+              )}
               <Button
                 variant="primary"
                 onClick={handleInstallExtension}
               >
                 Install Extension
               </Button>
+              {clipboardRequiresExtension && (
+                <Button
+                  variant="default"
+                  onClick={() => setShowExtensionDialog(false)}
+                >
+                  Continue Without Clipboard
+                </Button>
+              )}
             </div>
           </Card>
         </div>
