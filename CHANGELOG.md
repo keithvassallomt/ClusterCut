@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-04-05
+
+### Added
+- Cross-platform network state monitor (`netmon`): detects suspend/resume and connectivity changes natively on Linux (logind + portal NetworkMonitor), Windows (WM_POWERBROADCAST + NetworkStatusChanged), and macOS (NSWorkspace + SCNetworkReachability).
+- Universal heartbeat fallback: if 3 consecutive heartbeat rounds fail, the network is assumed down regardless of platform.
+- Peer join verification: new peers are ping-verified before a "Device Joined" notification is shown; unverified joins are deferred until the peer responds.
+- Peer leave retry: removal probes are retried (up to 3 times) when the local network is down, preventing false "Device Left" notifications.
+
+### Fixed
+- False "Device Left"/"Device Joined" notification bursts after resuming from suspend or reconnecting to Wi-Fi.
+- Peers on a previous Wi-Fi network are now silently removed when the local IP changes (no notification noise on network switch).
+- Windows: firewall rule is now checked before configuring, so the UAC prompt only appears on first launch (not every time).
+
+### Changed
+- Flatpak manifest now requests `org.freedesktop.login1` system bus access for suspend/resume detection.
+
 ## [0.2.0] - 2026-03-25
 
 ### Added

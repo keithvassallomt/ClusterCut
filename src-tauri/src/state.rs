@@ -1,7 +1,7 @@
 use crate::peer::Peer;
 use crate::storage::AppSettings;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 // use crate::crypto::SpakeState; // We'll just use explicit path or generic if needed, but explicit path is best.
 // actually, let's use Any or just simple wrapper if circular dep is issue.
@@ -47,6 +47,15 @@ pub struct AppState {
     pub current_theme: Arc<Mutex<Option<String>>>,
     // Startup Time (for notification suppression)
     pub startup_time: std::time::Instant,
+    // Network State (for notification suppression during outages/suspend)
+    pub network_available: Arc<AtomicBool>,
+    pub network_suspended: Arc<AtomicBool>,
+    pub resume_grace_until: Arc<Mutex<Option<std::time::Instant>>>,
+    pub last_known_local_ip: Arc<Mutex<Option<std::net::IpAddr>>>,
+    // Deferred join notifications (peer IDs awaiting ping verification)
+    pub pending_join_notifications: Arc<Mutex<HashSet<String>>>,
+    // Heartbeat fallback counter (consecutive rounds where all sends failed)
+    pub consecutive_heartbeat_failures: Arc<AtomicU32>,
 }
 
 impl AppState {
@@ -71,6 +80,12 @@ impl AppState {
             tray_menu: Arc::new(Mutex::new(None)),
             current_theme: Arc::new(Mutex::new(None)),
             startup_time: std::time::Instant::now(),
+            network_available: Arc::new(AtomicBool::new(true)),
+            network_suspended: Arc::new(AtomicBool::new(false)),
+            resume_grace_until: Arc::new(Mutex::new(None)),
+            last_known_local_ip: Arc::new(Mutex::new(None)),
+            pending_join_notifications: Arc::new(Mutex::new(HashSet::new())),
+            consecutive_heartbeat_failures: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -93,6 +108,20 @@ impl AppState {
     }
 
     pub fn should_notify(&self) -> bool {
-        self.startup_time.elapsed() > std::time::Duration::from_secs(60)
+        if self.startup_time.elapsed() < std::time::Duration::from_secs(60) {
+            return false;
+        }
+        if !self.network_available.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.network_suspended.load(Ordering::Relaxed) {
+            return false;
+        }
+        if let Some(end) = *self.resume_grace_until.lock().unwrap() {
+            if std::time::Instant::now() < end {
+                return false;
+            }
+        }
+        true
     }
 }

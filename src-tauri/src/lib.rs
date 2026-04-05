@@ -3,6 +3,7 @@ mod clipboard;
 mod dbus;
 mod crypto;
 mod discovery;
+mod netmon;
 mod peer;
 mod protocol;
 mod state;
@@ -883,6 +884,110 @@ fn check_and_notify_leave(app_handle: &tauri::AppHandle, state: &AppState, peer:
     }
 }
 
+const MAX_REMOVAL_RETRIES: u32 = 3;
+
+async fn removal_debounce_task(
+    state: AppState,
+    handle: tauri::AppHandle,
+    peer_id: String,
+    nonce: u64,
+    retry_count: u32,
+) {
+    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+
+    let should_probe = {
+        let pending = state.pending_removals.lock().unwrap();
+        pending.get(&peer_id).map_or(false, |n| *n == nonce)
+    };
+
+    if !should_probe {
+        tracing::debug!("[Discovery] Removal debounce cancelled (nonce changed) for {}", peer_id);
+        return;
+    }
+
+    // Layer 2: If network is down, retry instead of falsely confirming removal
+    if !state.network_available.load(std::sync::atomic::Ordering::Relaxed) {
+        if retry_count < MAX_REMOVAL_RETRIES {
+            tracing::info!("[Discovery] Network down — re-queuing removal for {} (retry {}/{})", peer_id, retry_count + 1, MAX_REMOVAL_RETRIES);
+            let new_nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
+            {
+                let mut pending = state.pending_removals.lock().unwrap();
+                pending.insert(peer_id.clone(), new_nonce);
+            }
+            Box::pin(removal_debounce_task(state, handle, peer_id, new_nonce, retry_count + 1)).await;
+            return;
+        }
+        // Max retries reached — remove silently (can't verify either way)
+        tracing::warn!("[Discovery] Max retries reached for {} with network down — removing silently", peer_id);
+        let mut pending = state.pending_removals.lock().unwrap();
+        pending.remove(&peer_id);
+        drop(pending);
+        let mut peers = state.peers.lock().unwrap();
+        peers.remove(&peer_id);
+        drop(peers);
+        let _ = handle.emit("peer-remove", &peer_id);
+        return;
+    }
+
+    // Network is up — perform active probe
+    let peer_addr = {
+        let peers = state.peers.lock().unwrap();
+        peers.get(&peer_id).map(|p| std::net::SocketAddr::new(p.ip, p.port))
+    };
+
+    let mut is_alive = false;
+
+    if let Some(addr) = peer_addr {
+        tracing::info!("[Discovery] Debounce expired for {}. Probing...", peer_id);
+        let transport_opt = { state.transport.lock().unwrap().clone() };
+
+        if let Some(transport) = transport_opt {
+            if let Ok(ping_data) = serde_json::to_vec(&Message::Ping) {
+                let send_fut = async {
+                    match transport.send_message(addr, &ping_data).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            tracing::warn!("[Discovery] Active probe to {} failed: {}", addr, e);
+                            false
+                        }
+                    }
+                };
+                if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(2), send_fut).await {
+                    is_alive = result;
+                } else {
+                    tracing::warn!("[Discovery] Active probe to {} timed out.", addr);
+                }
+            }
+        }
+    }
+
+    // Finalize
+    let mut pending = state.pending_removals.lock().unwrap();
+    if let Some(current_n) = pending.get(&peer_id) {
+        if *current_n == nonce {
+            pending.remove(&peer_id);
+            drop(pending);
+
+            if is_alive {
+                tracing::info!("[Discovery] Active probe SUCCESS for {}. Cancelling removal.", peer_id);
+                return;
+            }
+
+            tracing::info!("[Discovery] Active probe FAILED/TIMEOUT. Removing peer {}", peer_id);
+            let mut peers = state.peers.lock().unwrap();
+            if let Some(peer) = peers.remove(&peer_id) {
+                drop(peers);
+                check_and_notify_leave(&handle, &state, &peer);
+            }
+            let _ = handle.emit("peer-remove", &peer_id);
+        } else {
+            tracing::debug!("[Discovery] Removal debounce cancelled (nonce updated during probe) for {}", peer_id);
+        }
+    } else {
+        tracing::debug!("[Discovery] Removal debounce cancelled (entry removed during probe) for {}", peer_id);
+    }
+}
+
 fn gossip_peer(
     new_peer: &Peer,
     state: &AppState,
@@ -1269,27 +1374,39 @@ async fn probe_ip(
 
 #[cfg(target_os = "windows")]
 fn configure_windows_firewall() {
-    tracing::info!("Configuring Windows Firewall (Requesting UAC if needed)...");
-    
-    // We use PowerShell 'Start-Process -Verb RunAs' to elevate
-    // Check if rule exists first? netsh doesn't error if exists, just adds duplicate or fails? 
-    // Actually, 'add rule' usually fails if exists unless we delete. 
-    // We'll just run the delete and add commands blindly in the elevated process.
-    // We can chain them in powershell.
-    
-    // Command to run in elevated shell:
-    // netsh advfirewall firewall delete rule name="ClusterCut"
-    // netsh advfirewall firewall add rule name="ClusterCut" dir=in action=allow protocol=UDP localport=4654 profile=any edge=yes
-    
-    let cmd = "netsh advfirewall firewall delete rule name=\"ClusterCut\"; netsh advfirewall firewall add rule name=\"ClusterCut\" dir=in action=allow protocol=UDP localport=4654 profile=any edge=yes";
-    
+    // Check if the firewall rule already exists (does not require elevation)
+    let check = std::process::Command::new("netsh")
+        .args(["advfirewall", "firewall", "show", "rule", "name=ClusterCut"])
+        .output();
+
+    match check {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // If the rule exists, netsh prints its details including the port.
+            // Verify it matches our expected configuration.
+            if output.status.success()
+                && stdout.contains("UDP")
+                && stdout.contains("4654")
+            {
+                tracing::info!("Windows Firewall rule 'ClusterCut' already exists and looks correct, skipping.");
+                return;
+            }
+            tracing::info!("Firewall rule missing or misconfigured, will create/update (requesting UAC)...");
+        }
+        Err(e) => {
+            tracing::warn!("Could not check firewall rule: {}, will attempt to create it", e);
+        }
+    }
+
+    let cmd = "netsh advfirewall firewall delete rule name=\"ClusterCut\" 2>$null; netsh advfirewall firewall add rule name=\"ClusterCut\" dir=in action=allow protocol=UDP localport=4654 profile=any edge=yes";
+
     match std::process::Command::new("powershell")
         .args([
-            "-NoProfile", 
-            "-Command", 
+            "-NoProfile",
+            "-Command",
             &format!("Start-Process powershell -ArgumentList '-NoProfile -Command \"{}\"' -Verb RunAs -WindowStyle Hidden", cmd)
         ])
-        .spawn() // Use spawn, don't wait for output because it triggers a UAC dialog unrelated to our process tree often
+        .spawn()
     {
         Ok(_) => {
             tracing::info!("Triggered UAC prompt for Firewall configuration.");
@@ -1953,9 +2070,7 @@ pub fn run() {
 
             #[cfg(target_os = "windows")]
             {
-                // Attempt to configure firewall on startup
-                // This runs every time, but 'delete' command handles cleanup.
-                // Doing it in a separate thread to not block startup significantly.
+                // Ensure firewall rule exists; checks first and only prompts UAC if needed.
                 std::thread::spawn(|| {
                     configure_windows_firewall();
                 });
@@ -1964,6 +2079,14 @@ pub fn run() {
             #[cfg(target_os = "linux")]
             {
                 spawn_linux_theme_watcher(app_handle.clone());
+            }
+
+            // Start network state monitor (cross-platform)
+            {
+                let netmon_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::netmon::start_network_monitor(netmon_handle).await;
+                });
             }
 
             // Load State
@@ -2166,37 +2289,47 @@ pub fn run() {
                                     d_state.add_peer(peer.clone());
                                     let _ = d_handle.emit("peer-update", &peer);
 
-                                    // Trigger Notification
+                                    // Trigger Notification (with Layer 2 ping verification)
                                     {
-                                        let should_notify = {
+                                        let same_network = {
                                             let local_net = d_state.network_name.lock().unwrap();
-                                            if let Some(remote_net) = &peer.network_name {
-                                                *remote_net == *local_net
-                                            } else {
-                                                false
-                                            }
+                                            peer.network_name.as_ref().map_or(false, |rn| *rn == *local_net)
                                         };
 
-                                        if should_notify {
-                                            if d_state.settings.lock().unwrap().notifications.device_join {
-                                                // Suppress notifications during startup
-                                                if d_state.should_notify() {
-                                                    if is_new_peer {
-                                                        tracing::info!("[Notification] Triggering 'Device Joined' for discovered peer: {}", peer.hostname);
-                                                        send_notification(&d_handle, "Device Joined", &format!("{} has joined your cluster", peer.hostname), false, Some(1), "devices", NotificationPayload::None);
-                                                    } else {
-                                                        tracing::debug!("[Notification] Peer updated (already known): {}", peer.hostname);
+                                        if same_network && is_new_peer
+                                            && d_state.settings.lock().unwrap().notifications.device_join
+                                            && d_state.should_notify()
+                                        {
+                                            // Ping-verify before notifying
+                                            let verify_state = d_state.clone();
+                                            let verify_handle = d_handle.clone();
+                                            let verify_peer = peer.clone();
+                                            tauri::async_runtime::spawn(async move {
+                                                let addr = std::net::SocketAddr::new(verify_peer.ip, verify_peer.port);
+                                                let transport_opt = { verify_state.transport.lock().unwrap().clone() };
+                                                let mut verified = false;
+
+                                                if let Some(transport) = transport_opt {
+                                                    if let Ok(ping_data) = serde_json::to_vec(&Message::Ping) {
+                                                        if let Ok(Ok(_)) = tokio::time::timeout(
+                                                            std::time::Duration::from_secs(3),
+                                                            transport.send_message(addr, &ping_data),
+                                                        ).await {
+                                                            verified = true;
+                                                        }
                                                     }
-                                                } else {
-                                                    tracing::debug!("[Notification] Device join notification suppressed by startup timer for peer: {}", peer.hostname);
                                                 }
-                                            } else {
-                                                tracing::debug!("[Notification] Device join notification suppressed by settings for discovered peer: {}", peer.hostname);
-                                            }                                      } else {
-                                            // tracing::debug!("[Notification] suppressed - different cluster name.");
+
+                                                if verified {
+                                                    tracing::info!("[Notification] Ping-verified 'Device Joined' for: {}", verify_peer.hostname);
+                                                    send_notification(&verify_handle, "Device Joined", &format!("{} has joined your cluster", verify_peer.hostname), false, Some(1), "devices", NotificationPayload::None);
+                                                } else {
+                                                    tracing::info!("[Notification] Deferring 'Device Joined' for {} (ping failed, will fire on heartbeat)", verify_peer.hostname);
+                                                    verify_state.pending_join_notifications.lock().unwrap().insert(verify_peer.id.clone());
+                                                }
+                                            });
                                         }
                                     }
-                                    // Lock drops here
                                 }
 
                             }
@@ -2231,91 +2364,7 @@ pub fn run() {
                                 let r_id = id.clone();
                                 
                                 tauri::async_runtime::spawn(async move {
-                                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                                    
-                                    let should_probe = {
-                                        let pending = r_state.pending_removals.lock().unwrap();
-                                        if let Some(n) = pending.get(&r_id) {
-                                            *n == nonce
-                                        } else {
-                                            false
-                                        }
-                                    };
-
-                                    if should_probe {
-                                        // Confirmed! Still pending and nonce matches.
-                                        // START ACTIVE CHECK
-                                        let peer_addr = {
-                                            let peers = r_state.peers.lock().unwrap();
-                                            peers.get(&r_id).map(|p| std::net::SocketAddr::new(p.ip, p.port))
-                                        };
-                                        
-                                        let mut is_alive = false;
-                                        
-                                        // Lock is already dropped here by scope
-
-                                            
-                                            if let Some(addr) = peer_addr {
-                                                tracing::info!("[Discovery] Debounce expired for {}. Probing...", r_id);
-                                                // Create a temporary transport scope 
-                                                // (We can use the main one, but we need to clone the lock)
-                                                let transport_opt = { r_state.transport.lock().unwrap().clone() };
-                                                
-                                                if let Some(transport) = transport_opt {
-                                                    if let Ok(ping_data) = serde_json::to_vec(&Message::Ping) {
-                                                        // Convert Send Error to false
-                                                        // We use a short timeout for the ping
-                                                        let send_fut = async {
-                                                            match transport.send_message(addr, &ping_data).await {
-                                                                Ok(_) => true,
-                                                                Err(e) => { 
-                                                                    tracing::warn!("[Discovery] Active probe to {} failed: {}", addr, e);
-                                                                    false
-                                                                }
-                                                            }
-                                                        };
-                                                        
-                                                        // 2s timeout for ping
-                                                        if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(2), send_fut).await {
-                                                            is_alive = result;
-                                                        } else {
-                                                            tracing::warn!("[Discovery] Active probe to {} timed out.", addr);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            
-                                            // Re-acquire lock to finalize
-                                            let mut pending = r_state.pending_removals.lock().unwrap();
-                                            // Check if nonce still matches (it might have been updated/removed while we were working)
-                                            if let Some(current_n) = pending.get(&r_id) {
-                                                if *current_n == nonce {
-                                                    pending.remove(&r_id);
-                                                    drop(pending); // Drop lock
-                                                    
-                                                    if is_alive {
-                                                        tracing::info!("[Discovery] Active probe SUCCESS for {}. Cancelling removal.", r_id);
-                                                        return;
-                                                    }
-                                                    
-                                                    // Proceed with removal
-                                                    {
-                                                        tracing::info!("[Discovery] Active probe FAILED/TIMEOUT. Removing peer {}", r_id);
-                                                        let mut peers = r_state.peers.lock().unwrap();
-                                                        if let Some(peer) = peers.remove(&r_id) {
-                                                             drop(peers); // Drop lock before notifying
-                                                             check_and_notify_leave(&r_handle, &r_state, &peer);
-                                                        }
-                                                    }
-                                                    let _ = r_handle.emit("peer-remove", &r_id);
-                                                } else {
-                                                     tracing::debug!("[Discovery] Removal Debounce cancelled (Nonce updated during probe) for {}", r_id);
-                                                }
-                                            } else {
-                                                 tracing::debug!("[Discovery] Removal Debounce cancelled (Entry removed during probe) for {}", r_id);
-                                            }
-                                        }
-
+                                    removal_debounce_task(r_state, r_handle, r_id, nonce, 0).await;
                                 });
                             }
                             _ => {}
@@ -2380,11 +2429,12 @@ pub fn run() {
 
             let hb_state = (*app.state::<AppState>()).clone();
             let hb_transport = transport.clone();
+            let hb_handle = app.handle().clone();
 
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    
+
                     let peers: Vec<Peer> = {
                         // FIX: Heartbeat ALL runtime peers, not just known (connected) ones.
                         // This prevents pruning of discovered-but-not-yet-trusted peers.
@@ -2414,21 +2464,37 @@ pub fn run() {
                         port: hb_transport.local_addr().unwrap().port(),
                         hostname,
                         last_seen: 0,
-                        is_trusted: false, 
+                        is_trusted: false,
                         is_manual: true,
                         network_name: Some(network_name),
                         signature,
                     };
-                    
+
                     let msg = Message::PeerDiscovery(my_peer);
                     let data = serde_json::to_vec(&msg).unwrap_or_default();
 
-                    for p in peers {
-                        // Don't ping self (shouldn't be in list, but sanity check)
+                    let mut any_success = false;
+                    for p in &peers {
                         let addr = std::net::SocketAddr::new(p.ip, p.port);
-                        
-                        // We skip sending if wait, we want to broadcast to everyone we know.
-                        let _ = hb_transport.send_message(addr, &data).await;
+                        if hb_transport.send_message(addr, &data).await.is_ok() {
+                            any_success = true;
+                        }
+                    }
+
+                    // Heartbeat fallback: track consecutive rounds where all sends failed
+                    if any_success {
+                        let prev = hb_state.consecutive_heartbeat_failures.swap(0, std::sync::atomic::Ordering::Relaxed);
+                        if prev >= 3 {
+                            tracing::info!("[Netmon] Heartbeat fallback: network recovered (was down for {} rounds)", prev);
+                            crate::netmon::on_network_up(&hb_state);
+                            crate::netmon::start_recovery_tasks(&hb_handle);
+                        }
+                    } else {
+                        let failures = hb_state.consecutive_heartbeat_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if failures == 3 {
+                            tracing::warn!("[Netmon] Heartbeat fallback: 3 consecutive failed rounds — marking network as down");
+                            crate::netmon::on_network_down(&hb_state);
+                        }
                     }
                 }
             });
@@ -3323,6 +3389,19 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                  listener_state.add_peer(peer.clone());
                  let _ = listener_handle.emit("peer-update", &peer);
 
+                 // Fire deferred join notification if this peer was pending verification
+                 {
+                     let mut pending_joins = listener_state.pending_join_notifications.lock().unwrap();
+                     if pending_joins.remove(&peer.id) {
+                         if listener_state.should_notify()
+                             && listener_state.settings.lock().unwrap().notifications.device_join
+                         {
+                             tracing::info!("[Notification] Deferred 'Device Joined' fired for {} (confirmed by heartbeat)", peer.hostname);
+                             send_notification(&listener_handle, "Device Joined", &format!("{} has joined your cluster", peer.hostname), false, Some(1), "devices", NotificationPayload::None);
+                         }
+                     }
+                 }
+
                  if peer.is_trusted || peer.is_manual {
                      kp_lock.insert(peer.id.clone(), peer.clone());
                      save_known_peers(listener_handle.app_handle(), &kp_lock);
@@ -3525,6 +3604,22 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
         }
         Message::Pong => {
              tracing::debug!("Received Pong from {}. Connection Verified.", addr);
+             // Fire deferred join notification if the responding peer was pending
+             let peer_id_opt = {
+                 let peers = listener_state.peers.lock().unwrap();
+                 peers.values().find(|p| p.ip == addr.ip() && p.port == addr.port()).map(|p| (p.id.clone(), p.hostname.clone()))
+             };
+             if let Some((peer_id, hostname)) = peer_id_opt {
+                 let mut pending_joins = listener_state.pending_join_notifications.lock().unwrap();
+                 if pending_joins.remove(&peer_id) {
+                     if listener_state.should_notify()
+                         && listener_state.settings.lock().unwrap().notifications.device_join
+                     {
+                         tracing::info!("[Notification] Deferred 'Device Joined' fired for {} (confirmed by Pong)", hostname);
+                         send_notification(&listener_handle, "Device Joined", &format!("{} has joined your cluster", hostname), false, Some(1), "devices", NotificationPayload::None);
+                     }
+                 }
+             }
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "clustercut"
-version = "0.2.0"
+version = "0.2.1"
 description = "ClusterCut Clipboard Sync"
 authors = ["Keith Vassallo"]
 edition = "2021"
@@ -67,7 +67,16 @@ wl-clipboard-rs = "0.9.3"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58.0", features = [
     "Data_Xml_Dom",
-    "UI_Notifications", 
+    "UI_Notifications",
     "UI_Notifications_Management",
-    "Foundation"
+    "Foundation",
+    "Win32_System_Power",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Networking_Connectivity",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.6"
+nsworkspace = "0.2"
+core-foundation = "0.10"
