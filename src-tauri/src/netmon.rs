@@ -314,22 +314,20 @@ pub async fn start_network_monitor(app_handle: tauri::AppHandle) {
         windows_power_monitor(power_state, power_handle);
     });
 
-    // Spawn network monitor
+    // Spawn network monitor on a dedicated thread (handler is not Send)
     let net_state = state.clone();
     let net_handle = app_handle.clone();
-    tauri::async_runtime::spawn(async move {
-        windows_network_monitor(net_state, net_handle).await;
+    std::thread::spawn(move || {
+        windows_network_monitor(net_state, net_handle);
     });
 }
 
 #[cfg(target_os = "windows")]
 fn windows_power_monitor(state: AppState, app_handle: tauri::AppHandle) {
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows::Win32::System::Power::{PBT_APMSUSPEND, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND};
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
+        CreateWindowExW, DispatchMessageW, GetMessageW,
         RegisterClassW, TranslateMessage, HWND_MESSAGE, MSG, WINDOW_EX_STYLE,
-        WINDOW_STYLE, WNDCLASSW, WM_POWERBROADCAST,
+        WINDOW_STYLE, WNDCLASSW,
     };
     use windows::core::PCWSTR;
 
@@ -345,7 +343,7 @@ fn windows_power_monitor(state: AppState, app_handle: tauri::AppHandle) {
 
         // Store state in a Box that we pass via CreateWindowEx lpParam
         // We'll use a static instead since wndproc can't easily access instance data
-        POWER_MONITOR_STATE.set((state, app_handle));
+        POWER_MONITOR_STATE.set(Some((state, app_handle)));
 
         let _hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -357,13 +355,13 @@ fn windows_power_monitor(state: AppState, app_handle: tauri::AppHandle) {
             None,
             None,
             None,
-        );
+        ).expect("Failed to create power monitor window");
 
         tracing::info!("[Netmon] Windows power monitor started");
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            TranslateMessage(&msg);
+            let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
@@ -381,8 +379,9 @@ unsafe extern "system" fn power_wndproc(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::System::Power::{PBT_APMSUSPEND, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND};
-    use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_POWERBROADCAST};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, WM_POWERBROADCAST, PBT_APMSUSPEND, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
+    };
 
     if msg == WM_POWERBROADCAST {
         POWER_MONITOR_STATE.with(|cell| {
@@ -406,7 +405,7 @@ unsafe extern "system" fn power_wndproc(
 }
 
 #[cfg(target_os = "windows")]
-async fn windows_network_monitor(state: AppState, app_handle: tauri::AppHandle) {
+fn windows_network_monitor(state: AppState, app_handle: tauri::AppHandle) {
     use windows::Networking::Connectivity::{NetworkInformation, NetworkConnectivityLevel};
 
     // Check initial state
@@ -458,10 +457,10 @@ async fn windows_network_monitor(state: AppState, app_handle: tauri::AppHandle) 
     match NetworkInformation::NetworkStatusChanged(&handler) {
         Ok(token) => {
             tracing::info!("[Netmon] Windows network monitor registered");
-            // Keep alive — the token must stay in scope
-            std::future::pending::<()>().await;
+            // Keep alive — block this thread forever so the token stays in scope
+            std::thread::park();
             // Prevent unused warning & ensure cleanup
-            drop(token);
+            let _ = token;
         }
         Err(e) => {
             tracing::error!("[Netmon] Failed to register Windows network monitor: {}", e);
