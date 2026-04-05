@@ -879,7 +879,7 @@ dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
  "clap 4.5.57",
- "core-foundation 0.10.1",
+ "core-foundation 0.9.4",
  "futures",
  "getrandom 0.2.17",
  "hostname",

@@ -500,26 +500,40 @@ pub async fn start_network_monitor(app_handle: tauri::AppHandle) {
 
 #[cfg(target_os = "macos")]
 fn macos_sleep_monitor(state: AppState, app_handle: tauri::AppHandle) {
-    use nsworkspace::NSWorkspace;
+    use nsworkspace::{Monitor, NotificationListener, Event};
 
     tracing::info!("[Netmon] macOS sleep monitor starting");
 
+    let (monitor, receiver, _stop) = match Monitor::new() {
+        Some(m) => m,
+        None => {
+            tracing::error!("[Netmon] Failed to create NSWorkspace monitor");
+            return;
+        }
+    };
+
+    monitor.subscribe(NotificationListener::DidSleep | NotificationListener::DidWake);
+
+    // Spawn a thread to process events from the channel
     let sleep_state = state.clone();
-    NSWorkspace::observe_will_sleep(move || {
-        on_suspend(&sleep_state);
-    });
-
-    let wake_state = state.clone();
     let wake_handle = app_handle.clone();
-    NSWorkspace::observe_did_wake(move || {
-        on_resume(&wake_state);
-        start_recovery_tasks(&wake_handle);
+    std::thread::spawn(move || {
+        while let Ok(event) = receiver.recv() {
+            match event {
+                Event::DidSleep => {
+                    on_suspend(&sleep_state);
+                }
+                Event::DidWake => {
+                    on_resume(&sleep_state);
+                    start_recovery_tasks(&wake_handle);
+                }
+                _ => {}
+            }
+        }
     });
 
-    // NSWorkspace notifications require a running CFRunLoop on this thread
-    unsafe {
-        core_foundation::runloop::CFRunLoop::get_current().run();
-    }
+    // Run the monitor's run loop (blocks)
+    monitor.run();
 }
 
 #[cfg(target_os = "macos")]
@@ -554,14 +568,16 @@ fn macos_network_monitor(state: AppState, app_handle: tauri::AppHandle) {
     };
 
     if reachability.set_callback(callback).is_ok() {
-        if reachability.schedule_with_runloop(
-            &core_foundation::runloop::CFRunLoop::get_current(),
-            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
-        ) {
+        if unsafe {
+            reachability.schedule_with_runloop(
+                &core_foundation::runloop::CFRunLoop::get_current(),
+                core_foundation::runloop::kCFRunLoopDefaultMode,
+            )
+        }
+        .is_ok()
+        {
             tracing::info!("[Netmon] macOS network reachability callback registered");
-            unsafe {
-                core_foundation::runloop::CFRunLoop::get_current().run();
-            }
+            core_foundation::runloop::CFRunLoop::run_current();
         } else {
             tracing::error!("[Netmon] Failed to schedule reachability with run loop");
         }
