@@ -12,7 +12,9 @@ use tokio::sync::Notify;
 
 pub(crate) const DBUS_NAME: &str = "org.gnome.Shell";
 pub(crate) const DBUS_PATH: &str = "/org/gnome/Shell/Extensions/ClusterCut";
-pub(crate) const DBUS_IFACE: &str = "app.clustercut.clustercut.Clipboard";
+// Interface is versioned (.Clipboard2) so the is_available() probe can't be
+// fooled by an older extension install that only exposes text operations.
+pub(crate) const DBUS_IFACE: &str = "app.clustercut.clustercut.Clipboard2";
 
 /// Check if the GNOME extension's clipboard bridge is available on D-Bus.
 /// Uses blocking D-Bus so it can be called before the async runtime is ready.
@@ -108,6 +110,25 @@ fn write_text_dbus(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Write a list of file URIs via D-Bus. The extension writes both
+/// `text/uri-list` and `x-special/gnome-copied-files` so file managers
+/// recognise the paste as a file copy rather than plain text.
+fn write_files_dbus(uris: &[String]) -> Result<(), String> {
+    let conn = zbus::blocking::Connection::session()
+        .map_err(|e| format!("D-Bus connection failed: {}", e))?;
+
+    conn.call_method(
+        Some(DBUS_NAME),
+        DBUS_PATH,
+        Some(DBUS_IFACE),
+        "WriteFiles",
+        &(uris,),
+    )
+    .map_err(|e| format!("WriteFiles D-Bus call failed: {}", e))?;
+
+    Ok(())
+}
+
 fn write_text(_app: &AppHandle, text: String) -> Result<(), String> {
     write_text_dbus(&text)
 }
@@ -133,9 +154,7 @@ fn write_files(_app: &AppHandle, files: Vec<String>) -> Result<(), String> {
         return Err("No valid file paths".to_string());
     }
 
-    // Write as newline-separated URI list
-    let uri_text = uris.join("\n");
-    write_text_dbus(&uri_text)
+    write_files_dbus(&uris)
 }
 
 pub fn set_clipboard(app: &AppHandle, text: String) {
@@ -185,10 +204,18 @@ pub fn start_monitor(
             }
         };
 
-        let mut stream = match proxy.receive_signal("ClipboardChanged").await {
+        let mut text_stream = match proxy.receive_signal("ClipboardChanged").await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to subscribe to ClipboardChanged signal: {}", e);
+                return;
+            }
+        };
+
+        let mut files_stream = match proxy.receive_signal("FilesChanged").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to subscribe to FilesChanged signal: {}", e);
                 return;
             }
         };
@@ -203,37 +230,44 @@ pub fn start_monitor(
                 break;
             }
 
-            tokio::select! {
+            let new_content: Option<ClipboardContent> = tokio::select! {
                 _ = cancel_task.notified() => {
                     tracing::info!("GNOME clipboard monitor cancelled, exiting.");
                     break;
                 }
-                next = stream.next() => {
-                    match next {
-                        Some(msg) => {
-                            if let Ok(text) = msg.body().deserialize::<String>() {
-                                if !text.is_empty() {
-                                    let current_content = ClipboardContent::Text(text);
-
-                                    if common::should_process_content(&current_content, &last_content) {
-                                        last_content = current_content.clone();
-                                        common::process_clipboard_change(
-                                            current_content,
-                                            &app_handle,
-                                            &state,
-                                            &transport,
-                                        );
-                                    } else {
-                                        last_content = current_content;
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            tracing::warn!("D-Bus clipboard signal stream ended");
-                            break;
-                        }
+                next = text_stream.next() => match next {
+                    Some(msg) => match msg.body().deserialize::<String>() {
+                        Ok(text) if !text.is_empty() => Some(ClipboardContent::Text(text)),
+                        _ => None,
+                    },
+                    None => {
+                        tracing::warn!("D-Bus ClipboardChanged stream ended");
+                        break;
                     }
+                },
+                next = files_stream.next() => match next {
+                    Some(msg) => match msg.body().deserialize::<Vec<String>>() {
+                        Ok(uris) if !uris.is_empty() => Some(ClipboardContent::Files(uris)),
+                        _ => None,
+                    },
+                    None => {
+                        tracing::warn!("D-Bus FilesChanged stream ended");
+                        break;
+                    }
+                },
+            };
+
+            if let Some(current_content) = new_content {
+                if common::should_process_content(&current_content, &last_content) {
+                    last_content = current_content.clone();
+                    common::process_clipboard_change(
+                        current_content,
+                        &app_handle,
+                        &state,
+                        &transport,
+                    );
+                } else {
+                    last_content = current_content;
                 }
             }
         }

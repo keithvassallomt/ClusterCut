@@ -80,6 +80,24 @@ pub fn start(app_handle: AppHandle, state: AppState, transport: Transport) {
         // transitions, not on current state. Do one reconcile pass now.
         reconcile(&app_handle, &state, &transport, &mut monitor_cancel).await;
 
+        // If after the cold-start reconcile we're still Degraded, the extension
+        // isn't installed, isn't enabled, or is an incompatible version. Surface
+        // that to the user so they don't have to dig through logs to understand
+        // why clipboard sync isn't working. reconcile() only fires notifications
+        // on transitions, so this covers the transition-less cold-start case.
+        if super::get_backend() == ClipboardBackend::Degraded {
+            crate::send_notification(
+                &app_handle,
+                "Clipboard sync needs the ClusterCut extension",
+                "Install or enable the ClusterCut GNOME extension to start syncing. \
+                 If you already have it installed, make sure it is up to date.",
+                true,
+                None,
+                "history",
+                crate::NotificationPayload::None,
+            );
+        }
+
         loop {
             if state.is_shutdown() {
                 break;

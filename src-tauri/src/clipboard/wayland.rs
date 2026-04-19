@@ -9,7 +9,7 @@ use std::io::Read;
 use std::thread;
 use std::time::Duration;
 use tauri::AppHandle;
-use wl_clipboard_rs::copy::{MimeType as CopyMimeType, Options as CopyOptions, Source};
+use wl_clipboard_rs::copy::{MimeSource, MimeType as CopyMimeType, Options as CopyOptions, Source};
 use wl_clipboard_rs::paste::{
     get_contents, ClipboardType, Error as PasteError, MimeType as PasteMimeType, Seat,
 };
@@ -101,13 +101,27 @@ fn write_files(_app: &AppHandle, files: Vec<String>) -> Result<(), String> {
         return Err("No valid file paths".to_string());
     }
 
-    let uri_text = uris.join("\n");
+    // Advertise both text/uri-list and x-special/gnome-copied-files so GTK file
+    // managers (Nautilus) and others recognise a file paste rather than a text
+    // paste. The `copy` field in x-special/gnome-copied-files distinguishes a
+    // copy from a cut — we always use "copy".
+    let uri_list = format!("{}\n", uris.join("\n"));
+    let gnome_copied = format!("copy\n{}", uris.join("\n"));
+
+    let sources = vec![
+        MimeSource {
+            source: Source::Bytes(uri_list.into_bytes().into()),
+            mime_type: CopyMimeType::Specific("text/uri-list".to_string()),
+        },
+        MimeSource {
+            source: Source::Bytes(gnome_copied.into_bytes().into()),
+            mime_type: CopyMimeType::Specific("x-special/gnome-copied-files".to_string()),
+        },
+    ];
+
     let opts = CopyOptions::new();
-    opts.copy(
-        Source::Bytes(uri_text.into_bytes().into()),
-        CopyMimeType::Specific("text/uri-list".to_string()),
-    )
-    .map_err(|e| format!("wl-clipboard-rs copy files failed: {}", e))
+    opts.copy_multi(sources)
+        .map_err(|e| format!("wl-clipboard-rs copy files failed: {}", e))
 }
 
 pub fn set_clipboard(app: &AppHandle, text: String) {

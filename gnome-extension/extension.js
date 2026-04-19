@@ -29,18 +29,30 @@ const DBUS_IFACE = `
   </interface>
 </node>`;
 
-// D-Bus interface for clipboard bridging (Wayland)
+// D-Bus interface for clipboard bridging (Wayland).
+// Interface is intentionally versioned (.Clipboard2) so the Rust side's
+// is_available() probe cannot be fooled by an older extension that only
+// speaks the legacy text-only Clipboard interface.
 const CLIPBOARD_DBUS_IFACE = `
 <node>
-  <interface name="app.clustercut.clustercut.Clipboard">
+  <interface name="app.clustercut.clustercut.Clipboard2">
     <method name="ReadClipboard">
       <arg type="s" direction="out"/>
     </method>
     <method name="WriteClipboard">
       <arg type="s" direction="in"/>
     </method>
+    <method name="ReadFiles">
+      <arg type="as" direction="out"/>
+    </method>
+    <method name="WriteFiles">
+      <arg type="as" direction="in"/>
+    </method>
     <signal name="ClipboardChanged">
       <arg type="s"/>
+    </signal>
+    <signal name="FilesChanged">
+      <arg type="as"/>
     </signal>
   </interface>
 </node>`;
@@ -279,7 +291,12 @@ export default class ClusterCutExtension extends Extension {
 
     _startClipboardBridge() {
         this._lastClipboardText = '';
-        this._ignoreNextChange = false;
+        this._lastFilesKey = '';
+        // Deadline (in GLib monotonic microseconds) before which owner-changed
+        // events are ignored. Using a deadline instead of a one-shot bool handles
+        // the case where a WriteFiles call (which writes two MIMEs) triggers the
+        // GNOME Shell selection owner to fire owner-changed more than once.
+        this._ignoreUntil = 0;
 
         // Export the clipboard D-Bus interface
         this._clipboardDbusId = Gio.DBus.session.register_object(
@@ -315,30 +332,143 @@ export default class ClusterCutExtension extends Extension {
         }
 
         this._lastClipboardText = null;
-        this._ignoreNextChange = null;
+        this._lastFilesKey = null;
+        this._ignoreUntil = 0;
+    }
+
+    _suppressNextChanges() {
+        // Swallow owner-changed events for the next 500 ms (covers multiple
+        // emissions from a single multi-MIME write).
+        this._ignoreUntil = GLib.get_monotonic_time() + 500000;
+    }
+
+    _shouldIgnore() {
+        return GLib.get_monotonic_time() < this._ignoreUntil;
     }
 
     _onClipboardOwnerChanged() {
-        if (this._ignoreNextChange) {
-            this._ignoreNextChange = false;
+        if (this._shouldIgnore()) {
             return;
         }
 
+        // NOTE: St.Clipboard.get_mimetypes is SYNCHRONOUS and returns the list
+        // directly; it is NOT callback-style like get_text / get_content. An
+        // earlier version of this file passed a callback here and silently did
+        // nothing on every clipboard change.
+        const clipboard = St.Clipboard.get_default();
+        const mimetypes = clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD);
+        if (!mimetypes || mimetypes.length === 0) {
+            return;
+        }
+
+        // Priority: file URIs > plain text. Image bytes and other MIME
+        // payloads are intentionally ignored — ClusterCut only syncs
+        // files-as-files today.
+        const hasUris = mimetypes.includes('text/uri-list')
+            || mimetypes.includes('x-special/gnome-copied-files');
+
+        if (hasUris) {
+            this._readAndEmitFiles();
+            return;
+        }
+
+        const hasText = mimetypes.some(m => m === 'text/plain'
+            || m === 'text/plain;charset=utf-8'
+            || m === 'UTF8_STRING'
+            || m === 'STRING');
+
+        if (hasText) {
+            this._readAndEmitText();
+        }
+    }
+
+    _readAndEmitText() {
         const clipboard = St.Clipboard.get_default();
         clipboard.get_text(St.ClipboardType.CLIPBOARD, (cb, text) => {
             if (text && text !== this._lastClipboardText) {
                 this._lastClipboardText = text;
+                this._lastFilesKey = '';
 
-                // Emit ClipboardChanged D-Bus signal
                 Gio.DBus.session.emit_signal(
-                    null, // broadcast
+                    null,
                     '/org/gnome/Shell/Extensions/ClusterCut',
-                    'app.clustercut.clustercut.Clipboard',
+                    'app.clustercut.clustercut.Clipboard2',
                     'ClipboardChanged',
                     new GLib.Variant('(s)', [text])
                 );
             }
         });
+    }
+
+    _readAndEmitFiles() {
+        const clipboard = St.Clipboard.get_default();
+        clipboard.get_content(St.ClipboardType.CLIPBOARD, 'text/uri-list', (cb, bytes) => {
+            const uris = this._parseUriList(bytes);
+            if (uris.length === 0) {
+                return;
+            }
+
+            const key = uris.join('\n');
+            if (key === this._lastFilesKey) {
+                return;
+            }
+            this._lastFilesKey = key;
+            this._lastClipboardText = '';
+
+            Gio.DBus.session.emit_signal(
+                null,
+                '/org/gnome/Shell/Extensions/ClusterCut',
+                'app.clustercut.clustercut.Clipboard2',
+                'FilesChanged',
+                new GLib.Variant('(as)', [uris])
+            );
+        });
+    }
+
+    _parseUriList(bytes) {
+        if (!bytes) {
+            return [];
+        }
+        const data = bytes.get_data ? bytes.get_data() : bytes;
+        if (!data || data.length === 0) {
+            return [];
+        }
+        let text;
+        try {
+            text = new TextDecoder('utf-8').decode(data);
+        } catch (_e) {
+            return [];
+        }
+        return text
+            .split(/\r?\n/)
+            .map(l => l.trim())
+            .filter(l => l.length > 0 && !l.startsWith('#'));
+    }
+
+    _writeFiles(uris) {
+        if (!uris || uris.length === 0) {
+            return;
+        }
+
+        this._suppressNextChanges();
+        this._lastFilesKey = uris.join('\n');
+        this._lastClipboardText = '';
+
+        const clipboard = St.Clipboard.get_default();
+
+        // Nautilus and other GTK file managers primarily look for
+        // x-special/gnome-copied-files to decide whether Paste means
+        // "paste files" vs "paste text". We advertise both MIMEs so
+        // the target app picks whichever it understands.
+        const uriListText = uris.join('\n') + '\n';
+        const gnomeCopiedText = 'copy\n' + uris.join('\n');
+
+        const encoder = new TextEncoder();
+        const uriListBytes = GLib.Bytes.new(encoder.encode(uriListText));
+        const gnomeCopiedBytes = GLib.Bytes.new(encoder.encode(gnomeCopiedText));
+
+        clipboard.set_content(St.ClipboardType.CLIPBOARD, 'text/uri-list', uriListBytes);
+        clipboard.set_content(St.ClipboardType.CLIPBOARD, 'x-special/gnome-copied-files', gnomeCopiedBytes);
     }
 
     _handleClipboardMethod(methodName, parameters, invocation) {
@@ -349,10 +479,21 @@ export default class ClusterCutExtension extends Extension {
             });
         } else if (methodName === 'WriteClipboard') {
             const text = parameters.deep_unpack()[0];
-            this._ignoreNextChange = true;
+            this._suppressNextChanges();
             this._lastClipboardText = text;
+            this._lastFilesKey = '';
             const clipboard = St.Clipboard.get_default();
             clipboard.set_text(St.ClipboardType.CLIPBOARD, text);
+            invocation.return_value(null);
+        } else if (methodName === 'ReadFiles') {
+            const clipboard = St.Clipboard.get_default();
+            clipboard.get_content(St.ClipboardType.CLIPBOARD, 'text/uri-list', (cb, bytes) => {
+                const uris = this._parseUriList(bytes);
+                invocation.return_value(new GLib.Variant('(as)', [uris]));
+            });
+        } else if (methodName === 'WriteFiles') {
+            const [uris] = parameters.deep_unpack();
+            this._writeFiles(uris);
             invocation.return_value(null);
         } else {
             invocation.return_dbus_error(

@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - GNOME Wayland: runtime detection of the ClusterCut extension. Clipboard sync now starts automatically as soon as the extension is enabled (no app restart required) and pauses cleanly if the extension is disabled or crashes.
 - User-facing notifications when clipboard sync transitions between active and paused on GNOME Wayland.
+- Cold-start notification on GNOME Wayland when the app launches without a working extension (missing, disabled, or outdated), so the user isn't left wondering why clipboard sync isn't working.
+- GNOME Wayland: file-copy sync. Copying a file in Nautilus now syncs to other peers, and files received from peers paste cleanly into Nautilus as file copies (not text).
+
+### Fixed
+- Wayland (all compositors): file pastes are now advertised with both `text/uri-list` and `x-special/gnome-copied-files`, so GTK file managers recognise them as file pastes instead of plain text.
+
+### Changed
+- GNOME extension D-Bus interface bumped to `app.clustercut.clustercut.Clipboard2` (extension version 3.0). An outdated extension no longer silently passes the clipboard-backend probe — the "Clipboard sync paused" notification fires until the matching extension version is installed.
 
 ## [0.2.1] - 2026-04-05
 
