@@ -215,6 +215,20 @@ flatpak output_dir="~/Downloads":
         git clone --depth 1 https://github.com/flathub/shared-modules.git .flatpak-shared-modules
     fi
     ln -s "$(pwd)/.flatpak-shared-modules" "${STAGING}/shared-modules"
+    # Ensure the Flatpak runtime + SDK extensions the manifest needs are installed.
+    # Branch pins: GNOME 50 is built on freedesktop 25.08, which is the branch the
+    # Sdk.Extension.* bundles are published at (NOT branch 50).
+    for ref in \
+        "org.gnome.Platform//50" \
+        "org.gnome.Sdk//50" \
+        "org.freedesktop.Sdk.Extension.rust-stable//25.08" \
+        "org.freedesktop.Sdk.Extension.node22//25.08"; do
+        if ! flatpak info --user "${ref}" >/dev/null 2>&1 \
+            && ! flatpak info --system "${ref}" >/dev/null 2>&1; then
+            echo "Installing missing Flatpak: ${ref}..."
+            flatpak install --user -y flathub "${ref}"
+        fi
+    done
     # Generator scripts need aiohttp / PyYAML / tomlkit — install into a cached venv.
     if [ ! -d .venv-flatpak ]; then
         echo "Creating flatpak tooling virtualenv..."
