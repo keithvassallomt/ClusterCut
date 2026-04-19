@@ -64,8 +64,28 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
-    <release version="0.2.2" date="2026-04-19" />
-    <release version="0.2.1" date="2026-04-05" />
+    <release version="0.2.2" date="2026-04-19">
+      <description>
+        <p>Better GNOME Wayland support and clearer status reporting.</p>
+        <ul>
+          <li>File copies now sync on GNOME Wayland — copy a file in Nautilus, paste it on another peer</li>
+          <li>Clipboard sync starts automatically as soon as the ClusterCut GNOME extension is enabled; no app restart needed</li>
+          <li>Notifications now tell you when clipboard sync can't start (missing or outdated extension) or has been paused</li>
+          <li>Current sync mode is shown in GNOME's Background Apps list, matching the Quick Settings toggle</li>
+          <li>Requires ClusterCut GNOME extension v3.0 or newer</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.2.1" date="2026-04-05">
+      <description>
+        <p>Fewer spurious notifications and better handling of suspend/resume and Wi-Fi changes.</p>
+        <ul>
+          <li>Far fewer false "Device Joined" / "Device Left" notifications after sleep/wake or reconnecting to Wi-Fi</li>
+          <li>Peers on a previous network are now cleaned up silently when the local IP changes</li>
+          <li>Windows: the firewall rule check avoids the repeated UAC prompt on every launch</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-03-25">
       <description>
         <p>Clipboard sync now works natively on Wayland. No more X11 workarounds.</p>
