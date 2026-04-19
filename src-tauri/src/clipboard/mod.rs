@@ -5,13 +5,15 @@ mod plugin;
 mod wayland;
 #[cfg(target_os = "linux")]
 pub mod dbus_clipboard;
+#[cfg(target_os = "linux")]
+mod watcher;
 
 use crate::state::AppState;
 use crate::transport::Transport;
 use tauri::AppHandle;
 
 #[cfg(target_os = "linux")]
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// Which clipboard backend is active on Linux.
 #[cfg(target_os = "linux")]
@@ -28,7 +30,18 @@ pub enum ClipboardBackend {
 }
 
 #[cfg(target_os = "linux")]
-static ACTIVE_BACKEND: OnceLock<ClipboardBackend> = OnceLock::new();
+static ACTIVE_BACKEND: OnceLock<RwLock<ClipboardBackend>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn backend_cell() -> &'static RwLock<ClipboardBackend> {
+    ACTIVE_BACKEND.get_or_init(|| {
+        RwLock::new(if is_wayland() {
+            ClipboardBackend::Degraded
+        } else {
+            ClipboardBackend::Plugin
+        })
+    })
+}
 
 #[cfg(target_os = "linux")]
 pub fn is_wayland() -> bool {
@@ -59,22 +72,26 @@ pub fn detect_backend() -> ClipboardBackend {
         tracing::warn!(
             "Wayland session detected but no clipboard backend available. \
              Clipboard monitoring will not work. \
-             On GNOME, install the ClusterCut extension for clipboard support."
+             On GNOME, install the ClusterCut extension for clipboard support. \
+             Will watch for the extension to become available."
         );
         ClipboardBackend::Degraded
     };
 
-    let _ = ACTIVE_BACKEND.set(backend);
+    *backend_cell().write().unwrap() = backend;
     backend
 }
 
 #[cfg(target_os = "linux")]
 pub fn get_backend() -> ClipboardBackend {
-    ACTIVE_BACKEND.get().copied().unwrap_or(if is_wayland() {
-        ClipboardBackend::Degraded
-    } else {
-        ClipboardBackend::Plugin
-    })
+    *backend_cell().read().unwrap()
+}
+
+/// Update the active backend. Used by the watcher to transition between
+/// Degraded and GnomeExtension when the extension is enabled/disabled at runtime.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_backend(backend: ClipboardBackend) {
+    *backend_cell().write().unwrap() = backend;
 }
 
 /// Returns true if the tauri-plugin-clipboard should be initialized.
@@ -178,13 +195,10 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
             ClipboardBackend::WlrDataControl => {
                 wayland::start_monitor(app_handle, state, transport)
             }
-            ClipboardBackend::GnomeExtension => {
-                dbus_clipboard::start_monitor(app_handle, state, transport)
-            }
-            ClipboardBackend::Degraded => {
-                tracing::warn!(
-                    "Clipboard monitor not started — no backend available in degraded mode"
-                );
+            // For GNOME, the watcher owns the dbus_clipboard monitor lifecycle so it
+            // can start/stop as the extension is enabled or disabled at runtime.
+            ClipboardBackend::GnomeExtension | ClipboardBackend::Degraded => {
+                watcher::start(app_handle, state, transport);
             }
         }
     }

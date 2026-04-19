@@ -6,11 +6,13 @@
 use super::common::{self, ClipboardContent};
 use crate::state::AppState;
 use crate::transport::Transport;
+use std::sync::Arc;
 use tauri::AppHandle;
+use tokio::sync::Notify;
 
-const DBUS_NAME: &str = "org.gnome.Shell";
-const DBUS_PATH: &str = "/org/gnome/Shell/Extensions/ClusterCut";
-const DBUS_IFACE: &str = "app.clustercut.clustercut.Clipboard";
+pub(crate) const DBUS_NAME: &str = "org.gnome.Shell";
+pub(crate) const DBUS_PATH: &str = "/org/gnome/Shell/Extensions/ClusterCut";
+pub(crate) const DBUS_IFACE: &str = "app.clustercut.clustercut.Clipboard";
 
 /// Check if the GNOME extension's clipboard bridge is available on D-Bus.
 /// Uses blocking D-Bus so it can be called before the async runtime is ready.
@@ -37,6 +39,33 @@ pub fn is_available() -> bool {
                 false
             }
         }
+        Err(_) => false,
+    }
+}
+
+/// Async version of `is_available` for use from within tokio tasks.
+pub async fn is_available_async() -> bool {
+    let conn = match zbus::Connection::session().await {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let reply = conn
+        .call_method(
+            Some(DBUS_NAME),
+            DBUS_PATH,
+            Some("org.freedesktop.DBus.Introspectable"),
+            "Introspect",
+            &(),
+        )
+        .await;
+
+    match reply {
+        Ok(msg) => msg
+            .body()
+            .deserialize::<String>()
+            .map(|xml| xml.contains(DBUS_IFACE))
+            .unwrap_or(false),
         Err(_) => false,
     }
 }
@@ -127,8 +156,16 @@ pub fn write_text_direct(app: &AppHandle, text: String) -> Result<(), String> {
     write_text(app, text)
 }
 
-pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transport) {
-    // Spawn a tokio task to listen for ClipboardChanged D-Bus signals
+/// Start the GNOME extension D-Bus clipboard monitor. Returns a cancel handle;
+/// call `Notify::notify_one()` on it (or drop the last Arc) to stop the monitor.
+pub fn start_monitor(
+    app_handle: AppHandle,
+    state: AppState,
+    transport: Transport,
+) -> Arc<Notify> {
+    let cancel = Arc::new(Notify::new());
+    let cancel_task = cancel.clone();
+
     tauri::async_runtime::spawn(async move {
         tracing::info!("Starting GNOME extension clipboard monitor (D-Bus bridge)");
 
@@ -140,15 +177,7 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
             }
         };
 
-        // Create a proxy to the extension's clipboard interface
-        let proxy = match zbus::Proxy::new(
-            &conn,
-            DBUS_NAME,
-            DBUS_PATH,
-            DBUS_IFACE,
-        )
-        .await
-        {
+        let proxy = match zbus::Proxy::new(&conn, DBUS_NAME, DBUS_PATH, DBUS_IFACE).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("Failed to create D-Bus proxy for clipboard bridge: {}", e);
@@ -156,7 +185,6 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
             }
         };
 
-        // Subscribe to the ClipboardChanged signal
         let mut stream = match proxy.receive_signal("ClipboardChanged").await {
             Ok(s) => s,
             Err(e) => {
@@ -175,31 +203,41 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 break;
             }
 
-            match stream.next().await {
-                Some(msg) => {
-                    if let Ok(text) = msg.body().deserialize::<String>() {
-                        if !text.is_empty() {
-                            let current_content = ClipboardContent::Text(text);
+            tokio::select! {
+                _ = cancel_task.notified() => {
+                    tracing::info!("GNOME clipboard monitor cancelled, exiting.");
+                    break;
+                }
+                next = stream.next() => {
+                    match next {
+                        Some(msg) => {
+                            if let Ok(text) = msg.body().deserialize::<String>() {
+                                if !text.is_empty() {
+                                    let current_content = ClipboardContent::Text(text);
 
-                            if common::should_process_content(&current_content, &last_content) {
-                                last_content = current_content.clone();
-                                common::process_clipboard_change(
-                                    current_content,
-                                    &app_handle,
-                                    &state,
-                                    &transport,
-                                );
-                            } else {
-                                last_content = current_content;
+                                    if common::should_process_content(&current_content, &last_content) {
+                                        last_content = current_content.clone();
+                                        common::process_clipboard_change(
+                                            current_content,
+                                            &app_handle,
+                                            &state,
+                                            &transport,
+                                        );
+                                    } else {
+                                        last_content = current_content;
+                                    }
+                                }
                             }
                         }
+                        None => {
+                            tracing::warn!("D-Bus clipboard signal stream ended");
+                            break;
+                        }
                     }
-                }
-                None => {
-                    tracing::warn!("D-Bus clipboard signal stream ended");
-                    break;
                 }
             }
         }
     });
+
+    cancel
 }
