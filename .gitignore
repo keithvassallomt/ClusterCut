@@ -31,7 +31,7 @@ build-dir/
 .flatpak-shared-modules/
 
 # Extension build
-clustercut-extension.zip
+clustercut@keithvassallo.com.shell-extension.zip
 .venv-shexli/
 .venv-flatpak/
 

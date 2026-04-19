@@ -167,7 +167,7 @@ release output_dir="~/Downloads":
 clean:
     rm -rf src-tauri/target
     rm -rf build-dir
-    rm -f clustercut-extension.zip
+    rm -f clustercut@keithvassallo.com.shell-extension.zip
     rm -f dist/*.flatpak
     rm -rf .flatpak-builder
     rm -rf .flatpak-staging
@@ -178,8 +178,8 @@ extension-zip:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Building GNOME Extension ZIP..."
-    rm -f clustercut-extension.zip
-    (cd gnome-extension && zip -r ../clustercut-extension.zip . -x "*.png" >/dev/null)
+    rm -f clustercut@keithvassallo.com.shell-extension.zip
+    (cd gnome-extension && zip -r ../clustercut@keithvassallo.com.shell-extension.zip . -x "*.png" >/dev/null)
 
     # EGO now requires extensions pass shexli before publish. Cache the venv so
     # we don't reinstall shexli on every zip build.
@@ -191,13 +191,13 @@ extension-zip:
     pip install -q -U shexli
 
     echo "==> Validating with shexli..."
-    if ! shexli clustercut-extension.zip; then
-        rm -f clustercut-extension.zip
+    if ! shexli clustercut@keithvassallo.com.shell-extension.zip; then
+        rm -f clustercut@keithvassallo.com.shell-extension.zip
         echo "ERROR: shexli validation failed; zip removed."
         exit 1
     fi
 
-    echo "Done: clustercut-extension.zip"
+    echo "Done: clustercut@keithvassallo.com.shell-extension.zip"
 
 # Build and export a local Flatpak bundle for testing
 flatpak output_dir="~/Downloads":

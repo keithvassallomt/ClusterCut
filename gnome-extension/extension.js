@@ -1,3 +1,6 @@
+// ClusterCut GNOME Shell extension.
+// Bridges the Wayland clipboard to the ClusterCut app over D-Bus (St.Clipboard
+// read/write is required for Wayland — see EGO-A-005 manual review note).
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
