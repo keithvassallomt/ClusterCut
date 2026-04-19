@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - User-facing notifications when clipboard sync transitions between active and paused on GNOME Wayland.
 - Cold-start notification on GNOME Wayland when the app launches without a working extension (missing, disabled, or outdated), so the user isn't left wondering why clipboard sync isn't working.
 - GNOME Wayland: file-copy sync. Copying a file in Nautilus now syncs to other peers, and files received from peers paste cleanly into Nautilus as file copies (not text).
+- GNOME: ClusterCut now reports its sync mode ("Auto", "Auto Send", "Auto Receive", "Auto Disabled") in the Background Apps list via the `org.freedesktop.portal.Background` portal, matching the extension's Quick Settings subtitle.
+- `just extension-zip` now validates the generated zip with EGO's `shexli` tool before leaving it on disk; the zip is removed if validation fails.
 
 ### Fixed
 - Wayland (all compositors): file pastes are now advertised with both `text/uri-list` and `x-special/gnome-copied-files`, so GTK file managers recognise them as file pastes instead of plain text.

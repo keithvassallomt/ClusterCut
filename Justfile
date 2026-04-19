@@ -43,6 +43,35 @@ bump-version:
 build:
     npm run tauri build
 
+# Linux dev setup: install tray icon + GNOME extension into user share dirs (tauri dev only; packaging installs these automatically).
+dev-setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "$(uname -s)" != "Linux" ]; then
+        echo "dev-setup is Linux-only; skipping."
+        exit 0
+    fi
+
+    # 1. Tray icon — Rust/libappindicator looks it up by name from the system icon theme.
+    TRAY_DEST="${HOME}/.local/share/icons/hicolor/scalable/status"
+    mkdir -p "${TRAY_DEST}"
+    install -m 0644 "assets/Tray Icons/svg/clustercut-tray-symbolic.svg" \
+        "${TRAY_DEST}/app.clustercut.clustercut-tray-symbolic.svg"
+    echo "Installed tray icon to ${TRAY_DEST}/app.clustercut.clustercut-tray-symbolic.svg"
+
+    # 2. GNOME extension — copy (not symlink) so gnome-shell treats it as a normal install.
+    EXT_UUID="clustercut@keithvassallo.com"
+    EXT_DEST="${HOME}/.local/share/gnome-shell/extensions/${EXT_UUID}"
+    mkdir -p "${EXT_DEST}"
+    cp -r gnome-extension/. "${EXT_DEST}/"
+    echo "Installed GNOME extension to ${EXT_DEST}"
+
+    echo ""
+    echo "Next steps:"
+    echo "  - Restart the dev app (npm run tauri dev) to pick up the tray icon."
+    echo "  - Log out and log back in (GNOME Wayland can't live-reload extensions)."
+    echo "    Then: gnome-extensions enable ${EXT_UUID}"
+
 # Build a release: sync version, commit, tag, build native packages (+flatpak on Linux), copy to output dir
 release output_dir="~/Downloads":
     #!/usr/bin/env bash
@@ -144,11 +173,31 @@ clean:
     rm -rf .flatpak-staging
     rm -rf .flatpak-shared-modules
 
-# Build the GNOME Extension ZIP
+# Build the GNOME Extension ZIP, validated by EGO's shexli checker.
 extension-zip:
-    @echo "Building GNOME Extension ZIP..."
-    rm -f clustercut-extension.zip && cd gnome-extension && zip -r ../clustercut-extension.zip . -x "*.png"
-    @echo "Done: clustercut-extension.zip"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building GNOME Extension ZIP..."
+    rm -f clustercut-extension.zip
+    (cd gnome-extension && zip -r ../clustercut-extension.zip . -x "*.png" >/dev/null)
+
+    # EGO now requires extensions pass shexli before publish. Cache the venv so
+    # we don't reinstall shexli on every zip build.
+    if [ ! -d .venv-shexli ]; then
+        echo "==> Creating shexli virtualenv..."
+        python3 -m venv .venv-shexli
+    fi
+    . .venv-shexli/bin/activate
+    pip install -q -U shexli
+
+    echo "==> Validating with shexli..."
+    if ! shexli clustercut-extension.zip; then
+        rm -f clustercut-extension.zip
+        echo "ERROR: shexli validation failed; zip removed."
+        exit 1
+    fi
+
+    echo "Done: clustercut-extension.zip"
 
 # Build and export a local Flatpak bundle for testing
 flatpak output_dir="~/Downloads":

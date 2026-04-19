@@ -3,6 +3,52 @@ use tauri::{Emitter, Listener, Manager};
 use zbus::interface;
 use zbus::object_server::SignalContext;
 
+#[cfg(target_os = "linux")]
+const PORTAL_NAME: &str = "org.freedesktop.portal.Desktop";
+#[cfg(target_os = "linux")]
+const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+#[cfg(target_os = "linux")]
+const PORTAL_IFACE: &str = "org.freedesktop.portal.Background";
+
+/// Status text shown under ClusterCut in GNOME's Background Apps list.
+/// Matches the QuickMenuToggle subtitle wording from the extension so the two
+/// surfaces stay in sync.
+#[cfg(target_os = "linux")]
+fn background_status_text(auto_send: bool, auto_receive: bool) -> &'static str {
+    match (auto_send, auto_receive) {
+        (true, true) => "Auto",
+        (true, false) => "Auto Send",
+        (false, true) => "Auto Receive",
+        (false, false) => "Auto Disabled",
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn set_background_status(conn: &zbus::Connection, message: &str) {
+    use std::collections::HashMap;
+    use zbus::zvariant::Value;
+
+    let mut options: HashMap<&str, Value<'_>> = HashMap::new();
+    options.insert("message", Value::from(message.to_string()));
+
+    let result = conn
+        .call_method(
+            Some(PORTAL_NAME),
+            PORTAL_PATH,
+            Some(PORTAL_IFACE),
+            "SetStatus",
+            &(options,),
+        )
+        .await;
+
+    if let Err(e) = result {
+        // Portal isn't always available (no xdg-desktop-portal, or app-id not
+        // registered — typical in `tauri dev` without a .desktop file). Log and
+        // move on; this is a nice-to-have, not a required capability.
+        tracing::debug!("Background portal SetStatus failed: {}", e);
+    }
+}
+
 pub struct ClusterCutDBus {
     app_handle: tauri::AppHandle,
 }
@@ -76,6 +122,17 @@ pub async fn start_dbus_server(app_handle: tauri::AppHandle) -> zbus::Result<()>
         .build()
         .await?;
 
+    // Publish initial Background Apps status (Linux only).
+    #[cfg(target_os = "linux")]
+    {
+        let (auto_send, auto_receive) = {
+            let state = app_handle.state::<AppState>();
+            let s = state.settings.lock().unwrap();
+            (s.auto_send, s.auto_receive)
+        };
+        set_background_status(&conn, background_status_text(auto_send, auto_receive)).await;
+    }
+
     // Clone for the closure
     let dbus_conn = conn.clone();
 
@@ -94,6 +151,13 @@ pub async fn start_dbus_server(app_handle: tauri::AppHandle) -> zbus::Result<()>
                         &(payload.auto_send, payload.auto_receive),
                     )
                     .await;
+
+                #[cfg(target_os = "linux")]
+                set_background_status(
+                    &conn,
+                    background_status_text(payload.auto_send, payload.auto_receive),
+                )
+                .await;
             });
         }
     });

@@ -32,6 +32,7 @@ build-dir/
 
 # Extension build
 clustercut-extension.zip
+.venv-shexli/
 
 # macOS signing credentials
 .env

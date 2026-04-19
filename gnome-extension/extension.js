@@ -29,10 +29,8 @@ const DBUS_IFACE = `
   </interface>
 </node>`;
 
-// D-Bus interface for clipboard bridging (Wayland).
-// Interface is intentionally versioned (.Clipboard2) so the Rust side's
-// is_available() probe cannot be fooled by an older extension that only
-// speaks the legacy text-only Clipboard interface.
+// Versioned .Clipboard2 so the Rust is_available() probe can't be fooled by an
+// older extension that only speaks the legacy text-only Clipboard interface.
 const CLIPBOARD_DBUS_IFACE = `
 <node>
   <interface name="app.clustercut.clustercut.Clipboard2">
@@ -65,7 +63,6 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
         super._init();
         this._extensionObject = extensionObject;
 
-        // Initialize proxy class wrapper here instead of top-level
         this._ProxyClass = Gio.DBusProxy.makeProxyWrapper(DBUS_IFACE);
 
         this._toggle = new QuickSettings.QuickMenuToggle({
@@ -73,14 +70,12 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
             toggleMode: true,
         });
 
-        // Set default/fallback initially to avoid blocking
         this._toggle.iconName = 'edit-paste-symbolic';
         this._toggle.subtitle = 'Searching...';
         this._toggle.checked = false;
 
         this._checkIcon(extensionObject.path);
 
-        // Add to the indicator's list
         this.quickSettingsItems.push(this._toggle);
 
         this._proxy = new this._ProxyClass(
@@ -88,9 +83,7 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
             'app.clustercut.clustercut',
             '/org/gnome/Shell/Extensions/ClusterCut',
             (proxy, error) => {
-                if (error) {
-                    // console.error('ClusterCut: Proxy creation failed', error);
-                } else {
+                if (!error) {
                     this._proxySignalId = this._proxy.connectSignal('StateChanged', (proxy, senderName, [autoSend, autoReceive]) => {
                          this._updateInternalState(autoSend, autoReceive);
                     });
@@ -98,29 +91,25 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
             }
         );
 
-        // Watch for the App on D-Bus
         this._appRunning = false;
         this._watchId = Gio.bus_watch_name(
             Gio.BusType.SESSION,
             'app.clustercut.clustercut',
             Gio.BusNameWatcherFlags.NONE,
             (conn, name, owner) => {
-                // console.log(`ClusterCut: Connected to ${owner}`);
                 this._appRunning = true;
                 this._toggle.subtitle = 'Syncing...';
                 this._toggle.reactive = true;
                 this._updateState();
             },
             (conn, name) => {
-                // console.log('ClusterCut: App Lost/Not Found');
                 this._appRunning = false;
                 this._toggle.subtitle = 'Not running';
                 this._toggle.checked = false;
-                this._toggle.reactive = true; 
+                this._toggle.reactive = true;
             }
         );
 
-        // Connect Toggle Click
         this._toggle.connectObject('clicked', () => {
              if (!this._appRunning) {
                  this._toggle.subtitle = 'Not running';
@@ -129,25 +118,21 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
 
              if (!this._proxy) return;
 
-             // We just toggle, ignoring the specific checked state because the methods are Toggles
              this._proxy.ToggleAutoSendRemote((res, err) => {
                   if (!err) {
                        this._proxy.ToggleAutoReceiveRemote((r, e) => {
                            this._updateState();
                        });
-                  } else {
-                      // console.error('ClusterCut: ToggleAutoSend failed', err);
                   }
              });
         }, this);
 
-        // Add Menu Items
         this._toggle.menu.addAction('Show Window', () => {
             if (this._appRunning && this._proxy) this._proxy.ShowWindowRemote();
             Main.overview.hide();
             Main.panel.closeQuickSettings();
         });
-        
+
         this._autoSendItem = this._toggle.menu.addAction('Enable Auto-Send', () => {
              if (this._appRunning && this._proxy) {
                  this._proxy.ToggleAutoSendRemote((result, error) => {
@@ -172,18 +157,16 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
     async _checkIcon(extensionPath) {
         const iconPath = extensionPath + '/icons/hicolor/symbolic/apps/clustercut-symbolic.svg';
         const iconFile = Gio.File.new_for_path(iconPath);
-        
+
         try {
-            // Async check using query_info_async
             await iconFile.query_info_async(Gio.FILE_ATTRIBUTE_STANDARD_NAME, Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null);
-            
-            // If we get here, file exists
+
             if (this._toggle) {
                  const gicon = new Gio.FileIcon({ file: iconFile });
                  this._toggle.gicon = gicon;
             }
         } catch (e) {
-            // File likely doesn't exist or other error, fallback remains 'edit-paste-symbolic'
+            // fallback remains 'edit-paste-symbolic'
         }
     }
 
@@ -191,15 +174,14 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
         if (!this._toggle) return;
 
         this._toggle.set({ checked: autoSend && autoReceive });
-        
-        // Update Menu Labels
+
         if (this._autoSendItem && this._autoSendItem.label) {
             this._autoSendItem.label.text = autoSend ? 'Disable Auto-Send' : 'Enable Auto-Send';
         }
         if (this._autoReceiveItem && this._autoReceiveItem.label) {
             this._autoReceiveItem.label.text = autoReceive ? 'Disable Auto-Receive' : 'Enable Auto-Receive';
         }
-        
+
         let text = '';
         if (autoSend && autoReceive) {
             text = 'Auto';
@@ -210,44 +192,32 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
         } else {
             text = 'Auto Disabled';
         }
-        
+
         this._toggle.subtitle = text;
     }
 
     _updateState() {
         if (!this._proxy || !this._appRunning) {
-             return; // Silent return to avoid log spam
+             return;
         }
 
         this._proxy.GetStateRemote((result, error) => {
             if (error) {
-                // console.error('ClusterCut: GetStateRemote failed', error);
                 return;
             }
-            if (result) {
-                // With two 'out' args, result should be [val1, val2]
-                let autoSend = false;
-                let autoReceive = false;
-                
-                if (Array.isArray(result) && result.length >= 2) {
-                     autoSend = result[0];
-                     autoReceive = result[1];
-                } else {
-                    // console.error('ClusterCut: Unexpected result format' + JSON.stringify(result));
-                }
-                
-                this._updateInternalState(autoSend, autoReceive);
+            if (result && Array.isArray(result) && result.length >= 2) {
+                this._updateInternalState(result[0], result[1]);
             }
         });
     }
-    
+
     destroy() {
         if (this._watchId) {
             Gio.bus_unwatch_name(this._watchId);
             this._watchId = 0;
         }
 
-        // Clean up proxy signal (D-Bus proxy signal, not GObject — must use disconnectSignal)
+        // D-Bus proxy signals are not GObject signals — must use disconnectSignal.
         if (this._proxySignalId && this._proxy) {
             this._proxy.disconnectSignal(this._proxySignalId);
             this._proxySignalId = null;
@@ -273,7 +243,6 @@ export default class ClusterCutExtension extends Extension {
         this._indicator = new ClusterCutIndicator(this);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
 
-        // Start clipboard bridge D-Bus service
         this._startClipboardBridge();
     }
 
@@ -292,24 +261,20 @@ export default class ClusterCutExtension extends Extension {
     _startClipboardBridge() {
         this._lastClipboardText = '';
         this._lastFilesKey = '';
-        // Deadline (in GLib monotonic microseconds) before which owner-changed
-        // events are ignored. Using a deadline instead of a one-shot bool handles
-        // the case where a WriteFiles call (which writes two MIMEs) triggers the
-        // GNOME Shell selection owner to fire owner-changed more than once.
+        // GLib monotonic-time deadline. A one-shot bool doesn't work here because
+        // a WriteFiles call writes two MIMEs and fires owner-changed more than once.
         this._ignoreUntil = 0;
 
-        // Export the clipboard D-Bus interface
         this._clipboardDbusId = Gio.DBus.session.register_object(
             '/org/gnome/Shell/Extensions/ClusterCut',
             ClipboardBridgeIface.interfaces[0],
             (connection, sender, objectPath, interfaceName, methodName, parameters, invocation) => {
                 this._handleClipboardMethod(methodName, parameters, invocation);
             },
-            null, // get_property
-            null  // set_property
+            null,
+            null
         );
 
-        // Monitor clipboard changes via Meta.Selection
         const selection = global.display.get_selection();
         selection.connectObject(
             'owner-changed',
@@ -337,8 +302,6 @@ export default class ClusterCutExtension extends Extension {
     }
 
     _suppressNextChanges() {
-        // Swallow owner-changed events for the next 500 ms (covers multiple
-        // emissions from a single multi-MIME write).
         this._ignoreUntil = GLib.get_monotonic_time() + 500000;
     }
 
@@ -351,19 +314,14 @@ export default class ClusterCutExtension extends Extension {
             return;
         }
 
-        // NOTE: St.Clipboard.get_mimetypes is SYNCHRONOUS and returns the list
-        // directly; it is NOT callback-style like get_text / get_content. An
-        // earlier version of this file passed a callback here and silently did
-        // nothing on every clipboard change.
+        // St.Clipboard.get_mimetypes is SYNCHRONOUS — passing a callback here
+        // silently does nothing because the closure becomes the user_data arg.
         const clipboard = St.Clipboard.get_default();
         const mimetypes = clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD);
         if (!mimetypes || mimetypes.length === 0) {
             return;
         }
 
-        // Priority: file URIs > plain text. Image bytes and other MIME
-        // payloads are intentionally ignored — ClusterCut only syncs
-        // files-as-files today.
         const hasUris = mimetypes.includes('text/uri-list')
             || mimetypes.includes('x-special/gnome-copied-files');
 
@@ -456,10 +414,8 @@ export default class ClusterCutExtension extends Extension {
 
         const clipboard = St.Clipboard.get_default();
 
-        // Nautilus and other GTK file managers primarily look for
-        // x-special/gnome-copied-files to decide whether Paste means
-        // "paste files" vs "paste text". We advertise both MIMEs so
-        // the target app picks whichever it understands.
+        // Write both MIMEs: Nautilus/GTK file managers key on
+        // x-special/gnome-copied-files to decide "paste file" vs "paste text".
         const uriListText = uris.join('\n') + '\n';
         const gnomeCopiedText = 'copy\n' + uris.join('\n');
 
