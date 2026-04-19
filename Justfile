@@ -215,12 +215,19 @@ flatpak output_dir="~/Downloads":
         git clone --depth 1 https://github.com/flathub/shared-modules.git .flatpak-shared-modules
     fi
     ln -s "$(pwd)/.flatpak-shared-modules" "${STAGING}/shared-modules"
+    # Generator scripts need aiohttp / PyYAML / tomlkit — install into a cached venv.
+    if [ ! -d .venv-flatpak ]; then
+        echo "Creating flatpak tooling virtualenv..."
+        python3 -m venv .venv-flatpak
+        .venv-flatpak/bin/pip install -q -U pip aiohttp PyYAML tomlkit
+    fi
+    PY=.venv-flatpak/bin/python3
     # Generate sources into staging
     echo "Generating Cargo sources..."
-    python3 src-tauri/flatpak/builder-tools/cargo/flatpak-cargo-generator.py src-tauri/Cargo.lock -o "${STAGING}/cargo-sources.json"
+    "${PY}" src-tauri/flatpak/builder-tools/cargo/flatpak-cargo-generator.py src-tauri/Cargo.lock -o "${STAGING}/cargo-sources.json"
     echo "Generating Node sources..."
     export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/src-tauri/flatpak/builder-tools/node"
-    python3 -m flatpak_node_generator npm package-lock.json -o "${STAGING}/node-sources.json"
+    "${PY}" -m flatpak_node_generator npm package-lock.json -o "${STAGING}/node-sources.json"
     # Build and install
     echo "Building Flatpak..."
     flatpak-builder --user --install --force-clean build-dir "${STAGING}/app.clustercut.clustercut.yml"
@@ -268,12 +275,19 @@ friendlyhub-update submission_dir="/home/keith/LocalCode/keithvassallomt/app.clu
     # Copy the metainfo manifest
     echo "Copying metainfo manifest..."
     cp "${METAINFO}" "{{submission_dir}}/"
+    # Generator scripts need aiohttp / PyYAML / tomlkit — install into a cached venv.
+    if [ ! -d .venv-flatpak ]; then
+        echo "Creating flatpak tooling virtualenv..."
+        python3 -m venv .venv-flatpak
+        .venv-flatpak/bin/pip install -q -U pip aiohttp PyYAML tomlkit
+    fi
+    PY=.venv-flatpak/bin/python3
     # Generate sources into submission dir
     echo "Generating Cargo sources..."
-    python3 src-tauri/flatpak/builder-tools/cargo/flatpak-cargo-generator.py src-tauri/Cargo.lock -o "{{submission_dir}}/cargo-sources.json"
+    "${PY}" src-tauri/flatpak/builder-tools/cargo/flatpak-cargo-generator.py src-tauri/Cargo.lock -o "{{submission_dir}}/cargo-sources.json"
     echo "Generating Node sources..."
     export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/src-tauri/flatpak/builder-tools/node"
-    python3 -m flatpak_node_generator npm package-lock.json -o "{{submission_dir}}/node-sources.json"
+    "${PY}" -m flatpak_node_generator npm package-lock.json -o "{{submission_dir}}/node-sources.json"
     echo ""
     echo "============================================"
     echo " FriendlyHub submission prepared!"
