@@ -1,6 +1,8 @@
 pub mod common;
 mod plugin;
 
+use crate::protocol::ClipboardBlob;
+
 #[cfg(target_os = "linux")]
 mod wayland;
 #[cfg(target_os = "linux")]
@@ -136,6 +138,31 @@ pub fn set_clipboard_paths(app: &AppHandle, paths: Vec<String>) {
             ClipboardBackend::Degraded => {
                 tracing::warn!(
                     "Clipboard file write attempted in degraded mode — no backend available"
+                );
+            }
+        }
+    }
+}
+
+/// Place an image blob (typically `image/png`) on the local clipboard so the
+/// user can paste it in any app. Wired up across all four backends; the GNOME
+/// extension path requires extension v4.0 or newer — older extensions return
+/// UnknownMethod and the write fails gracefully.
+pub fn set_clipboard_image(app: &AppHandle, blob: ClipboardBlob) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        plugin::set_clipboard_image(app, blob);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match get_backend() {
+            ClipboardBackend::Plugin => plugin::set_clipboard_image(app, blob),
+            ClipboardBackend::WlrDataControl => wayland::set_clipboard_image(app, blob),
+            ClipboardBackend::GnomeExtension => dbus_clipboard::set_clipboard_image(app, blob),
+            ClipboardBackend::Degraded => {
+                tracing::warn!(
+                    "Clipboard image write attempted in degraded mode — no backend available"
                 );
             }
         }

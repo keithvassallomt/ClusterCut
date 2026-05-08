@@ -3,6 +3,7 @@
 ///
 /// Uses polling with get_contents (not subprocess spawning), so no flickering.
 use super::common::{self, ClipboardContent};
+use crate::protocol::ClipboardBlob;
 use crate::state::AppState;
 use crate::transport::Transport;
 use std::io::Read;
@@ -11,8 +12,25 @@ use std::time::Duration;
 use tauri::AppHandle;
 use wl_clipboard_rs::copy::{MimeSource, MimeType as CopyMimeType, Options as CopyOptions, Source};
 use wl_clipboard_rs::paste::{
-    get_contents, ClipboardType, Error as PasteError, MimeType as PasteMimeType, Seat,
+    get_contents, get_mime_types, ClipboardType, Error as PasteError,
+    MimeType as PasteMimeType, Seat,
 };
+
+/// Hard cap on bytes we'll read from the clipboard for an image probe.
+/// A 4K uncompressed BMP is ~33 MB; 64 MB is generous headroom.
+const MAX_CLIPBOARD_IMAGE_READ_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Image MIME types we know how to decode, in preference order.
+/// PNG first because it's lossless and the most commonly offered by browsers.
+const IMAGE_MIME_PRIORITY: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/bmp",
+    "image/x-bmp",
+    "image/tiff",
+    "image/gif",
+];
 
 /// Check if wlr-data-control is available by attempting a paste.
 pub fn is_available() -> bool {
@@ -65,9 +83,63 @@ fn read_clipboard_files() -> Option<Vec<String>> {
     }
 }
 
+/// Read an image from the clipboard if one is offered, decode it, and re-encode
+/// to PNG so peers receive a uniform wire format. Returns None if no image MIME
+/// is offered, the data couldn't be decoded, or the encoded blob exceeds the
+/// wire-size cap.
+fn read_clipboard_image() -> Option<ClipboardBlob> {
+    let offered = match get_mime_types(ClipboardType::Regular, Seat::Unspecified) {
+        Ok(set) => set,
+        Err(_) => return None,
+    };
+
+    let mime = IMAGE_MIME_PRIORITY
+        .iter()
+        .copied()
+        .find(|m| offered.contains(*m))?;
+
+    let mut pipe = match get_contents(
+        ClipboardType::Regular,
+        Seat::Unspecified,
+        PasteMimeType::Specific(mime),
+    ) {
+        Ok((p, _)) => p,
+        Err(e) => {
+            tracing::debug!("clipboard image read failed for {}: {}", mime, e);
+            return None;
+        }
+    };
+
+    // Read with a hard cap so a runaway source can't exhaust memory.
+    let mut buf = Vec::new();
+    if (&mut pipe)
+        .take(MAX_CLIPBOARD_IMAGE_READ_BYTES + 1)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return None;
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    if buf.len() as u64 > MAX_CLIPBOARD_IMAGE_READ_BYTES {
+        tracing::warn!(
+            "Clipboard {} exceeds {} byte read cap; skipping.",
+            mime,
+            MAX_CLIPBOARD_IMAGE_READ_BYTES
+        );
+        return None;
+    }
+
+    common::normalize_image_blob_from_bytes(buf, mime)
+}
+
 fn read_clipboard() -> ClipboardContent {
     if let Some(files) = read_clipboard_files() {
         return ClipboardContent::Files(files);
+    }
+    if let Some(blob) = read_clipboard_image() {
+        return ClipboardContent::Image(blob);
     }
     if let Some(text) = read_clipboard_text() {
         return ClipboardContent::Text(text);
@@ -124,12 +196,25 @@ fn write_files(_app: &AppHandle, files: Vec<String>) -> Result<(), String> {
         .map_err(|e| format!("wl-clipboard-rs copy files failed: {}", e))
 }
 
+fn write_image(_app: &AppHandle, blob: &ClipboardBlob) -> Result<(), String> {
+    let opts = CopyOptions::new();
+    opts.copy(
+        Source::Bytes(blob.data.clone().into()),
+        CopyMimeType::Specific(blob.mime_type.clone()),
+    )
+    .map_err(|e| format!("wl-clipboard-rs copy image failed: {}", e))
+}
+
 pub fn set_clipboard(app: &AppHandle, text: String) {
     common::set_clipboard_with_ignore(app, text, write_text);
 }
 
 pub fn set_clipboard_paths(app: &AppHandle, paths: Vec<String>) {
     common::set_clipboard_paths_with_ignore(app, paths, write_files);
+}
+
+pub fn set_clipboard_image(app: &AppHandle, blob: ClipboardBlob) {
+    common::set_clipboard_blob_with_ignore(app, blob, write_image);
 }
 
 pub fn read_text(_app: &AppHandle) -> Result<String, String> {

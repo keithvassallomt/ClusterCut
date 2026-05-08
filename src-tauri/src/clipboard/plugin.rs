@@ -1,8 +1,16 @@
 /// Clipboard backend using tauri-plugin-clipboard.
 /// Used on macOS, Windows, and X11 on Linux.
+///
+/// Image clipboard data (PNG, JPEG, etc. that apps put on the clipboard as
+/// raw bytes — e.g. "Copy Image" in a browser) is handled in parallel via
+/// `arboard` because tauri-plugin-clipboard only exposes text and file reads.
+/// The two crates run side-by-side on the same monitor thread; reads on all
+/// three platforms (X11, Windows, macOS) are non-destructive, so the
+/// existing text/file paths are unaffected if arboard is disabled or fails.
 use super::common::{
     self, ClipboardContent, IGNORED_CONTENT,
 };
+use crate::protocol::ClipboardBlob;
 use crate::state::AppState;
 use crate::transport::Transport;
 use std::time::Duration;
@@ -10,7 +18,109 @@ use std::{thread, sync::mpsc};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard::Clipboard;
 
-fn read_clipboard(app: &AppHandle) -> ClipboardContent {
+/// Cap on RGBA bytes returned by arboard. A 4K image is ~33 MB; 200 MB
+/// covers up to ~7K screenshots without risking absurd allocations.
+const MAX_CLIPBOARD_IMAGE_RGBA_BYTES: usize = 200 * 1024 * 1024;
+/// Wire-format size cap. PNG-encoded blobs over this are dropped on send.
+const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Try to pull an image from the clipboard via arboard, encode to PNG, and
+/// return it as a `ClipboardBlob`. Returns `None` for any failure mode —
+/// arboard returns `Err` when no image is offered, which is the common case.
+fn read_clipboard_image_arboard(arboard: &mut arboard::Clipboard) -> Option<ClipboardBlob> {
+    let img = match arboard.get_image() {
+        Ok(i) => i,
+        Err(arboard::Error::ContentNotAvailable) => return None,
+        Err(e) => {
+            tracing::debug!("arboard get_image failed: {}", e);
+            return None;
+        }
+    };
+
+    let width = img.width as u32;
+    let height = img.height as u32;
+
+    if img.bytes.len() > MAX_CLIPBOARD_IMAGE_RGBA_BYTES {
+        tracing::warn!(
+            "Clipboard image RGBA buffer ({} bytes) exceeds {} byte cap; skipping.",
+            img.bytes.len(),
+            MAX_CLIPBOARD_IMAGE_RGBA_BYTES
+        );
+        return None;
+    }
+
+    let rgba = match image::RgbaImage::from_raw(width, height, img.bytes.into_owned()) {
+        Some(r) => r,
+        None => {
+            tracing::warn!(
+                "Clipboard image dims/bytes mismatch (w={}, h={}); skipping.",
+                width,
+                height
+            );
+            return None;
+        }
+    };
+
+    let mut png_bytes = Vec::new();
+    if let Err(e) = image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+    {
+        tracing::warn!("Failed to PNG-encode clipboard image: {}", e);
+        return None;
+    }
+
+    if png_bytes.len() > MAX_CLIPBOARD_IMAGE_WIRE_BYTES {
+        tracing::warn!(
+            "Clipboard image PNG ({} bytes) exceeds {} byte wire cap; skipping.",
+            png_bytes.len(),
+            MAX_CLIPBOARD_IMAGE_WIRE_BYTES
+        );
+        return None;
+    }
+
+    Some(ClipboardBlob {
+        mime_type: "image/png".to_string(),
+        data: png_bytes,
+        width: Some(width),
+        height: Some(height),
+    })
+}
+
+/// Decode a PNG blob into RGBA and hand it to arboard, which writes the
+/// platform-canonical formats (CF_DIB/CF_DIBV5 on Windows; NSPasteboardTypePNG
+/// + NSPasteboardTypeTIFF on macOS; image/png on X11).
+fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Result<(), String> {
+    let format = match blob.mime_type.as_str() {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/webp" => image::ImageFormat::WebP,
+        "image/bmp" | "image/x-bmp" => image::ImageFormat::Bmp,
+        "image/tiff" => image::ImageFormat::Tiff,
+        "image/gif" => image::ImageFormat::Gif,
+        other => return Err(format!("unsupported clipboard image MIME: {}", other)),
+    };
+
+    let decoded = image::load_from_memory_with_format(&blob.data, format)
+        .map_err(|e| format!("decode clipboard image: {}", e))?;
+    let rgba = decoded.into_rgba8();
+    let width = rgba.width() as usize;
+    let height = rgba.height() as usize;
+    let img_data = arboard::ImageData {
+        width,
+        height,
+        bytes: rgba.into_raw().into(),
+    };
+
+    let mut clip = arboard::Clipboard::new()
+        .map_err(|e| format!("arboard init failed: {}", e))?;
+    clip.set_image(img_data)
+        .map_err(|e| format!("arboard set_image failed: {}", e))
+}
+
+fn read_clipboard(
+    app: &AppHandle,
+    arboard_opt: Option<&mut arboard::Clipboard>,
+) -> ClipboardContent {
     let clip = app.state::<Clipboard>();
 
     match clip.read_files() {
@@ -20,6 +130,15 @@ fn read_clipboard(app: &AppHandle) -> ClipboardContent {
             }
         }
         Err(_) => {}
+    }
+
+    // Image probe sits between files and text so the canonical "Copy Image"
+    // browser case is caught (no uri-list, no useful text), while the
+    // existing "Copy a file" flow that does emit uri-list still wins above.
+    if let Some(arb) = arboard_opt {
+        if let Some(blob) = read_clipboard_image_arboard(arb) {
+            return ClipboardContent::Image(blob);
+        }
     }
 
     match clip.read_text() {
@@ -105,6 +224,10 @@ pub fn set_clipboard_paths(app: &AppHandle, paths: Vec<String>) {
     common::set_clipboard_paths_with_ignore(app, paths, write_files);
 }
 
+pub fn set_clipboard_image(app: &AppHandle, blob: ClipboardBlob) {
+    common::set_clipboard_blob_with_ignore(app, blob, write_clipboard_image_arboard);
+}
+
 /// Read clipboard text directly (for manual send shortcut).
 pub fn read_text(app: &AppHandle) -> Result<String, String> {
     app.state::<Clipboard>()
@@ -125,8 +248,22 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
 
     // Worker Thread
     thread::spawn(move || {
+        // Init arboard once for the lifetime of the worker thread. If init
+        // fails (e.g. no X server), image clipboard reads are silently
+        // disabled — text and file paths still work via tauri-plugin-clipboard.
+        let mut arboard_clip: Option<arboard::Clipboard> = match arboard::Clipboard::new() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(
+                    "arboard init failed; clipboard image reads disabled: {}",
+                    e
+                );
+                None
+            }
+        };
+
         while cmd_rx.recv().is_ok() {
-            let content = read_clipboard(&app_handle_worker);
+            let content = read_clipboard(&app_handle_worker, arboard_clip.as_mut());
             if res_tx.send(content).is_err() {
                 break;
             }
@@ -177,6 +314,7 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                     // Content didn't change from an ignored echo perspective
                 } else if matches!(&*ignored, ClipboardContent::Text(t) if matches!(&current_content, ClipboardContent::Text(c) if c == t))
                     || matches!(&*ignored, ClipboardContent::Files(f) if matches!(&current_content, ClipboardContent::Files(c) if c == f))
+                    || matches!(&*ignored, ClipboardContent::Image(b) if matches!(&current_content, ClipboardContent::Image(c) if c == b))
                 {
                     last_content = current_content;
                 }

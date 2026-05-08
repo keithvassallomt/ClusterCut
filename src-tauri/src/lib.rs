@@ -1679,6 +1679,7 @@ async fn send_clipboard(
         sender: hostname,
         sender_id: local_id,
         files: None,
+        blob: None,
     };
 
     // Emit local event so history updates
@@ -1817,11 +1818,15 @@ async fn confirm_pending_clipboard(
 
     if let Some(payload) = pending_opt {
         tracing::info!("Confirming pending clipboard from {}", payload.sender);
-        clipboard::set_clipboard(&app_handle, payload.text.clone());
-        
+        if let Some(blob) = payload.blob.clone() {
+            clipboard::set_clipboard_image(&app_handle, blob);
+        } else {
+            clipboard::set_clipboard(&app_handle, payload.text.clone());
+        }
+
         // Emit change event so history updates
         let _ = app_handle.emit("clipboard-change", &payload);
-        
+
         Ok(())
     } else {
         Err("No pending clipboard content".to_string())
@@ -2964,6 +2969,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                             sender: "Unknown (Legacy)".to_string(),
                                             sender_id: "unknown".to_string(),
                                             files: None,
+                                            blob: None,
                                         }
                                     )
                             } else {
@@ -3051,6 +3057,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 id: id.clone(),
                                 text: text.clone(),
                                 files: payload.files.clone(),
+                                blob: payload.blob.clone(),
                                 timestamp: ts,
                                 sender: sender.clone(),
                                 sender_id: payload.sender_id.clone(),
@@ -3120,6 +3127,27 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                     } // End if !enable_ft else
                                 } // End if !files.is_empty()
                             } // End if let Some(files)
+
+                            // BLOB HANDLING (image clipboard data)
+                            if let Some(blob) = payload_obj.blob.clone() {
+                                let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
+                                if auto_receiver {
+                                    clipboard::set_clipboard_image(&listener_handle, blob);
+                                    let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                } else {
+                                    tracing::info!("[Clipboard] Auto-receive OFF. Storing pending blob from {}", sender);
+                                    {
+                                        let mut pending = listener_state.pending_clipboard.lock().unwrap();
+                                        *pending = Some(payload_obj.clone());
+                                    }
+                                    let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                }
+
+                                let notifications = listener_state.settings.lock().unwrap().notifications.clone();
+                                if notifications.data_received {
+                                    send_notification(&listener_handle, "Image Received", "Image copied to clipboard", false, Some(2), "history", NotificationPayload::None);
+                                }
+                            }
 
                             // TEXT HANDLING
                             if !text.is_empty() {
@@ -3832,6 +3860,7 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
                                 sender: hostname,
                                 sender_id: local_id,
                                 files: None,
+                                blob: None,
                             };
                         
                         // Emit local event
@@ -3885,8 +3914,11 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
                 let mut guard = state.pending_clipboard.lock().unwrap();
                 if let Some(payload) = guard.take() { // take() removes it from pending
                     // Apply to System Clipboard
-                    // Using clipboard plugin
-                    if let Err(e) = clipboard::write_text_direct(app_handle, payload.text) {
+                    if let Some(blob) = payload.blob.clone() {
+                        clipboard::set_clipboard_image(app_handle, blob);
+                        tracing::info!("Confirmed pending clipboard image via shortcut.");
+                        send_notification(app_handle, "Image Received", "Pending image applied.", false, Some(2), "history", NotificationPayload::None);
+                    } else if let Err(e) = clipboard::write_text_direct(app_handle, payload.text) {
                         tracing::error!("Failed to write pending clipboard to system: {}", e);
                     } else {
                         tracing::info!("Confirmed pending clipboard content via shortcut.");

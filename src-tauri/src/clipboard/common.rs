@@ -1,5 +1,5 @@
 use crate::crypto;
-use crate::protocol::{ClipboardPayload, FileMetadata, Message};
+use crate::protocol::{ClipboardBlob, ClipboardPayload, FileMetadata, Message};
 use crate::state::AppState;
 use crate::transport::Transport;
 use std::thread;
@@ -8,10 +8,81 @@ use tauri::{AppHandle, Emitter};
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
 
+/// Wire-format size cap for clipboard image blobs. Sender drops anything over.
+pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Map a MIME string to an `image::ImageFormat`. Returns `None` for unknown
+/// types so callers can skip unsupported sources cleanly.
+pub fn image_format_for_mime(mime: &str) -> Option<image::ImageFormat> {
+    match mime {
+        "image/png" => Some(image::ImageFormat::Png),
+        "image/jpeg" => Some(image::ImageFormat::Jpeg),
+        "image/webp" => Some(image::ImageFormat::WebP),
+        "image/bmp" | "image/x-bmp" => Some(image::ImageFormat::Bmp),
+        "image/tiff" => Some(image::ImageFormat::Tiff),
+        "image/gif" => Some(image::ImageFormat::Gif),
+        _ => None,
+    }
+}
+
+/// Decode raw clipboard bytes of a known image MIME and return a normalised
+/// `ClipboardBlob` containing PNG bytes. Used by both the Wayland (wlr) and
+/// GNOME-extension (D-Bus) backends. Returns `None` if the MIME isn't an
+/// image format we know, the bytes don't decode, or the encoded blob exceeds
+/// `MAX_CLIPBOARD_IMAGE_WIRE_BYTES`.
+///
+/// PNG sources skip the re-encode step — we just validate the bytes by
+/// loading them and reuse the original buffer.
+pub fn normalize_image_blob_from_bytes(
+    bytes: Vec<u8>,
+    source_mime: &str,
+) -> Option<ClipboardBlob> {
+    let format = image_format_for_mime(source_mime)?;
+
+    let img = match image::load_from_memory_with_format(&bytes, format) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!("Failed to decode clipboard {}: {}", source_mime, e);
+            return None;
+        }
+    };
+    let width = img.width();
+    let height = img.height();
+
+    let png_bytes = if matches!(format, image::ImageFormat::Png) {
+        bytes
+    } else {
+        let mut out = Vec::new();
+        if let Err(e) = img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        {
+            tracing::warn!("Failed to PNG-encode clipboard image: {}", e);
+            return None;
+        }
+        out
+    };
+
+    if png_bytes.len() > MAX_CLIPBOARD_IMAGE_WIRE_BYTES {
+        tracing::warn!(
+            "Clipboard image PNG ({} bytes) exceeds {} byte wire cap; skipping.",
+            png_bytes.len(),
+            MAX_CLIPBOARD_IMAGE_WIRE_BYTES
+        );
+        return None;
+    }
+
+    Some(ClipboardBlob {
+        mime_type: "image/png".to_string(),
+        data: png_bytes,
+        width: Some(width),
+        height: Some(height),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClipboardContent {
     Text(String),
     Files(Vec<String>),
+    Image(ClipboardBlob),
     None,
 }
 
@@ -59,6 +130,19 @@ pub fn should_process_content(
                     should_process = true;
                 }
             }
+            ClipboardContent::Image(ign_blob) => {
+                if let ClipboardContent::Image(curr_blob) = current_content {
+                    if curr_blob == ign_blob {
+                        *ignored = ClipboardContent::None;
+                    } else if current_content != last_content {
+                        should_process = true;
+                    }
+                } else if current_content != last_content
+                    && *current_content != ClipboardContent::None
+                {
+                    should_process = true;
+                }
+            }
         }
     }
     should_process
@@ -94,6 +178,7 @@ pub fn process_clipboard_change(
                 id: msg_id,
                 text,
                 files: None,
+                blob: None,
                 timestamp: ts,
                 sender: hostname,
                 sender_id: local_id,
@@ -191,6 +276,7 @@ pub fn process_clipboard_change(
                     id: msg_id,
                     text: String::new(),
                     files: Some(file_metas),
+                    blob: None,
                     timestamp: ts,
                     sender: hostname,
                     sender_id: local_id,
@@ -199,6 +285,58 @@ pub fn process_clipboard_change(
             } else {
                 tracing::warn!("No valid files found in clipboard content.");
             }
+        }
+        ClipboardContent::Image(blob) => {
+            tracing::debug!(
+                "Clipboard Image Change Detected (mime={}, len={})",
+                blob.mime_type,
+                blob.data.len()
+            );
+
+            // Dedup: blob signature is mime + length + first/last 16 bytes (cheap, avoids full
+            // byte-equality on multi-megabyte images while still distinguishing distinct copies).
+            let head_len = blob.data.len().min(16);
+            let tail_start = blob.data.len().saturating_sub(16);
+            let mut sig = format!("BLOB:{}:{}:", blob.mime_type, blob.data.len());
+            for b in &blob.data[..head_len] {
+                use std::fmt::Write;
+                let _ = write!(sig, "{:02x}", b);
+            }
+            sig.push(':');
+            for b in &blob.data[tail_start..] {
+                use std::fmt::Write;
+                let _ = write!(sig, "{:02x}", b);
+            }
+
+            {
+                let mut last_global = state.last_clipboard_content.lock().unwrap();
+                if *last_global == sig {
+                    tracing::debug!(
+                        "Ignoring broadcast - blob matches last_clipboard_content"
+                    );
+                    return;
+                }
+                *last_global = sig;
+            }
+
+            let hostname = crate::get_hostname_internal();
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let local_id = state.local_device_id.lock().unwrap().clone();
+            let payload_obj = ClipboardPayload {
+                id: msg_id,
+                text: String::new(),
+                files: None,
+                blob: Some(blob),
+                timestamp: ts,
+                sender: hostname,
+                sender_id: local_id,
+            };
+            broadcast_clipboard(app_handle, state, transport, payload_obj);
         }
         ClipboardContent::None => {}
     }
@@ -245,6 +383,8 @@ pub fn broadcast_clipboard(
                         if notifications.data_sent {
                             let body = if payload_obj.files.is_some() {
                                 "File info broadcasted to cluster."
+                            } else if payload_obj.blob.is_some() {
+                                "Image broadcasted to cluster."
                             } else {
                                 "Clipboard content broadcasted to cluster."
                             };
@@ -313,6 +453,35 @@ pub fn set_clipboard_paths_with_ignore(app: &AppHandle, paths: Vec<String>, writ
             tracing::error!("Failed to set clipboard files: {}", e);
         } else {
             tracing::debug!("Successfully set local clipboard files.");
+        }
+    });
+}
+
+/// Set clipboard image blob, with feedback loop prevention.
+/// `write_fn` is the platform-specific writer that places `data` on the OS clipboard
+/// under `mime_type` (canonically "image/png" today).
+pub fn set_clipboard_blob_with_ignore(
+    app: &AppHandle,
+    blob: ClipboardBlob,
+    write_fn: fn(&AppHandle, &ClipboardBlob) -> Result<(), String>,
+) {
+    let app_handle = app.clone();
+    let blob_clone = blob.clone();
+
+    thread::spawn(move || {
+        {
+            let mut ignored = IGNORED_CONTENT.lock().unwrap();
+            *ignored = ClipboardContent::Image(blob_clone.clone());
+        }
+
+        if let Err(e) = write_fn(&app_handle, &blob_clone) {
+            tracing::error!("Failed to set clipboard blob: {}", e);
+        } else {
+            tracing::debug!(
+                "Successfully set local clipboard blob (mime={}, len={}).",
+                blob_clone.mime_type,
+                blob_clone.data.len()
+            );
         }
     });
 }

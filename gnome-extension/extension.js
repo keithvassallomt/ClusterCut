@@ -34,6 +34,12 @@ const DBUS_IFACE = `
 
 // Versioned .Clipboard2 so the Rust is_available() probe can't be fooled by an
 // older extension that only speaks the legacy text-only Clipboard interface.
+//
+// Blob (image) methods + BlobChanged signal added in extension v4.0 are *added
+// to* this Clipboard2 interface rather than bumped to a Clipboard3 — D-Bus is
+// additive, so old apps that don't know about ReadBlob/WriteBlob keep using the
+// text/file methods unchanged. New apps probe for the new methods and silently
+// fall back when paired with an older extension.
 const CLIPBOARD_DBUS_IFACE = `
 <node>
   <interface name="app.clustercut.clustercut.Clipboard2">
@@ -49,14 +55,43 @@ const CLIPBOARD_DBUS_IFACE = `
     <method name="WriteFiles">
       <arg type="as" direction="in"/>
     </method>
+    <method name="GetMimetypes">
+      <arg type="as" direction="out"/>
+    </method>
+    <method name="ReadBlob">
+      <arg type="s" direction="in" name="mime_type"/>
+      <arg type="ay" direction="out" name="data"/>
+    </method>
+    <method name="WriteBlob">
+      <arg type="s" direction="in" name="mime_type"/>
+      <arg type="ay" direction="in" name="data"/>
+    </method>
     <signal name="ClipboardChanged">
       <arg type="s"/>
     </signal>
     <signal name="FilesChanged">
       <arg type="as"/>
     </signal>
+    <signal name="BlobChanged">
+      <arg type="s" name="mime_type"/>
+      <arg type="ay" name="data"/>
+    </signal>
   </interface>
 </node>`;
+
+// Image MIME types we relay over D-Bus, in preference order. The Rust side
+// normalises everything to PNG before broadcasting, so all that matters here
+// is that we pick the first source format the clipboard offers that we can
+// pass through verbatim. PNG first because it's lossless and most common.
+const IMAGE_MIME_PRIORITY = [
+    'image/png',
+    'image/jpeg',
+    'image/webp',
+    'image/bmp',
+    'image/x-bmp',
+    'image/tiff',
+    'image/gif',
+];
 
 let ClipboardBridgeIface = null;
 
@@ -264,6 +299,7 @@ export default class ClusterCutExtension extends Extension {
     _startClipboardBridge() {
         this._lastClipboardText = '';
         this._lastFilesKey = '';
+        this._lastBlobKey = '';
         // GLib monotonic-time deadline. A one-shot bool doesn't work here because
         // a WriteFiles call writes two MIMEs and fires owner-changed more than once.
         this._ignoreUntil = 0;
@@ -301,6 +337,7 @@ export default class ClusterCutExtension extends Extension {
 
         this._lastClipboardText = null;
         this._lastFilesKey = null;
+        this._lastBlobKey = null;
         this._ignoreUntil = 0;
     }
 
@@ -330,6 +367,15 @@ export default class ClusterCutExtension extends Extension {
 
         if (hasUris) {
             this._readAndEmitFiles();
+            return;
+        }
+
+        // Image probe sits between files and text so the canonical "Copy Image"
+        // browser case is caught (no uri-list, no useful text), while the
+        // existing "Copy a file" flow that does emit uri-list still wins above.
+        const imageMime = IMAGE_MIME_PRIORITY.find(m => mimetypes.includes(m));
+        if (imageMime) {
+            this._readAndEmitBlob(imageMime);
             return;
         }
 
@@ -386,6 +432,55 @@ export default class ClusterCutExtension extends Extension {
         });
     }
 
+    // Stable, cheap fingerprint for a blob so we can dedup natural re-copies of
+    // the same content without holding the full bytes for comparison. Mirrors
+    // the Rust-side signature in clipboard/common.rs.
+    _blobKey(mime, data) {
+        if (!data || data.length === 0) {
+            return '';
+        }
+        const head = Math.min(16, data.length);
+        const tailStart = Math.max(0, data.length - 16);
+        let sig = `${mime}:${data.length}:`;
+        for (let i = 0; i < head; i++) {
+            sig += data[i].toString(16);
+        }
+        sig += ':';
+        for (let i = tailStart; i < data.length; i++) {
+            sig += data[i].toString(16);
+        }
+        return sig;
+    }
+
+    _readAndEmitBlob(mime) {
+        const clipboard = St.Clipboard.get_default();
+        clipboard.get_content(St.ClipboardType.CLIPBOARD, mime, (cb, bytes) => {
+            if (!bytes) {
+                return;
+            }
+            const data = bytes.get_data ? bytes.get_data() : bytes;
+            if (!data || data.length === 0) {
+                return;
+            }
+
+            const key = this._blobKey(mime, data);
+            if (key === this._lastBlobKey) {
+                return;
+            }
+            this._lastBlobKey = key;
+            this._lastClipboardText = '';
+            this._lastFilesKey = '';
+
+            Gio.DBus.session.emit_signal(
+                null,
+                '/org/gnome/Shell/Extensions/ClusterCut',
+                'app.clustercut.clustercut.Clipboard2',
+                'BlobChanged',
+                new GLib.Variant('(say)', [mime, data])
+            );
+        });
+    }
+
     _parseUriList(bytes) {
         if (!bytes) {
             return [];
@@ -430,6 +525,21 @@ export default class ClusterCutExtension extends Extension {
         clipboard.set_content(St.ClipboardType.CLIPBOARD, 'x-special/gnome-copied-files', gnomeCopiedBytes);
     }
 
+    _writeBlob(mime, data) {
+        if (!data || data.length === 0) {
+            return;
+        }
+
+        this._suppressNextChanges();
+        this._lastBlobKey = this._blobKey(mime, data);
+        this._lastClipboardText = '';
+        this._lastFilesKey = '';
+
+        const clipboard = St.Clipboard.get_default();
+        const glibBytes = GLib.Bytes.new(data);
+        clipboard.set_content(St.ClipboardType.CLIPBOARD, mime, glibBytes);
+    }
+
     _handleClipboardMethod(methodName, parameters, invocation) {
         if (methodName === 'ReadClipboard') {
             const clipboard = St.Clipboard.get_default();
@@ -453,6 +563,28 @@ export default class ClusterCutExtension extends Extension {
         } else if (methodName === 'WriteFiles') {
             const [uris] = parameters.deep_unpack();
             this._writeFiles(uris);
+            invocation.return_value(null);
+        } else if (methodName === 'GetMimetypes') {
+            // Synchronous — see _onClipboardOwnerChanged comment.
+            const clipboard = St.Clipboard.get_default();
+            const mimetypes = clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD) || [];
+            invocation.return_value(new GLib.Variant('(as)', [mimetypes]));
+        } else if (methodName === 'ReadBlob') {
+            const [mime] = parameters.deep_unpack();
+            const clipboard = St.Clipboard.get_default();
+            clipboard.get_content(St.ClipboardType.CLIPBOARD, mime, (cb, bytes) => {
+                let data = new Uint8Array(0);
+                if (bytes) {
+                    const arr = bytes.get_data ? bytes.get_data() : bytes;
+                    if (arr && arr.length > 0) {
+                        data = arr;
+                    }
+                }
+                invocation.return_value(new GLib.Variant('(ay)', [data]));
+            });
+        } else if (methodName === 'WriteBlob') {
+            const [mime, data] = parameters.deep_unpack();
+            this._writeBlob(mime, data);
             invocation.return_value(null);
         } else {
             invocation.return_dbus_error(

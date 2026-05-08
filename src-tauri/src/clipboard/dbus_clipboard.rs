@@ -4,6 +4,7 @@
 /// The GNOME extension monitors clipboard via St.Clipboard (privileged compositor access)
 /// and exposes clipboard operations over D-Bus.
 use super::common::{self, ClipboardContent};
+use crate::protocol::ClipboardBlob;
 use crate::state::AppState;
 use crate::transport::Transport;
 use std::sync::Arc;
@@ -129,8 +130,32 @@ fn write_files_dbus(uris: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Write an image blob to the GNOME extension's clipboard via WriteBlob.
+/// Returns Err on extensions older than v4.0 that don't implement WriteBlob —
+/// callers handle the error gracefully (image clipboard is silently disabled
+/// against older extensions).
+fn write_blob_dbus(mime: &str, data: &[u8]) -> Result<(), String> {
+    let conn = zbus::blocking::Connection::session()
+        .map_err(|e| format!("D-Bus connection failed: {}", e))?;
+
+    conn.call_method(
+        Some(DBUS_NAME),
+        DBUS_PATH,
+        Some(DBUS_IFACE),
+        "WriteBlob",
+        &(mime, data),
+    )
+    .map_err(|e| format!("WriteBlob D-Bus call failed: {}", e))?;
+
+    Ok(())
+}
+
 fn write_text(_app: &AppHandle, text: String) -> Result<(), String> {
     write_text_dbus(&text)
+}
+
+fn write_image(_app: &AppHandle, blob: &ClipboardBlob) -> Result<(), String> {
+    write_blob_dbus(&blob.mime_type, &blob.data)
 }
 
 fn write_files(_app: &AppHandle, files: Vec<String>) -> Result<(), String> {
@@ -163,6 +188,10 @@ pub fn set_clipboard(app: &AppHandle, text: String) {
 
 pub fn set_clipboard_paths(app: &AppHandle, paths: Vec<String>) {
     common::set_clipboard_paths_with_ignore(app, paths, write_files);
+}
+
+pub fn set_clipboard_image(app: &AppHandle, blob: ClipboardBlob) {
+    common::set_clipboard_blob_with_ignore(app, blob, write_image);
 }
 
 /// Read clipboard text directly (for manual send shortcut).
@@ -220,6 +249,28 @@ pub fn start_monitor(
             }
         };
 
+        // BlobChanged was added in extension v4.0. The match rule is just a
+        // name filter on incoming signals — subscribing against an older
+        // extension that never emits BlobChanged is harmless: the stream
+        // simply never produces, and image clipboard sync is silently
+        // unavailable. Text + files keep working unchanged in either case.
+        let mut blob_stream = match proxy.receive_signal("BlobChanged").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to subscribe to BlobChanged signal (image clipboard sync disabled): {}",
+                    e
+                );
+                // Subscribe to the same signal name that produces nothing — by
+                // chaining off a different signal we don't care about — just so
+                // the select! arm has a valid stream to await.
+                proxy
+                    .receive_signal("ClipboardChanged")
+                    .await
+                    .expect("ClipboardChanged subscription succeeded above")
+            }
+        };
+
         use futures::StreamExt;
 
         let mut last_content = ClipboardContent::None;
@@ -252,6 +303,19 @@ pub fn start_monitor(
                     },
                     None => {
                         tracing::warn!("D-Bus FilesChanged stream ended");
+                        break;
+                    }
+                },
+                next = blob_stream.next() => match next {
+                    Some(msg) => match msg.body().deserialize::<(String, Vec<u8>)>() {
+                        Ok((mime, data)) if !data.is_empty() => {
+                            common::normalize_image_blob_from_bytes(data, &mime)
+                                .map(ClipboardContent::Image)
+                        }
+                        _ => None,
+                    },
+                    None => {
+                        tracing::warn!("D-Bus BlobChanged stream ended");
                         break;
                     }
                 },
