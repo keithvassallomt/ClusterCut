@@ -106,16 +106,52 @@ fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Resu
     let rgba = decoded.into_rgba8();
     let width = rgba.width() as usize;
     let height = rgba.height() as usize;
-    let img_data = arboard::ImageData {
-        width,
-        height,
-        bytes: rgba.into_raw().into(),
-    };
+    let raw = rgba.into_raw();
 
-    let mut clip = arboard::Clipboard::new()
-        .map_err(|e| format!("arboard init failed: {}", e))?;
-    clip.set_image(img_data)
-        .map_err(|e| format!("arboard set_image failed: {}", e))
+    // Retry with backoff. Windows in particular (error 1418 / ERROR_CLIPBOARD_NOT_OPEN)
+    // can fail if tauri-plugin-clipboard's monitor or another clipboard-aware process
+    // grabs the clipboard between our OpenClipboard and SetClipboardData calls.
+    // arboard's internal retry is short (~250 ms total); a longer outer retry covers
+    // briefly-stuck monitors. ImageData consumes its bytes, so we rebuild it per attempt
+    // from the same `raw` Vec via Cow::Borrowed (cheap — no copy until consumed).
+    const MAX_ATTEMPTS: u32 = 6;
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let img_data = arboard::ImageData {
+            width,
+            height,
+            bytes: std::borrow::Cow::Borrowed(&raw),
+        };
+        let result = arboard::Clipboard::new()
+            .map_err(|e| format!("arboard init failed: {}", e))
+            .and_then(|mut clip| {
+                clip.set_image(img_data)
+                    .map_err(|e| format!("arboard set_image failed: {}", e))
+            });
+        match result {
+            Ok(()) => {
+                if attempt > 1 {
+                    tracing::info!("Clipboard image set succeeded on attempt {}", attempt);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = Some(e.clone());
+                if attempt < MAX_ATTEMPTS {
+                    let backoff_ms = 50_u64 * (1 << (attempt - 1)).min(8); // 50, 100, 200, 400, 400, then give up
+                    tracing::warn!(
+                        "Clipboard image set attempt {}/{} failed: {}. Retrying in {} ms",
+                        attempt,
+                        MAX_ATTEMPTS,
+                        e,
+                        backoff_ms
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "set_image failed for unknown reason".to_string()))
 }
 
 fn read_clipboard(
