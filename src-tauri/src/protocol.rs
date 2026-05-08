@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -8,14 +9,52 @@ pub struct FileMetadata {
 
 // In-memory clipboard image data, normalised to PNG on the wire.
 // Width/height are hints for the receiver (UI thumbnails, debug logs).
+//
+// `data` is **base64-encoded** because serde_json serialises a raw `Vec<u8>`
+// as a JSON array of integers (`[1,2,3,…]`), which adds ~3.5× per-byte bloat.
+// Base64 is ~1.33× — a >2× wire reduction for typical clipboard images.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardBlob {
     pub mime_type: String,
-    pub data: Vec<u8>,
+    pub data: String,
     #[serde(default)]
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
+}
+
+impl ClipboardBlob {
+    /// Construct from raw image bytes; encodes them as base64 internally so
+    /// callers don't have to know the wire format.
+    pub fn from_bytes(
+        mime_type: impl Into<String>,
+        bytes: &[u8],
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            width,
+            height,
+        }
+    }
+
+    /// Decode the base64 wire form back into raw bytes ready to feed into
+    /// the OS clipboard. Returns the decoded byte vector or a descriptive error.
+    pub fn raw_bytes(&self) -> Result<Vec<u8>, String> {
+        base64::engine::general_purpose::STANDARD
+            .decode(self.data.as_bytes())
+            .map_err(|e| format!("invalid base64 in ClipboardBlob.data: {}", e))
+    }
+
+    /// Length of the decoded raw bytes — used for size cap checks before
+    /// putting a blob on the wire.
+    pub fn decoded_len(&self) -> usize {
+        // Cheap estimate: 4 base64 chars decode to 3 bytes; ignore padding for
+        // this purpose (the cap is approximate anyway).
+        (self.data.len() / 4) * 3
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -86,16 +125,15 @@ pub enum Message {
 mod tests {
     use super::*;
 
+    fn sample_bytes() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        ]
+    }
+
     fn sample_blob() -> ClipboardBlob {
-        ClipboardBlob {
-            mime_type: "image/png".to_string(),
-            data: vec![
-                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-                0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-            ],
-            width: Some(640),
-            height: Some(480),
-        }
+        ClipboardBlob::from_bytes("image/png", &sample_bytes(), Some(640), Some(480))
     }
 
     fn sample_payload(blob: Option<ClipboardBlob>) -> ClipboardPayload {
@@ -151,11 +189,28 @@ mod tests {
     #[test]
     fn clipboard_blob_omits_dimensions_when_none() {
         // Width/height are #[serde(default)] — payloads without them should still parse.
-        let blob_json = r#"{"mime_type":"image/png","data":[1,2,3]}"#;
+        let blob_json = r#"{"mime_type":"image/png","data":"AQID"}"#;
         let parsed: ClipboardBlob = serde_json::from_str(blob_json).unwrap();
         assert_eq!(parsed.mime_type, "image/png");
-        assert_eq!(parsed.data, vec![1, 2, 3]);
+        assert_eq!(parsed.raw_bytes().unwrap(), vec![1, 2, 3]);
         assert!(parsed.width.is_none());
         assert!(parsed.height.is_none());
+    }
+
+    #[test]
+    fn clipboard_blob_data_is_base64_on_wire_not_int_array() {
+        // Regression guard: serde_json must emit `data` as a base64 string,
+        // not the bloat-prone `[123,45,67,...]` integer array.
+        let blob = sample_blob();
+        let json = serde_json::to_string(&blob).unwrap();
+        assert!(json.contains("\"data\":\""), "data should be a JSON string, got: {}", json);
+        assert!(!json.contains("\"data\":["), "data must NOT be a JSON array, got: {}", json);
+    }
+
+    #[test]
+    fn clipboard_blob_round_trip_bytes() {
+        let original = sample_bytes();
+        let blob = ClipboardBlob::from_bytes("image/png", &original, None, None);
+        assert_eq!(blob.raw_bytes().unwrap(), original);
     }
 }

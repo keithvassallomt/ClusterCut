@@ -78,12 +78,12 @@ fn read_clipboard_image_arboard(arboard: &mut arboard::Clipboard) -> Option<Clip
         return None;
     }
 
-    Some(ClipboardBlob {
-        mime_type: "image/png".to_string(),
-        data: png_bytes,
-        width: Some(width),
-        height: Some(height),
-    })
+    Some(ClipboardBlob::from_bytes(
+        "image/png",
+        &png_bytes,
+        Some(width),
+        Some(height),
+    ))
 }
 
 /// Decode a PNG blob into RGBA and hand it to arboard, which writes the
@@ -100,7 +100,8 @@ fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Resu
         other => return Err(format!("unsupported clipboard image MIME: {}", other)),
     };
 
-    let decoded = image::load_from_memory_with_format(&blob.data, format)
+    let bytes = blob.raw_bytes()?;
+    let decoded = image::load_from_memory_with_format(&bytes, format)
         .map_err(|e| format!("decode clipboard image: {}", e))?;
     let rgba = decoded.into_rgba8();
     let width = rgba.width() as usize;

@@ -70,12 +70,12 @@ pub fn normalize_image_blob_from_bytes(
         return None;
     }
 
-    Some(ClipboardBlob {
-        mime_type: "image/png".to_string(),
-        data: png_bytes,
-        width: Some(width),
-        height: Some(height),
-    })
+    Some(ClipboardBlob::from_bytes(
+        "image/png",
+        &png_bytes,
+        Some(width),
+        Some(height),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,22 +288,24 @@ pub fn process_clipboard_change(
         }
         ClipboardContent::Image(blob) => {
             tracing::debug!(
-                "Clipboard Image Change Detected (mime={}, len={})",
+                "Clipboard Image Change Detected (mime={}, decoded_len={})",
                 blob.mime_type,
-                blob.data.len()
+                blob.decoded_len()
             );
 
-            // Dedup: blob signature is mime + length + first/last 16 bytes (cheap, avoids full
-            // byte-equality on multi-megabyte images while still distinguishing distinct copies).
-            let head_len = blob.data.len().min(16);
-            let tail_start = blob.data.len().saturating_sub(16);
-            let mut sig = format!("BLOB:{}:{}:", blob.mime_type, blob.data.len());
-            for b in &blob.data[..head_len] {
+            // Dedup: blob signature is mime + base64 length + first/last 16 base64 chars
+            // (cheap, avoids full content equality on multi-megabyte images while still
+            // distinguishing distinct copies — base64 is bijective with raw bytes).
+            let raw = blob.data.as_bytes();
+            let head_len = raw.len().min(16);
+            let tail_start = raw.len().saturating_sub(16);
+            let mut sig = format!("BLOB:{}:{}:", blob.mime_type, raw.len());
+            for b in &raw[..head_len] {
                 use std::fmt::Write;
                 let _ = write!(sig, "{:02x}", b);
             }
             sig.push(':');
-            for b in &blob.data[tail_start..] {
+            for b in &raw[tail_start..] {
                 use std::fmt::Write;
                 let _ = write!(sig, "{:02x}", b);
             }
@@ -478,9 +480,9 @@ pub fn set_clipboard_blob_with_ignore(
             tracing::error!("Failed to set clipboard blob: {}", e);
         } else {
             tracing::debug!(
-                "Successfully set local clipboard blob (mime={}, len={}).",
+                "Successfully set local clipboard blob (mime={}, decoded_len={}).",
                 blob_clone.mime_type,
-                blob_clone.data.len()
+                blob_clone.decoded_len()
             );
         }
     });

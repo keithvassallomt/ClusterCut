@@ -197,9 +197,10 @@ fn write_files(_app: &AppHandle, files: Vec<String>) -> Result<(), String> {
 }
 
 fn write_image(_app: &AppHandle, blob: &ClipboardBlob) -> Result<(), String> {
+    let bytes = blob.raw_bytes()?;
     let opts = CopyOptions::new();
     opts.copy(
-        Source::Bytes(blob.data.clone().into()),
+        Source::Bytes(bytes.into()),
         CopyMimeType::Specific(blob.mime_type.clone()),
     )
     .map_err(|e| format!("wl-clipboard-rs copy image failed: {}", e))

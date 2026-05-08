@@ -132,9 +132,14 @@ impl Transport {
                                     match conn.accept_bi().await {
                                         Ok((_, mut recv)) => {
                                             // tracing::debug!("Accepted message stream from {}", remote_addr);
-                                            // Limit 10MB
+                                            // Cap each message at 64 MB. Sized to fit a 10 MB raw
+                                            // clipboard image after the wire-format expansion:
+                                            // base64 (1.33×) inside ClipboardPayload JSON, then the
+                                            // encrypted ciphertext re-wrapped in
+                                            // Message::Clipboard(Vec<u8>) which serde_json emits
+                                            // as an integer array (~3.5×). Net ~50 MB worst case.
                                             if let Ok(buf) =
-                                                recv.read_to_end(1024 * 1024 * 10).await
+                                                recv.read_to_end(1024 * 1024 * 64).await
                                             {
                                                 if !buf.is_empty() {
                                                     on_receive_message(buf, remote_addr);

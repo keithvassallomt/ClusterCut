@@ -70,15 +70,24 @@ type HistoryItem = {
   sender_id?: string;
 };
 
-// The backend serialises Vec<u8> as a JSON array of integers. Convert it to a
-// Blob URL once at receive time so the thumbnail can be rendered straight from
-// memory without re-marshalling. Returns undefined if the payload has no blob.
-// Caller is responsible for revoking the URL when the item is dropped.
+// The backend ships ClipboardBlob.data as a base64 string (chosen over the
+// default Vec<u8>→JSON-int-array encoding to keep wire size manageable —
+// see protocol.rs). Decode once at receive time and stash an object URL so
+// the thumbnail can render straight from memory. Caller is responsible for
+// revoking the URL when the item is dropped.
 function blobFromPayload(payloadBlob: any): ClipboardBlobPreview | undefined {
-  if (!payloadBlob || !payloadBlob.data || payloadBlob.data.length === 0) {
+  if (!payloadBlob || typeof payloadBlob.data !== "string" || payloadBlob.data.length === 0) {
     return undefined;
   }
-  const bytes = new Uint8Array(payloadBlob.data);
+  let bytes: Uint8Array;
+  try {
+    const binString = atob(payloadBlob.data);
+    bytes = Uint8Array.from(binString, c => c.charCodeAt(0));
+  } catch (e) {
+    console.warn("Failed to decode clipboard blob base64:", e);
+    return undefined;
+  }
+  if (bytes.length === 0) return undefined;
   const url = URL.createObjectURL(new Blob([bytes], { type: payloadBlob.mime_type || "image/png" }));
   return {
     mime_type: payloadBlob.mime_type || "image/png",

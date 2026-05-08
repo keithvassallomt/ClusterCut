@@ -155,7 +155,8 @@ fn write_text(_app: &AppHandle, text: String) -> Result<(), String> {
 }
 
 fn write_image(_app: &AppHandle, blob: &ClipboardBlob) -> Result<(), String> {
-    write_blob_dbus(&blob.mime_type, &blob.data)
+    let bytes = blob.raw_bytes()?;
+    write_blob_dbus(&blob.mime_type, &bytes)
 }
 
 fn write_files(_app: &AppHandle, files: Vec<String>) -> Result<(), String> {
