@@ -40,3 +40,4 @@ clustercut@keithvassallo.com.shell-extension.zip
 
 # Claude Code
 CLAUDE.md
+.claude/settings.local.json
