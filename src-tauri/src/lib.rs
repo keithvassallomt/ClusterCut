@@ -3003,21 +3003,12 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 }
                             }
 
-                            // Loop/Dedupe Check
-                            let content_signature = if let Some(files) = &payload.files {
-                                if !files.is_empty() {
-                                    let mut sig = String::from("FILES:");
-                                    for f in files {
-                                        use std::fmt::Write;
-                                        let _ = write!(sig, "{}:{};", f.name, f.size);
-                                    }
-                                    sig
-                                } else {
-                                    text.clone()
-                                }
-                            } else {
-                                text.clone()
-                            };
+                            // Loop/Dedupe Check — must match the sender-side
+                            // signature in clipboard::common::payload_signature
+                            // so a blob received from a peer correctly suppresses
+                            // an immediate re-broadcast back to the cluster.
+                            let content_signature =
+                                crate::clipboard::common::payload_signature(&payload);
 
                             {
                                 let mut last = listener_state.last_clipboard_content.lock().unwrap();

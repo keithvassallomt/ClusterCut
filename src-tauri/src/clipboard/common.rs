@@ -11,6 +11,46 @@ use std::sync::{Arc, Mutex};
 /// Wire-format size cap for clipboard image blobs. Sender drops anything over.
 pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
 
+/// Compute a stable, cheap content fingerprint for a `ClipboardPayload` used
+/// by both the sender (broadcast dedup) and receiver (re-broadcast loop guard)
+/// against `state.last_clipboard_content`. Both ends must agree on the format
+/// so a blob received from a peer can correctly suppress an immediate
+/// re-broadcast back to that peer.
+///
+/// Format:
+/// - Files:  `FILES:name1:size1;name2:size2;…`
+/// - Blob:   `BLOB:<mime>:<base64_len>:<head16_hex>:<tail16_hex>`
+/// - Text:   the text itself (or empty string)
+pub fn payload_signature(payload: &ClipboardPayload) -> String {
+    if let Some(files) = payload.files.as_ref() {
+        if !files.is_empty() {
+            let mut sig = String::from("FILES:");
+            for f in files {
+                use std::fmt::Write;
+                let _ = write!(sig, "{}:{};", f.name, f.size);
+            }
+            return sig;
+        }
+    }
+    if let Some(blob) = payload.blob.as_ref() {
+        let raw = blob.data.as_bytes();
+        let head_len = raw.len().min(16);
+        let tail_start = raw.len().saturating_sub(16);
+        let mut sig = format!("BLOB:{}:{}:", blob.mime_type, raw.len());
+        for b in &raw[..head_len] {
+            use std::fmt::Write;
+            let _ = write!(sig, "{:02x}", b);
+        }
+        sig.push(':');
+        for b in &raw[tail_start..] {
+            use std::fmt::Write;
+            let _ = write!(sig, "{:02x}", b);
+        }
+        return sig;
+    }
+    payload.text.clone()
+}
+
 /// Map a MIME string to an `image::ImageFormat`. Returns `None` for unknown
 /// types so callers can skip unsupported sources cleanly.
 pub fn image_format_for_mime(mime: &str) -> Option<image::ImageFormat> {
@@ -293,23 +333,24 @@ pub fn process_clipboard_change(
                 blob.decoded_len()
             );
 
-            // Dedup: blob signature is mime + base64 length + first/last 16 base64 chars
-            // (cheap, avoids full content equality on multi-megabyte images while still
-            // distinguishing distinct copies — base64 is bijective with raw bytes).
-            let raw = blob.data.as_bytes();
-            let head_len = raw.len().min(16);
-            let tail_start = raw.len().saturating_sub(16);
-            let mut sig = format!("BLOB:{}:{}:", blob.mime_type, raw.len());
-            for b in &raw[..head_len] {
-                use std::fmt::Write;
-                let _ = write!(sig, "{:02x}", b);
-            }
-            sig.push(':');
-            for b in &raw[tail_start..] {
-                use std::fmt::Write;
-                let _ = write!(sig, "{:02x}", b);
-            }
+            let hostname = crate::get_hostname_internal();
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let local_id = state.local_device_id.lock().unwrap().clone();
+            let payload_obj = ClipboardPayload {
+                id: msg_id,
+                text: String::new(),
+                files: None,
+                blob: Some(blob),
+                timestamp: ts,
+                sender: hostname,
+                sender_id: local_id,
+            };
 
+            let sig = payload_signature(&payload_obj);
             {
                 let mut last_global = state.last_clipboard_content.lock().unwrap();
                 if *last_global == sig {
@@ -321,23 +362,6 @@ pub fn process_clipboard_change(
                 *last_global = sig;
             }
 
-            let hostname = crate::get_hostname_internal();
-            let msg_id = uuid::Uuid::new_v4().to_string();
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            let local_id = state.local_device_id.lock().unwrap().clone();
-            let payload_obj = ClipboardPayload {
-                id: msg_id,
-                text: String::new(),
-                files: None,
-                blob: Some(blob),
-                timestamp: ts,
-                sender: hostname,
-                sender_id: local_id,
-            };
             broadcast_clipboard(app_handle, state, transport, payload_obj);
         }
         ClipboardContent::None => {}
