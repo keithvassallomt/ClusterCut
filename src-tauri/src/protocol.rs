@@ -31,6 +31,10 @@ pub struct FileStreamHeader {
     pub file_name: String,
     pub file_size: u64,
     pub auth_token: String, // Encrypted token proving Cluster Key possession
+    // Whether the payload following the header line is zstd-compressed.
+    // Defaults to false so headers from peers <= 0.2.2 (which omit the field) parse cleanly.
+    #[serde(default)]
+    pub compressed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

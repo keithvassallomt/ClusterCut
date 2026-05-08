@@ -1,4 +1,5 @@
 mod clipboard;
+mod compression;
 #[cfg(target_os = "linux")]
 mod dbus;
 mod crypto;
@@ -2817,45 +2818,75 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
 
     // 4. Stream Data (Zero-Copy-ish)
     let start_time = std::time::Instant::now();
-    
-    // reader is BufReader<RecvStream>. We can just copy.
-    // However, we want progress updates?
-    // tokio::io::copy doesn't give progress.
-    // If we want progress, we need a loop, but without length framing.
-    // Simple loop: read(buf), write(buf).
-    
+
+    // reader is BufReader<RecvStream>. We loop manually so we can emit progress.
+    // total_written counts bytes written to disk (post-decompression on the compressed
+    // path), so the progress percentage matches header.file_size — the *uncompressed*
+    // size — regardless of whether the wire payload was compressed.
+
     let mut buf = vec![0u8; 1024 * 1024]; // 1MB Buffer
     let mut total_written = 0u64;
     let mut last_emit = std::time::Instant::now();
     let mut chunk_count = 0;
 
-    tracing::info!("[Receiver] Starting RAW Stream. Expecting {} bytes.", header.file_size);
-    
-    loop {
-        match reader.read(&mut buf).await {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                if let Err(e) = file.write_all(&buf[0..n]).await {
-                     tracing::error!("File Write Error: {}", e);
-                     break;
+    if header.compressed {
+        tracing::info!("[Receiver] Starting ZSTD Stream. Expecting {} bytes (decompressed).", header.file_size);
+        let mut decoder = async_compression::tokio::bufread::ZstdDecoder::new(reader);
+        loop {
+            match decoder.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if let Err(e) = file.write_all(&buf[0..n]).await {
+                        tracing::error!("File Write Error: {}", e);
+                        break;
+                    }
+                    total_written += n as u64;
+                    chunk_count += 1;
+
+                    if last_emit.elapsed().as_millis() > 200 {
+                        let _ = app.emit("file-progress", serde_json::json!({
+                            "id": header.id,
+                            "fileName": header.file_name,
+                            "total": header.file_size,
+                            "transferred": total_written
+                        }));
+                        last_emit = std::time::Instant::now();
+                    }
                 }
-                total_written += n as u64;
-                chunk_count += 1;
-                
-                // Emit Progress (Throttled 200ms)
-                if last_emit.elapsed().as_millis() > 200 {
-                     let _ = app.emit("file-progress", serde_json::json!({
-                         "id": header.id,
-                         "fileName": header.file_name,
-                         "total": header.file_size,
-                         "transferred": total_written
-                     }));
-                     last_emit = std::time::Instant::now();
+                Err(e) => {
+                    tracing::error!("Decompressed Stream Read Error: {}", e);
+                    break;
                 }
             }
-            Err(e) => {
-                tracing::error!("Stream Read Error: {}", e);
-                break;
+        }
+    } else {
+        tracing::info!("[Receiver] Starting RAW Stream. Expecting {} bytes.", header.file_size);
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if let Err(e) = file.write_all(&buf[0..n]).await {
+                         tracing::error!("File Write Error: {}", e);
+                         break;
+                    }
+                    total_written += n as u64;
+                    chunk_count += 1;
+
+                    // Emit Progress (Throttled 200ms)
+                    if last_emit.elapsed().as_millis() > 200 {
+                         let _ = app.emit("file-progress", serde_json::json!({
+                             "id": header.id,
+                             "fileName": header.file_name,
+                             "total": header.file_size,
+                             "transferred": total_written
+                         }));
+                         last_emit = std::time::Instant::now();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Stream Read Error: {}", e);
+                    break;
+                }
             }
         }
     }
@@ -3503,6 +3534,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                  
                                  if let Some(p_str) = path {
                                       let file_path = PathBuf::from(p_str.clone());
+                                      let compress_enabled = listener_state.settings.lock().unwrap().compress_file_transfers;
                                       // 3. Open Stream & Send
                                       tauri::async_runtime::spawn(async move {
                                            // Open File
@@ -3532,6 +3564,10 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                        }
                                                    };
                                                    
+                                                   // Decide whether to compress this file (deterministic rules).
+                                                   let compressed = compress_enabled
+                                                       && crate::compression::should_compress(&file_name, file_size);
+
                                                    // 4b. Send Header
                                                    let header = crate::protocol::FileStreamHeader {
                                                        id: req.id,
@@ -3539,36 +3575,66 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                        file_name,
                                                        file_size,
                                                        auth_token,
+                                                       compressed,
                                                    };
-                                                   
+
                                                    if let Ok(h_json) = serde_json::to_string(&header) {
                                                        if let Err(e) = stream.write_all(h_json.as_bytes()).await { tracing::error!("Header Write Error: {}", e); return; }
                                                        if let Err(e) = stream.write_all(b"\n").await { tracing::error!("Header Newline Error: {}", e); return; }
                                                    }
-                                                   
-                                                   // 5. Send Raw File
+
+                                                   // 5. Send File (raw or zstd-compressed depending on flag)
                                                    let mut buf = vec![0u8; 1024 * 1024]; // 1MB chunks
                                                    let mut chunks_sent = 0;
                                                    let start_time = std::time::Instant::now();
 
-                                                   tracing::info!("[Sender] Starting RAW loop. File size: {}", file_size);
-
-                                                   loop {
-                                                       match file.read(&mut buf).await {
-                                                           Ok(0) => break, // EOF
-                                                           Ok(n) => {
-                                                               // Write Raw Data
-                                                               if let Err(e) = stream.write_all(&buf[0..n]).await { tracing::error!("Stream Write Error: {}", e); break; }
-                                                               chunks_sent += 1;
+                                                   if compressed {
+                                                       tracing::info!("[Sender] Starting ZSTD loop. File size: {}", file_size);
+                                                       let mut encoder = async_compression::tokio::write::ZstdEncoder::with_quality(
+                                                           stream,
+                                                           async_compression::Level::Precise(crate::compression::ZSTD_LEVEL),
+                                                       );
+                                                       loop {
+                                                           match file.read(&mut buf).await {
+                                                               Ok(0) => break, // EOF
+                                                               Ok(n) => {
+                                                                   if let Err(e) = encoder.write_all(&buf[0..n]).await {
+                                                                       tracing::error!("Compressed Stream Write Error: {}", e);
+                                                                       break;
+                                                                   }
+                                                                   chunks_sent += 1;
+                                                               }
+                                                               Err(e) => { tracing::error!("File Read Error: {}", e); break; }
                                                            }
-                                                           Err(e) => { tracing::error!("File Read Error: {}", e); break; }
                                                        }
+                                                       // Flush trailing zstd block before finishing the QUIC stream.
+                                                       if let Err(e) = encoder.shutdown().await {
+                                                           tracing::error!("Encoder Shutdown Error: {}", e);
+                                                       }
+                                                       let mut stream = encoder.into_inner();
+                                                       let total_time = start_time.elapsed();
+                                                       tracing::info!("[Sender] ZSTD loop finished in {:?}. Chunks: {}", total_time, chunks_sent);
+                                                       let _ = stream.finish();
+                                                       drop(stream);
+                                                   } else {
+                                                       tracing::info!("[Sender] Starting RAW loop. File size: {}", file_size);
+                                                       loop {
+                                                           match file.read(&mut buf).await {
+                                                               Ok(0) => break, // EOF
+                                                               Ok(n) => {
+                                                                   // Write Raw Data
+                                                                   if let Err(e) = stream.write_all(&buf[0..n]).await { tracing::error!("Stream Write Error: {}", e); break; }
+                                                                   chunks_sent += 1;
+                                                               }
+                                                               Err(e) => { tracing::error!("File Read Error: {}", e); break; }
+                                                           }
+                                                       }
+                                                       let total_time = start_time.elapsed();
+                                                       tracing::info!("[Sender] Loop finished in {:?}. Chunks: {}", total_time, chunks_sent);
+                                                       // Finish Stream (signals no more data will be written)
+                                                       let _ = stream.finish();
+                                                       drop(stream);
                                                    }
-                                                   let total_time = start_time.elapsed();
-                                                   tracing::info!("[Sender] Loop finished in {:?}. Chunks: {}", total_time, chunks_sent);
-                                                   // Finish Stream (signals no more data will be written)
-                                                   let _ = stream.finish();
-                                                   drop(stream);
 
                                                    // Wait for the connection to close naturally.
                                                    // After all data is delivered and ACKed, both sides go idle,

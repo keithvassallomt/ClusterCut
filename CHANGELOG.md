@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.3] - 2026-05-08
 
+### Added
+- Optional zstd compression for file transfers, off by default. Enable it under Settings → File Transfer when transferring large, compressible files (text, code, logs, datasets) over slower links. Files smaller than 64 KB or already in a compressed format (images, video, archives, office docs, etc.) are skipped automatically. **Incompatible with ClusterCut 0.2.2 and earlier — peers running older versions will receive corrupt files when receiving from a sender that has compression enabled.** (#3)
+
 ### Changed
 - Inter font is now vendored locally via `@fontsource/inter` instead of being fetched from Google Fonts at runtime, keeping the app fully LAN-only (#7).
 

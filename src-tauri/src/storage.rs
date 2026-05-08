@@ -312,6 +312,8 @@ pub struct AppSettings {
     pub ignore_extension_missing: bool,
     #[serde(default)]
     pub flatpak_autostart: bool,
+    #[serde(default)]
+    pub compress_file_transfers: bool,
 }
 
 impl Default for AppSettings {
@@ -329,6 +331,7 @@ impl Default for AppSettings {
             notify_large_files: true,
             ignore_extension_missing: false,
             flatpak_autostart: false,
+            compress_file_transfers: false,
         }
     }
 }

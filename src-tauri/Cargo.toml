@@ -32,6 +32,7 @@ getrandom = "0.2.14"
 base64 = "0.22.1"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io", "codec"] }
+async-compression = { version = "0.4", features = ["zstd", "tokio"] }
 local-ip-address = "0.6.8"
 rcgen = "0.14.6"
 rustls = { version = "0.23.35", features = ["aws_lc_rs"] }

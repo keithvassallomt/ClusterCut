@@ -101,6 +101,7 @@ interface AppSettings {
   max_auto_download_size: number;
   notify_large_files: boolean;
   ignore_extension_missing: boolean;
+  compress_file_transfers: boolean;
 }
 
 /* --- Helper Components (from Design) --- */
@@ -1774,6 +1775,7 @@ function SettingsView({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [autostart, setAutostart] = useState(false);
+  const [compressDialogOpen, setCompressDialogOpen] = useState(false);
 
   useEffect(() => {
     // Check if backend handles state (Flatpak) or native fallback
@@ -2157,6 +2159,31 @@ function SettingsView({
               </div>
             </div>
           )}
+
+          {settings.enable_file_transfer && (
+            <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-white/10 dark:bg-white/5">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">Compress File Transfers</div>
+                  <div className="text-xs text-zinc-500">
+                    Speeds up transfers of large, compressible files (text, code, logs, datasets) on slower links. Files that are already compressed (images, video, archives, etc.) are skipped automatically.
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    if (!settings.compress_file_transfers) {
+                      setCompressDialogOpen(true);
+                    } else {
+                      setSettings({ ...settings, compress_file_transfers: false });
+                    }
+                  }}
+                  className={clsx("relative h-6 w-11 shrink-0 rounded-full transition-colors", settings.compress_file_transfers ? "bg-emerald-500" : "bg-zinc-200 dark:bg-zinc-700")}
+                >
+                  <span className={clsx("block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform", settings.compress_file_transfers ? "translate-x-6" : "translate-x-1")} />
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </Card>
 
@@ -2214,7 +2241,18 @@ function SettingsView({
         </div>
       </div>
 
-
+      <Dialog
+        open={compressDialogOpen}
+        title="Enable file transfer compression?"
+        description="This feature is incompatible with ClusterCut 0.2.2 and earlier. Files sent to peers running an older version will arrive corrupt. Make sure all your devices are on 0.2.3 or newer before enabling."
+        type="danger"
+        confirmLabel="Enable compression"
+        onConfirm={() => {
+          setSettings({ ...settings, compress_file_transfers: true });
+          setCompressDialogOpen(false);
+        }}
+        onCancel={() => setCompressDialogOpen(false)}
+      />
 
     </div>
   );
