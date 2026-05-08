@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-05-08
+
+### Changed
+- Inter font is now vendored locally via `@fontsource/inter` instead of being fetched from Google Fonts at runtime, keeping the app fully LAN-only (#7).
+
 ## [0.2.2] - 2026-04-19
 
 ### Added
