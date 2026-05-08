@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "clustercut"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-compression",
  "base64 0.22.1",
