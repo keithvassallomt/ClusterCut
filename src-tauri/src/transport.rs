@@ -45,8 +45,18 @@ impl Transport {
         send.write_all(data).await?;
         send.finish()?;
 
-        // Give the stream a moment to flush/be accepted before dropping the connection
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Wait until the peer has acknowledged all stream data before letting
+        // the connection drop. The previous fixed 500 ms sleep was fine for
+        // text payloads but raced multi-MB clipboard images — the function
+        // returned and the connection torn down while bytes were still in
+        // flight, surfacing as "connection lost" on the receiver mid-read.
+        // 30 s upper bound covers slow links without hanging forever if the
+        // peer dies.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            send.stopped(),
+        )
+        .await;
 
         Ok(())
     }
