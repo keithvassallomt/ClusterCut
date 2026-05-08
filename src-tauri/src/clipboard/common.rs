@@ -378,6 +378,19 @@ pub fn broadcast_clipboard(
                     let msg = Message::Clipboard(cipher);
                     let data = serde_json::to_vec(&msg).unwrap_or_default();
 
+                    // Diagnostic: see if we're brushing up against the 64 MB
+                    // receiver cap on transport.rs. This logs at info so it's
+                    // visible without DEBUG logging enabled.
+                    if let Some(b) = payload_obj.blob.as_ref() {
+                        tracing::info!(
+                            "Broadcasting clipboard blob: raw_decoded={} bytes, base64_inner={} bytes, payload_json={} bytes, wire_message={} bytes",
+                            b.decoded_len(),
+                            b.data.len(),
+                            payload_bytes.len(),
+                            data.len()
+                        );
+                    }
+
                     let peers = state.get_peers();
                     if !peers.is_empty() {
                         let notifications =

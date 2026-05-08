@@ -138,17 +138,27 @@ impl Transport {
                                             // encrypted ciphertext re-wrapped in
                                             // Message::Clipboard(Vec<u8>) which serde_json emits
                                             // as an integer array (~3.5×). Net ~50 MB worst case.
-                                            if let Ok(buf) =
-                                                recv.read_to_end(1024 * 1024 * 64).await
-                                            {
-                                                if !buf.is_empty() {
-                                                    on_receive_message(buf, remote_addr);
+                                            const MESSAGE_BYTE_CAP: usize = 1024 * 1024 * 64;
+                                            match recv.read_to_end(MESSAGE_BYTE_CAP).await {
+                                                Ok(buf) => {
+                                                    if !buf.is_empty() {
+                                                        on_receive_message(buf, remote_addr);
+                                                    }
                                                 }
-                                            } else {
-                                                tracing::error!(
-                                                    "Failed to read from stream from {}",
-                                                    remote_addr
-                                                );
+                                                Err(quinn::ReadToEndError::TooLong) => {
+                                                    tracing::error!(
+                                                        "Stream from {} exceeded {} byte cap; dropping. Likely a clipboard image larger than the supported wire size.",
+                                                        remote_addr,
+                                                        MESSAGE_BYTE_CAP
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Failed to read from stream from {}: {}",
+                                                        remote_addr,
+                                                        e
+                                                    );
+                                                }
                                             }
                                         }
                                         Err(_e) => {
