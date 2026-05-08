@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- Added a strict Content Security Policy to the Tauri WebView (`default-src 'self'`, no `'unsafe-eval'`, no remote sources). Defense-in-depth against XSS in untrusted data the app renders (clipboard contents, filenames). Thanks to @mdunphy for the suggestion (#10).
+
+### Changed
+- Bumped `@tauri-apps/api` to `~2.10.0` (#11).
+
 ## [0.2.3] - 2026-05-08
 
 ### Added
