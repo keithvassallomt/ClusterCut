@@ -35,15 +35,35 @@ impl Transport {
         addr: SocketAddr,
         data: &[u8],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let len = data.len();
+        let large = len > 256 * 1024;
+        if large {
+            tracing::info!("send_message: connecting to {} for {} byte payload", addr, len);
+        }
+
         // Use connect_with to enforce specific ALPN config
         let connection = self
             .endpoint
             .connect_with(self.transport_config.clone(), addr, "clustercut")?
             .await?;
+        if large {
+            tracing::info!("send_message: connection established to {}", addr);
+        }
+
         let (mut send, _recv) = connection.open_bi().await?;
+        if large {
+            tracing::info!("send_message: bi stream opened to {}", addr);
+        }
 
         send.write_all(data).await?;
+        if large {
+            tracing::info!("send_message: write_all done ({} bytes) to {}", len, addr);
+        }
+
         send.finish()?;
+        if large {
+            tracing::info!("send_message: finish() called on stream to {}", addr);
+        }
 
         // Wait until the peer has acknowledged all stream data before letting
         // the connection drop. The previous fixed 500 ms sleep was fine for
@@ -51,12 +71,31 @@ impl Transport {
         // returned and the connection torn down while bytes were still in
         // flight, surfacing as "connection lost" on the receiver mid-read.
         // 30 s upper bound covers slow links without hanging forever if the
-        // peer dies.
-        let _ = tokio::time::timeout(
+        // peer dies. Fall back to a data-size-proportional sleep if stopped()
+        // doesn't yield a clean ACK, so a quirky stopped() implementation
+        // can't strand the data either.
+        match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             send.stopped(),
         )
-        .await;
+        .await
+        {
+            Ok(Ok(None)) => {
+                if large {
+                    tracing::info!("send_message: peer ACKed all data ({} bytes) to {}", len, addr);
+                }
+            }
+            other => {
+                let fallback_ms = ((len as u64 / 1024).max(500)).min(15_000);
+                tracing::warn!(
+                    "send_message: stopped() didn't yield clean ACK to {} ({:?}); falling back to {} ms drain wait",
+                    addr,
+                    other,
+                    fallback_ms
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(fallback_ms)).await;
+            }
+        }
 
         Ok(())
     }
@@ -141,7 +180,7 @@ impl Transport {
                                 loop {
                                     match conn.accept_bi().await {
                                         Ok((_, mut recv)) => {
-                                            // tracing::debug!("Accepted message stream from {}", remote_addr);
+                                            tracing::info!("Accepted message stream from {}", remote_addr);
                                             // Cap each message at 64 MB. Sized to fit a 10 MB raw
                                             // clipboard image after the wire-format expansion:
                                             // base64 (1.33×) inside ClipboardPayload JSON, then the
@@ -152,7 +191,17 @@ impl Transport {
                                             match recv.read_to_end(MESSAGE_BYTE_CAP).await {
                                                 Ok(buf) => {
                                                     if !buf.is_empty() {
+                                                        tracing::info!(
+                                                            "Read {} bytes from message stream {}",
+                                                            buf.len(),
+                                                            remote_addr
+                                                        );
                                                         on_receive_message(buf, remote_addr);
+                                                    } else {
+                                                        tracing::warn!(
+                                                            "Empty message stream from {} — skipping",
+                                                            remote_addr
+                                                        );
                                                     }
                                                 }
                                                 Err(quinn::ReadToEndError::TooLong) => {
