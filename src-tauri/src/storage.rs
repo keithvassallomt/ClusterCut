@@ -157,6 +157,60 @@ pub fn save_known_peers(app: &AppHandle, peers: &HashMap<String, Peer>) {
     }
 }
 
+pub fn load_device_cert(app: &AppHandle) -> Option<(Vec<u8>, Vec<u8>)> {
+    let path_resolver = app.path();
+    let cert_path = path_resolver
+        .resolve("device_cert.der", BaseDirectory::AppConfig)
+        .ok()?;
+    let key_path = path_resolver
+        .resolve("device_key.der", BaseDirectory::AppConfig)
+        .ok()?;
+
+    if !cert_path.exists() || !key_path.exists() {
+        return None;
+    }
+
+    match (fs::read(&cert_path), fs::read(&key_path)) {
+        (Ok(cert), Ok(key)) if !cert.is_empty() && !key.is_empty() => {
+            tracing::debug!("Loaded device cert from disk.");
+            Some((cert, key))
+        }
+        _ => None,
+    }
+}
+
+pub fn save_device_cert(app: &AppHandle, cert_der: &[u8], key_der: &[u8]) {
+    let path_resolver = app.path();
+    let cert_path = match path_resolver.resolve("device_cert.der", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("Failed to resolve device cert path: {}", e);
+            return;
+        }
+    };
+    let key_path = match path_resolver.resolve("device_key.der", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("Failed to resolve device key path: {}", e);
+            return;
+        }
+    };
+
+    if let Some(parent) = cert_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if let Err(e) = fs::write(&cert_path, cert_der) {
+        tracing::error!("Failed to write device cert: {}", e);
+        return;
+    }
+    if let Err(e) = fs::write(&key_path, key_der) {
+        tracing::error!("Failed to write device key: {}", e);
+        return;
+    }
+    tracing::debug!("Saved device cert to disk.");
+}
+
 pub fn load_device_id(app: &AppHandle) -> String {
     let path_resolver = app.path();
     let path = match path_resolver.resolve("device_id", BaseDirectory::AppConfig) {

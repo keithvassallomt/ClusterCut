@@ -15,4 +15,9 @@ pub struct Peer {
     // Cluster Authentication Signature (Base64)
     #[serde(default)]
     pub signature: Option<String>,
-} // timestamp for pruning old peers
+    // SHA-256 of the peer's TLS cert DER. Set during pairing or learned via
+    // gossip from a trusted peer; absent for peers paired before cert-pinning
+    // landed (those connections fall back to skip-verify until re-pair).
+    #[serde(default)]
+    pub fingerprint: Option<Vec<u8>>,
+}
