@@ -57,6 +57,67 @@ impl ClipboardBlob {
     }
 }
 
+// One alternate clipboard representation alongside the primary plain `text`
+// (e.g. text/html, text/rtf, image/svg+xml). Receivers re-stock these on
+// the local clipboard so the destination app can pick whichever format it
+// understands best — same buffet the sender saw.
+//
+// Text formats (text/html, text/rtf, image/svg+xml, etc.) carry their bytes
+// directly as a UTF-8 string in `data` with `binary: false`. Binary formats
+// (anything not safely round-trippable as UTF-8) base64-encode the bytes
+// into `data` with `binary: true`. Same rationale as `ClipboardBlob.data`:
+// serde_json would otherwise emit `Vec<u8>` as `[1,2,3,…]` which is ~3.5×
+// larger than base64.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardFormat {
+    pub mime_type: String,
+    pub data: String,
+    #[serde(default)]
+    pub binary: bool,
+}
+
+impl ClipboardFormat {
+    /// Construct from a UTF-8 string (text/html, text/rtf, image/svg+xml, …).
+    pub fn from_text(mime_type: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data: text.into(),
+            binary: false,
+        }
+    }
+
+    /// Construct from arbitrary bytes — base64-encoded internally.
+    pub fn from_bytes(mime_type: impl Into<String>, bytes: &[u8]) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            binary: true,
+        }
+    }
+
+    /// Decode `data` back into raw bytes, transparently base64-decoding when
+    /// `binary == true`.
+    pub fn raw_bytes(&self) -> Result<Vec<u8>, String> {
+        if self.binary {
+            base64::engine::general_purpose::STANDARD
+                .decode(self.data.as_bytes())
+                .map_err(|e| format!("invalid base64 in ClipboardFormat.data: {}", e))
+        } else {
+            Ok(self.data.as_bytes().to_vec())
+        }
+    }
+
+    /// Decoded byte length — base64 estimate for binary, str length for text.
+    /// Used for size-cap checks and dedup signatures.
+    pub fn decoded_len(&self) -> usize {
+        if self.binary {
+            (self.data.len() / 4) * 3
+        } else {
+            self.data.len()
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClipboardPayload {
     pub id: String,
@@ -65,6 +126,12 @@ pub struct ClipboardPayload {
     pub files: Option<Vec<FileMetadata>>,
     #[serde(default)]
     pub blob: Option<ClipboardBlob>,
+    // Additional representations of the same copy event (text/html, text/rtf, …)
+    // alongside the primary `text`. Receivers re-stock all that they can write
+    // to their OS clipboard. Older peers without this field deserialize as None
+    // and just paste plain text — graceful degradation.
+    #[serde(default)]
+    pub formats: Option<Vec<ClipboardFormat>>,
     pub timestamp: u64,
     pub sender: String,
     pub sender_id: String,
@@ -168,6 +235,7 @@ mod tests {
             text: String::new(),
             files: None,
             blob,
+            formats: None,
             timestamp: 1_700_000_000,
             sender: "test-host".to_string(),
             sender_id: "test-id-123".to_string(),
@@ -238,5 +306,94 @@ mod tests {
         let original = sample_bytes();
         let blob = ClipboardBlob::from_bytes("image/png", &original, None, None);
         assert_eq!(blob.raw_bytes().unwrap(), original);
+    }
+
+    fn sample_payload_with_formats(formats: Vec<ClipboardFormat>) -> ClipboardPayload {
+        ClipboardPayload {
+            id: "fmt-id".to_string(),
+            text: "Hello bold world".to_string(),
+            files: None,
+            blob: None,
+            formats: Some(formats),
+            timestamp: 1_700_000_000,
+            sender: "test-host".to_string(),
+            sender_id: "test-id-123".to_string(),
+        }
+    }
+
+    #[test]
+    fn clipboard_format_text_round_trip_json() {
+        let html = ClipboardFormat::from_text(
+            "text/html",
+            "<p>Hello <strong>bold</strong> world</p>",
+        );
+        let payload = sample_payload_with_formats(vec![html.clone()]);
+        let json = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: ClipboardPayload = serde_json::from_slice(&json).expect("deserialize");
+        let formats = parsed.formats.expect("formats preserved");
+        assert_eq!(formats, vec![html]);
+    }
+
+    #[test]
+    fn clipboard_format_binary_round_trip_bytes() {
+        let raw = vec![0x00, 0x01, 0xFF, 0xFE, 0xAB, 0xCD];
+        let fmt = ClipboardFormat::from_bytes("application/octet-stream", &raw);
+        assert!(fmt.binary);
+        assert_eq!(fmt.raw_bytes().unwrap(), raw);
+    }
+
+    #[test]
+    fn clipboard_format_text_raw_bytes_is_utf8() {
+        let fmt = ClipboardFormat::from_text("text/html", "héllo");
+        assert!(!fmt.binary);
+        assert_eq!(fmt.raw_bytes().unwrap(), "héllo".as_bytes());
+    }
+
+    #[test]
+    fn clipboard_payload_pre_formats_format_deserializes_with_no_formats() {
+        // Simulates a payload from a 0.3.0-alpha peer (image-sync but no rich-text).
+        // The `formats` field is missing entirely.
+        let old_json = r#"{
+            "id": "abc",
+            "text": "hello",
+            "files": null,
+            "blob": null,
+            "timestamp": 1234,
+            "sender": "old-peer",
+            "sender_id": "id-old"
+        }"#;
+        let parsed: ClipboardPayload = serde_json::from_str(old_json).expect("parse old");
+        assert!(parsed.formats.is_none());
+        assert!(parsed.blob.is_none());
+        assert_eq!(parsed.text, "hello");
+    }
+
+    #[test]
+    fn clipboard_format_round_trip_through_encryption() {
+        let key = [0u8; 32];
+        let html = ClipboardFormat::from_text(
+            "text/html",
+            "<p>Hello <strong>bold</strong> world</p>",
+        );
+        let rtf = ClipboardFormat::from_text(
+            "text/rtf",
+            r"{\rtf1\ansi Hello {\b bold} world}",
+        );
+        let payload = sample_payload_with_formats(vec![html.clone(), rtf.clone()]);
+        let json = serde_json::to_vec(&payload).unwrap();
+        let cipher = crate::crypto::encrypt(&key, &json).unwrap();
+        let plain = crate::crypto::decrypt(&key, &cipher).unwrap();
+        let recovered: ClipboardPayload = serde_json::from_slice(&plain).unwrap();
+        let formats = recovered.formats.expect("formats survive crypto");
+        assert_eq!(formats, vec![html, rtf]);
+    }
+
+    #[test]
+    fn clipboard_format_binary_field_defaults_to_false() {
+        // An older payload that pre-dates the `binary` flag should still parse.
+        let json = r#"{"mime_type":"text/html","data":"<p>x</p>"}"#;
+        let parsed: ClipboardFormat = serde_json::from_str(json).unwrap();
+        assert!(!parsed.binary);
+        assert_eq!(parsed.data, "<p>x</p>");
     }
 }

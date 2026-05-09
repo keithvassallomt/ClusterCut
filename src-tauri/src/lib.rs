@@ -1710,6 +1710,7 @@ async fn send_clipboard(
         sender_id: local_id,
         files: None,
         blob: None,
+        formats: None,
     };
 
     // Emit local event so history updates
@@ -3028,6 +3029,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                             sender_id: "unknown".to_string(),
                                             files: None,
                                             blob: None,
+                                            formats: None,
                                         }
                                     )
                             } else {
@@ -3107,6 +3109,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 text: text.clone(),
                                 files: payload.files.clone(),
                                 blob: payload.blob.clone(),
+                                formats: payload.formats.clone(),
                                 timestamp: ts,
                                 sender: sender.clone(),
                                 sender_id: payload.sender_id.clone(),
@@ -4040,6 +4043,7 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
                                 sender_id: local_id,
                                 files: None,
                                 blob: None,
+                                formats: None,
                             };
                         
                         // Emit local event

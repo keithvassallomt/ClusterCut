@@ -18,9 +18,12 @@ pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
 /// re-broadcast back to that peer.
 ///
 /// Format:
-/// - Files:  `FILES:name1:size1;name2:size2;…`
-/// - Blob:   `BLOB:<mime>:<base64_len>:<head16_hex>:<tail16_hex>`
-/// - Text:   the text itself (or empty string)
+/// - Files:    `FILES:name1:size1;name2:size2;…`
+/// - Blob:     `BLOB:<mime>:<base64_len>:<head16_hex>:<tail16_hex>`
+/// - Formats:  `<text>|FORMATS:mime1:len1;mime2:len2;…` (when `formats` is
+///             non-empty; the text portion still distinguishes two copies
+///             that happen to carry the same MIME set with different bytes)
+/// - Text:     the text itself (or empty string)
 pub fn payload_signature(payload: &ClipboardPayload) -> String {
     if let Some(files) = payload.files.as_ref() {
         if !files.is_empty() {
@@ -47,6 +50,17 @@ pub fn payload_signature(payload: &ClipboardPayload) -> String {
             let _ = write!(sig, "{:02x}", b);
         }
         return sig;
+    }
+    if let Some(formats) = payload.formats.as_ref() {
+        if !formats.is_empty() {
+            let mut sig = payload.text.clone();
+            sig.push_str("|FORMATS:");
+            for f in formats {
+                use std::fmt::Write;
+                let _ = write!(sig, "{}:{};", f.mime_type, f.data.len());
+            }
+            return sig;
+        }
     }
     payload.text.clone()
 }
@@ -219,6 +233,7 @@ pub fn process_clipboard_change(
                 text,
                 files: None,
                 blob: None,
+                formats: None,
                 timestamp: ts,
                 sender: hostname,
                 sender_id: local_id,
@@ -317,6 +332,7 @@ pub fn process_clipboard_change(
                     text: String::new(),
                     files: Some(file_metas),
                     blob: None,
+                    formats: None,
                     timestamp: ts,
                     sender: hostname,
                     sender_id: local_id,
@@ -345,6 +361,7 @@ pub fn process_clipboard_change(
                 text: String::new(),
                 files: None,
                 blob: Some(blob),
+                formats: None,
                 timestamp: ts,
                 sender: hostname,
                 sender_id: local_id,
@@ -510,4 +527,63 @@ pub fn set_clipboard_blob_with_ignore(
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ClipboardFormat;
+
+    fn payload_with(text: &str, formats: Option<Vec<ClipboardFormat>>) -> ClipboardPayload {
+        ClipboardPayload {
+            id: "id".to_string(),
+            text: text.to_string(),
+            files: None,
+            blob: None,
+            formats,
+            timestamp: 0,
+            sender: "host".to_string(),
+            sender_id: "device".to_string(),
+        }
+    }
+
+    #[test]
+    fn signature_plain_text_is_just_text() {
+        let p = payload_with("hello", None);
+        assert_eq!(payload_signature(&p), "hello");
+    }
+
+    #[test]
+    fn signature_with_empty_formats_falls_back_to_text() {
+        let p = payload_with("hello", Some(vec![]));
+        assert_eq!(payload_signature(&p), "hello");
+    }
+
+    #[test]
+    fn signature_with_formats_includes_mime_and_lengths() {
+        let html = ClipboardFormat::from_text("text/html", "<p>Hi</p>");
+        let rtf = ClipboardFormat::from_text("text/rtf", r"{\rtf1 Hi}");
+        let p = payload_with("Hi", Some(vec![html.clone(), rtf.clone()]));
+        let sig = payload_signature(&p);
+        assert!(sig.starts_with("Hi|FORMATS:"), "got: {}", sig);
+        assert!(sig.contains(&format!("text/html:{};", html.data.len())));
+        assert!(sig.contains(&format!("text/rtf:{};", rtf.data.len())));
+    }
+
+    #[test]
+    fn signature_distinguishes_same_text_different_formats() {
+        let html_a = ClipboardFormat::from_text("text/html", "<p>v1</p>");
+        let html_b = ClipboardFormat::from_text("text/html", "<p>version 2</p>");
+        let a = payload_with("plain", Some(vec![html_a]));
+        let b = payload_with("plain", Some(vec![html_b]));
+        assert_ne!(payload_signature(&a), payload_signature(&b));
+    }
+
+    #[test]
+    fn signature_distinguishes_different_text_same_formats() {
+        let html = ClipboardFormat::from_text("text/html", "<p>x</p>");
+        let a = payload_with("first", Some(vec![html.clone()]));
+        let b = payload_with("second", Some(vec![html]));
+        assert_ne!(payload_signature(&a), payload_signature(&b));
+    }
 }
