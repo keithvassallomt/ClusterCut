@@ -147,11 +147,10 @@ pub fn set_clipboard_paths(app: &AppHandle, paths: Vec<String>) {
 
 /// Write plain text plus alternate format representations (text/html, text/rtf,
 /// …) onto the local clipboard so the destination app can pick whichever
-/// format it understands best. Wayland wlroots and the Plugin backend
-/// (Windows / macOS) carry the rich formats end-to-end; X11 (also Plugin) and
-/// the GNOME-extension backend fall back to writing plain text only — Phase 4
-/// will fill in the GNOME-extension path; X11 rich-text is intentionally
-/// out of scope.
+/// format it understands best. Wayland wlroots, GNOME-extension, and the
+/// Plugin backend (Windows / macOS) carry the rich formats end-to-end. X11
+/// (also Plugin) is intentionally out of scope — its set_clipboard_rich falls
+/// back to plain text via tauri-plugin-clipboard.
 pub fn set_clipboard_rich(app: &AppHandle, text: String, formats: Vec<ClipboardFormat>) {
     #[cfg(not(target_os = "linux"))]
     {
@@ -168,8 +167,7 @@ pub fn set_clipboard_rich(app: &AppHandle, text: String, formats: Vec<ClipboardF
                 plugin::set_clipboard_rich(app, text, formats);
             }
             ClipboardBackend::GnomeExtension => {
-                let _ = formats;
-                dbus_clipboard::set_clipboard(app, text);
+                dbus_clipboard::set_clipboard_rich(app, text, formats);
             }
             ClipboardBackend::Degraded => {
                 tracing::warn!(
