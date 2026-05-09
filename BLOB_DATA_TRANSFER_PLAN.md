@@ -143,12 +143,13 @@ RTF is uniform: same bytes everywhere, no wrapping required.
 
 ### Per-backend implementation sketch
 
-The same four backends, with the additions:
+The four backends, with the additions:
 
 | Backend | Read | Write |
 |---|---|---|
-| **X11 / macOS / Windows** | Add MIME-aware reads to the existing arboard-shim thread. arboard 3.x **doesn't** expose `get_html` or arbitrary MIMEs, so this means either upstreaming a PR, vendoring a thin wrapper around `clipboard-win` (Windows), `x11rb` (X11), and `objc`/`NSPasteboard` (macOS), or — most likely — using crates like `clipboard-master` + per-OS code. | Same wrappers, `set_html` / `set_rtf`. Windows write needs `wrap_cf_html`. macOS just sets `public.html` / `public.rtf`. X11 sets `text/html` and/or `text/rtf` selection targets — Selection ownership needs a long-running owner because X11's "lazy paste" model holds the data on the source until requested |
-| **Wayland wlroots** | `wl_clipboard_rs::paste::get_mime_types` already used; just add `text/html` and `text/rtf` to the priority probe, alongside the image MIMEs | `copy::Source::Bytes` with multiple `MimeSource` entries (already do this for `text/uri-list` + `x-special/gnome-copied-files`); add `text/html` and `text/rtf` rows |
+| **Windows / macOS** | Add MIME-aware reads to the existing arboard-shim thread. arboard 3.x doesn't expose `get_html` or arbitrary MIMEs, so this is direct calls into `clipboard-win` (Windows) and `objc2`/`NSPasteboard` (macOS) — both small, well-documented APIs | Same wrappers, `set_html` / `set_rtf`. Windows write needs `wrap_cf_html` (compute the `Version:`/`StartHTML:`/`EndHTML:`/`StartFragment:`/`EndFragment:` byte-offset header). macOS just sets `public.html` / `public.rtf` |
+| **X11** | **Out of scope** for rich-text. Plain-text + files + images keep working unchanged via tauri-plugin-clipboard + the arboard image shim — no regression. X11 selection ownership requires a persistent owner thread responding to `SelectionRequest` events, and arboard's API doesn't let you add MIME targets to its existing owner; layering a third selection-owner alongside `tauri-plugin-clipboard` and `arboard` is high-risk. X11 is also a declining platform, so the cost/benefit doesn't justify the work | **Out of scope** as above. **Documentation reminder**: when user-facing docs are written, explicitly note that rich-text (HTML/RTF) clipboard sync is not supported on X11 — plain text, files, and images sync as normal |
+| **Wayland wlroots** | `wl_clipboard_rs::paste::get_mime_types` already used; add `text/html` and `text/rtf` to the priority probe, alongside the image MIMEs | `copy::Source::Bytes` with multiple `MimeSource` entries (already do this for `text/uri-list` + `x-special/gnome-copied-files`); add `text/html` and `text/rtf` rows |
 | **GNOME extension** | Add a generic `ReadAllFormats(in as mimes, out a(say) blobs)` D-Bus method, or extend the existing `BlobChanged` to carry a list. Folded into the **v4.0** release alongside the image blob methods so EGO only verifies once — v4.0 isn't shipped/submitted until both feature sets are in | Generic `WriteAllFormats(in a(say))` — JS calls `clipboard.set_content(type, mime, bytes)` for each. Echo prevention reuses the existing `_ignoreUntil` window |
 
 ### Smart capture rules
@@ -171,7 +172,7 @@ A history entry that carries `text` + `text/html` shouldn't show two cards — i
 
 1. Wire-format plumbing: `ClipboardFormat` struct, `formats` field on `ClipboardPayload`, signature update, round-trip tests. No backend wiring yet — same shape as Phase 1 of the image rollout.
 2. Wayland wlroots backend — easiest, reuses the existing MIME probe path. Validate with a Word document copied via Wayland-GNOME → KDE.
-3. X11 / Windows / macOS backend — the work-heavy phase. Likely needs more direct OS calls than `arboard` exposes today; potentially a small `clipboard-formats` crate of our own.
+3. Windows + macOS backend — direct calls into `clipboard-win` and `NSPasteboard` for HTML/RTF reads and writes, plus the `wrap_cf_html`/`strip_cf_html` helpers for Windows' Microsoft-specific HTML wrapper. **X11 is intentionally out of scope** for rich-text — see the per-backend table above for why. X11 keeps text/files/images via the existing paths, no regression.
 4. GNOME extension — add the rich-text format methods to the **same v4.0** D-Bus interface that already carries the image blob methods. EGO submission for v4.0 is held until this lands so the extension goes through verification once for the whole 0.3.0 cycle.
 5. Frontend — render rich previews, distinguish plain-vs-rich items.
 6. Smart-capture allowlist + edge-case polish — Word, Apple Mail, Outlook, Notion, VS Code (each puts wildly different things on the clipboard).
@@ -229,9 +230,9 @@ Today both ends just trust that the wire shape matches. With more formats in fli
 
 | # | Phase | Status |
 |---|---|---|
-| 1 | Wire-format plumbing (`ClipboardFormat`, `formats` field, signature, round-trip tests) | ⬜ not started |
-| 2 | Backend B — Wayland wlroots (extend MIME probe + multi-MimeSource write) | ⬜ not started |
-| 3 | Backend A — X11 / Windows / macOS (HTML/RTF reads/writes; CF_HTML wrap/strip helpers) | ⬜ not started |
+| 1 | Wire-format plumbing (`ClipboardFormat`, `formats` field, signature, round-trip tests) | ✅ complete |
+| 2 | Backend B — Wayland wlroots (extend MIME probe + multi-MimeSource write) | ✅ complete |
+| 3 | Backend A — Windows + macOS (HTML/RTF reads/writes; CF_HTML wrap/strip helpers). **X11 intentionally out of scope** — too costly for a declining platform | ⬜ not started |
 | 4 | Backend C — GNOME extension v4.0 (add format methods to the same v4.0 release as image blobs) | ⬜ not started |
 | 5 | Frontend — rich previews, plain-vs-rich badge | ⬜ not started |
 | 6 | Smart-capture allowlist + cross-app edge cases (Word, Apple Mail, Outlook, Notion, VS Code) | ⬜ not started |
@@ -240,4 +241,4 @@ Today both ends just trust that the wire shape matches. With more formats in fli
 
 | # | Phase | Status |
 |---|---|---|
-| 7 | CHANGELOG, metainfo, docs, end-to-end testing, EGO submission for extension v4.0 | ⏸ deferred until rich-text lands |
+| 7 | CHANGELOG, metainfo, **docs (note rich-text not supported on X11)**, end-to-end testing, EGO submission for extension v4.0 | ⏸ deferred until rich-text lands |
