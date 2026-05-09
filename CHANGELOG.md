@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Bumped `@tauri-apps/api` to `~2.10.0` (#11).
+- The "having trouble connecting?" modal at startup now suppresses itself when at least one of your manual peers is on a directly-reachable subnet. Previously any manual peer in `known_peers.json` would trigger the modal whenever no peers were online, even if you were sitting on the same LAN as that peer (in which case "no peers online" just means peers are offline, not a VPN/connectivity problem). Uses an approximate /24 same-subnet check against local interfaces.
 
 ## [0.2.3] - 2026-05-08
 

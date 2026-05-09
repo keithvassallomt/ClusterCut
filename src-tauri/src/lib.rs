@@ -1187,6 +1187,22 @@ fn get_known_peers(state: tauri::State<AppState>) -> std::collections::HashMap<S
     state.known_peers.lock().unwrap().clone()
 }
 
+/// Returns true when the user has at least one manual peer AND none of those
+/// manual peers are on a directly-reachable subnet. This is the gate for the
+/// "having trouble connecting?" modal — show it only when we'd actually expect
+/// remote/VPN connectivity to a manual peer. If a manual peer is on the local
+/// subnet, "no peers online" just means peers are offline, not a connection
+/// problem worth surfacing.
+#[tauri::command]
+fn expects_remote_manual_peers(state: tauri::State<AppState>) -> bool {
+    let peers = state.known_peers.lock().unwrap();
+    let manual: Vec<_> = peers.values().filter(|p| p.is_manual).collect();
+    if manual.is_empty() {
+        return false;
+    }
+    !manual.iter().any(|p| is_in_local_subnet(p.ip))
+}
+
 #[tauri::command]
 fn log_frontend(message: String, level: Option<String>) {
     match level.as_deref() {
@@ -2606,6 +2622,7 @@ pub fn run() {
             get_hostname,
             get_settings,
             get_known_peers,
+            expects_remote_manual_peers,
             log_frontend,
             save_settings,
             set_network_identity,
@@ -4144,6 +4161,28 @@ fn is_local_ip(ip: std::net::IpAddr) -> bool {
              if local_ip == ip {
                  return true;
              }
+        }
+    }
+    false
+}
+
+// Approximate same-subnet check: same first three IPv4 octets as one of our
+// own NIC IPs. We don't have netmask info from `local-ip-address`, so this is
+// a /24 heuristic — fine for the home/SMB networks ClusterCut targets but
+// will miss /23 or wider segments.
+fn is_in_local_subnet(ip: std::net::IpAddr) -> bool {
+    let target = match ip {
+        std::net::IpAddr::V4(v4) => v4.octets(),
+        std::net::IpAddr::V6(_) => return false,
+    };
+    if let Ok(ifaces) = list_afinet_netifas() {
+        for (_name, local_ip) in ifaces {
+            if let std::net::IpAddr::V4(local_v4) = local_ip {
+                let local = local_v4.octets();
+                if local[0] == target[0] && local[1] == target[1] && local[2] == target[2] {
+                    return true;
+                }
+            }
         }
     }
     false

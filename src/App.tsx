@@ -25,7 +25,6 @@ const internalLogToBackend = (level: string | null, msg: string, ...args: any[])
 };
 
 const logToBackend = (msg: string, ...args: any[]) => internalLogToBackend(null, msg, ...args);
-const logDebugToBackend = (msg: string, ...args: any[]) => internalLogToBackend("debug", msg, ...args);
 
 /* --- Types --- */
 // ... (rest of imports)
@@ -504,14 +503,14 @@ export default function App() {
   const [retryCount, setRetryCount] = useState(0);
   const [hasManualPeers, setHasManualPeers] = useState(false);
 
-  // Check for manual peers on startup
+  // Show the "trouble connecting?" modal only when we have manual peers AND
+  // none of them are on a directly-reachable subnet. If a manual peer is local,
+  // "no peers online" just means peers are offline, not a connection problem.
   useEffect(() => {
-    invoke<Record<string, Peer>>("get_known_peers").then(map => {
-      logDebugToBackend("Known Peers Raw:", map);
-      const hasManual = Object.values(map).some(p => p.is_manual);
-      logToBackend("Computed hasManual:", hasManual);
-      setHasManualPeers(hasManual);
-    }).catch(e => logToBackend("Error fetching known peers:", e));
+    invoke<boolean>("expects_remote_manual_peers").then(expects => {
+      logToBackend("Computed expectsRemoteManualPeers:", expects);
+      setHasManualPeers(expects);
+    }).catch(e => logToBackend("Error fetching expects_remote_manual_peers:", e));
   }, [settings, retryCount]); // Re-check if settings change or we retry
 
   useEffect(() => {
