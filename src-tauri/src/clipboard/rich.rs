@@ -84,23 +84,30 @@ mod windows {
         };
 
         // HTML: clipboard-win's `Html` Getter handles the CF_HTML byte-offset
-        // header for us, returning the HTML fragment as a String.
+        // header for us, returning the HTML fragment as a String. `Html::new`
+        // registers the CF_HTML format atom — None means the registration call
+        // failed, in which case there's nothing to read.
         let mut html_buf = String::new();
-        match Html.read_clipboard(&mut html_buf) {
-            Ok(_) if !html_buf.is_empty() => {
-                if html_buf.len() > MAX_RICH_TEXT_BYTES {
-                    tracing::warn!(
-                        "Clipboard HTML ({} bytes) exceeds {} byte cap; skipping format.",
-                        html_buf.len(),
-                        MAX_RICH_TEXT_BYTES
-                    );
-                } else {
-                    out.push(ClipboardFormat::from_text("text/html", html_buf));
+        match Html::new() {
+            Some(html) => match html.read_clipboard(&mut html_buf) {
+                Ok(_) if !html_buf.is_empty() => {
+                    if html_buf.len() > MAX_RICH_TEXT_BYTES {
+                        tracing::warn!(
+                            "Clipboard HTML ({} bytes) exceeds {} byte cap; skipping format.",
+                            html_buf.len(),
+                            MAX_RICH_TEXT_BYTES
+                        );
+                    } else {
+                        out.push(ClipboardFormat::from_text("text/html", html_buf));
+                    }
                 }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!("Html getter returned: {}", e);
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!("Html getter returned: {}", e);
+                }
+            },
+            None => {
+                tracing::debug!("Couldn't register CF_HTML format atom");
             }
         }
 
@@ -181,10 +188,12 @@ mod windows {
         raw::empty().map_err(|e| format!("EmptyClipboard: {}", e))?;
 
         // Plain text must be set first via Unicode (CF_UNICODETEXT) so apps
-        // that only consume plain text get something. `Setter<str>` takes
-        // `&str` so we pass `text` directly, not `&text`.
+        // that only consume plain text get something. The `Setter<T>` impl is
+        // `impl<T: AsRef<str>> Setter<T> for Unicode`, and `T` defaults to
+        // `Sized` — passing `text: &str` directly would make `T = str` which
+        // is unsized. `&text` makes `T = &str`, which is sized.
         Unicode
-            .write_clipboard(text)
+            .write_clipboard(&text)
             .map_err(|e| format!("CF_UNICODETEXT: {}", e))?;
 
         let rtf_id = rtf_format_id();
@@ -193,10 +202,13 @@ mod windows {
             match f.mime_type.as_str() {
                 "text/html" => {
                     // Html setter takes the unwrapped fragment and adds the
-                    // CF_HTML header for us.
+                    // CF_HTML header for us. `Html::new` registers the format
+                    // atom; None means registration failed.
                     let html_str = std::str::from_utf8(&bytes)
                         .map_err(|e| format!("text/html not UTF-8: {}", e))?;
-                    Html.write_clipboard(html_str)
+                    let html = Html::new()
+                        .ok_or_else(|| "couldn't register CF_HTML format atom".to_string())?;
+                    html.write_clipboard(&html_str)
                         .map_err(|e| format!("CF_HTML: {}", e))?;
                 }
                 "text/rtf" => {
@@ -204,7 +216,7 @@ mod windows {
                         "couldn't register Rich Text Format atom".to_string()
                     })?;
                     RawData(id)
-                        .write_clipboard(bytes.as_slice())
+                        .write_clipboard(&bytes)
                         .map_err(|e| format!("CF_RTF: {}", e))?;
                 }
                 other => {
