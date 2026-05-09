@@ -14,10 +14,32 @@ use super::rich;
 use crate::protocol::{ClipboardBlob, ClipboardFormat};
 use crate::state::AppState;
 use crate::transport::Transport;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::{thread, sync::mpsc};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard::Clipboard;
+
+/// Commands the clipboard worker thread accepts. The worker owns the only
+/// `arboard::Clipboard` handle in the process; routing all reads *and* image
+/// writes through it serialises Windows clipboard access on a single thread,
+/// which Win32 requires (clipboard ownership is per-thread, not per-process,
+/// and another thread calling `OpenClipboard` mid-`SetClipboardData` was
+/// surfacing as ERROR_CLIPBOARD_NOT_OPEN / os error 1418 on the setter).
+enum WorkerCommand {
+    Read,
+    SetImage {
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+        response: mpsc::Sender<Result<(), String>>,
+    },
+}
+
+/// Worker command sender, populated by `start_monitor`. The image write path
+/// looks this up to dispatch onto the worker thread instead of opening its
+/// own arboard handle on whichever thread it happens to be running on.
+static WORKER_CMD_TX: OnceLock<mpsc::Sender<WorkerCommand>> = OnceLock::new();
 
 /// Cap on RGBA bytes returned by arboard. A 4K image is ~33 MB; 200 MB
 /// covers up to ~7K screenshots without risking absurd allocations.
@@ -87,9 +109,13 @@ fn read_clipboard_image_arboard(arboard: &mut arboard::Clipboard) -> Option<Clip
     ))
 }
 
-/// Decode a PNG blob into RGBA and hand it to arboard, which writes the
-/// platform-canonical formats (CF_DIB/CF_DIBV5 on Windows; NSPasteboardTypePNG
-/// + NSPasteboardTypeTIFF on macOS; image/png on X11).
+/// Decode a clipboard image blob to RGBA on the caller thread, then dispatch
+/// the actual `arboard::set_image` call to the clipboard worker. The worker
+/// holds the only `arboard::Clipboard` handle in the process and also services
+/// the polling reads, so reads and writes are naturally serialised on one
+/// thread — required on Windows, where competing `OpenClipboard` calls from a
+/// different thread were surfacing as ERROR_CLIPBOARD_NOT_OPEN (os error 1418)
+/// inside arboard's `SetClipboardData`.
 fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Result<(), String> {
     let format = match blob.mime_type.as_str() {
         "image/png" => image::ImageFormat::Png,
@@ -109,27 +135,58 @@ fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Resu
     let height = rgba.height() as usize;
     let raw = rgba.into_raw();
 
-    // Retry with backoff. Windows in particular (error 1418 / ERROR_CLIPBOARD_NOT_OPEN)
-    // can fail if tauri-plugin-clipboard's monitor or another clipboard-aware process
-    // grabs the clipboard between our OpenClipboard and SetClipboardData calls.
-    // arboard's internal retry is short (~250 ms total); a longer outer retry covers
-    // briefly-stuck monitors. ImageData consumes its bytes, so we rebuild it per attempt
-    // from the same `raw` Vec via Cow::Borrowed (cheap — no copy until consumed).
+    let sender = WORKER_CMD_TX
+        .get()
+        .ok_or_else(|| "clipboard worker not initialised".to_string())?
+        .clone();
+    let (tx, rx) = mpsc::channel();
+    sender
+        .send(WorkerCommand::SetImage {
+            width,
+            height,
+            rgba: raw,
+            response: tx,
+        })
+        .map_err(|_| "clipboard worker channel closed".to_string())?;
+
+    // Bound the wait so a stuck worker can't hang the receive callback. The
+    // worker may be mid-`Read` when the SetImage arrives, so the actual delay
+    // is ≤ one poll cycle (~500 ms) plus the set_image retry budget below
+    // (~1.6 s worst case). 15 s leaves comfortable headroom.
+    match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("clipboard worker did not respond within 15 s".to_string())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("clipboard worker dropped response channel".to_string())
+        }
+    }
+}
+
+/// Worker-thread side of the image write. Uses the persistent
+/// `arboard::Clipboard` handle so `OpenClipboard`/`CloseClipboard` happen on
+/// the same thread that does all clipboard reads — no cross-thread contention.
+/// The retry loop covers brief contention with external clipboard-aware
+/// processes (e.g. clipboard managers) that we can't serialise against.
+fn set_image_with_handle(
+    arb: &mut arboard::Clipboard,
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+) -> Result<(), String> {
     const MAX_ATTEMPTS: u32 = 6;
     let mut last_err: Option<String> = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let img_data = arboard::ImageData {
             width,
             height,
-            bytes: std::borrow::Cow::Borrowed(&raw),
+            bytes: std::borrow::Cow::Borrowed(rgba),
         };
-        let result = arboard::Clipboard::new()
-            .map_err(|e| format!("arboard init failed: {}", e))
-            .and_then(|mut clip| {
-                clip.set_image(img_data)
-                    .map_err(|e| format!("arboard set_image failed: {}", e))
-            });
-        match result {
+        match arb
+            .set_image(img_data)
+            .map_err(|e| format!("arboard set_image failed: {}", e))
+        {
             Ok(()) => {
                 if attempt > 1 {
                     tracing::info!("Clipboard image set succeeded on attempt {}", attempt);
@@ -139,7 +196,7 @@ fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Resu
             Err(e) => {
                 last_err = Some(e.clone());
                 if attempt < MAX_ATTEMPTS {
-                    let backoff_ms = 50_u64 * (1 << (attempt - 1)).min(8); // 50, 100, 200, 400, 400, then give up
+                    let backoff_ms = 50_u64 * (1 << (attempt - 1)).min(8);
                     tracing::warn!(
                         "Clipboard image set attempt {}/{} failed: {}. Retrying in {} ms",
                         attempt,
@@ -147,7 +204,7 @@ fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Resu
                         e,
                         backoff_ms
                     );
-                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
                 }
             }
         }
@@ -315,8 +372,13 @@ pub fn write_text_direct(app: &AppHandle, text: String) -> Result<(), String> {
 pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transport) {
     let app_handle_worker = app_handle.clone();
 
-    let (cmd_tx, cmd_rx) = mpsc::channel::<()>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
     let (res_tx, res_rx) = mpsc::channel::<ClipboardContent>();
+
+    // Publish the sender so `write_clipboard_image_arboard` can dispatch
+    // image writes onto this thread. `set` returns Err if already initialised;
+    // start_monitor is only meant to run once, so silently ignoring is fine.
+    let _ = WORKER_CMD_TX.set(cmd_tx.clone());
 
     // Worker Thread
     thread::spawn(move || {
@@ -334,10 +396,29 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
             }
         };
 
-        while cmd_rx.recv().is_ok() {
-            let content = read_clipboard(&app_handle_worker, arboard_clip.as_mut());
-            if res_tx.send(content).is_err() {
-                break;
+        while let Ok(cmd) = cmd_rx.recv() {
+            match cmd {
+                WorkerCommand::Read => {
+                    let content = read_clipboard(&app_handle_worker, arboard_clip.as_mut());
+                    if res_tx.send(content).is_err() {
+                        break;
+                    }
+                }
+                WorkerCommand::SetImage {
+                    width,
+                    height,
+                    rgba,
+                    response,
+                } => {
+                    let result = match arboard_clip.as_mut() {
+                        Some(arb) => set_image_with_handle(arb, width, height, &rgba),
+                        None => Err("arboard handle unavailable on worker".to_string()),
+                    };
+                    // Best-effort: if the caller already gave up (timeout),
+                    // the receiver side is gone and send returns Err. Either
+                    // way the worker continues servicing future commands.
+                    let _ = response.send(result);
+                }
             }
         }
     });
@@ -352,17 +433,25 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 break;
             }
 
-            if cmd_tx.send(()).is_err() {
+            if cmd_tx.send(WorkerCommand::Read).is_err() {
                 tracing::error!("Clipboard worker thread died.");
                 break;
             }
 
-            let current_content = match res_rx.recv_timeout(Duration::from_millis(500)) {
+            // 5 s comfortably covers a SetImage running through its retry
+            // budget on the worker (~50+100+200+400+400 ms backoff plus
+            // arboard's internal `Clipboard::new_attempts` retries — ≤3.5 s
+            // worst case). A healthy Read returns in milliseconds, so a real
+            // timeout here means the worker is genuinely stuck, not just busy.
+            // On timeout we sleep before continuing so we don't hot-spin and
+            // pile Read commands behind whatever the worker is doing.
+            let current_content = match res_rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(c) => c,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     tracing::warn!(
-                        "Clipboard read timed out (possible deadlock/lock). Skipping cycle."
+                        "Clipboard worker did not respond within 5 s — likely external clipboard contention or a stuck handle."
                     );
+                    thread::sleep(Duration::from_millis(500));
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
