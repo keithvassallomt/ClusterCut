@@ -380,14 +380,20 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
 
             let current_content = read_clipboard();
 
-            if common::should_process_content(&current_content, &last_content) {
-                last_content = current_content.clone();
-                common::process_clipboard_change(
-                    current_content,
-                    &app_handle,
-                    &state,
-                    &transport,
-                );
+            match common::should_process_content(&current_content, &last_content) {
+                common::EchoVerdict::Process => {
+                    last_content = current_content.clone();
+                    common::process_clipboard_change(
+                        current_content,
+                        &app_handle,
+                        &state,
+                        &transport,
+                    );
+                }
+                common::EchoVerdict::Echo => {
+                    last_content = current_content;
+                }
+                common::EchoVerdict::NoChange => {}
             }
 
             thread::sleep(Duration::from_millis(500));

@@ -417,16 +417,20 @@ pub fn start_monitor(
             };
 
             if let Some(current_content) = new_content {
-                if common::should_process_content(&current_content, &last_content) {
-                    last_content = current_content.clone();
-                    common::process_clipboard_change(
-                        current_content,
-                        &app_handle,
-                        &state,
-                        &transport,
-                    );
-                } else {
-                    last_content = current_content;
+                match common::should_process_content(&current_content, &last_content) {
+                    common::EchoVerdict::Process => {
+                        last_content = current_content.clone();
+                        common::process_clipboard_change(
+                            current_content,
+                            &app_handle,
+                            &state,
+                            &transport,
+                        );
+                    }
+                    common::EchoVerdict::Echo => {
+                        last_content = current_content;
+                    }
+                    common::EchoVerdict::NoChange => {}
                 }
             }
         }

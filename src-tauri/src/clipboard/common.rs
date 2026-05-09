@@ -229,29 +229,49 @@ fn rich_eq_stable(
     ign_mimes == curr_mimes
 }
 
+/// Outcome of an IGNORED-guard check. The caller uses this to decide both
+/// whether to broadcast AND whether to advance `last_content` — bundling the
+/// two stops the bug where a successful echo-suppression leaves
+/// `last_content` stale, so the next poll sees the same content as "new"
+/// and broadcasts it (which was the loop-back observed in production).
+pub enum EchoVerdict {
+    /// Real new content — broadcast it. Caller should also set
+    /// `last_content = current`.
+    Process,
+    /// Echo of our own write — IGNORED guard matched and was cleared. Don't
+    /// broadcast, but caller MUST set `last_content = current` so the next
+    /// poll doesn't re-flag the same content as "new" via the `IGNORED is
+    /// None` branch.
+    Echo,
+    /// Nothing to do — content unchanged from last seen, or empty. Caller
+    /// leaves `last_content` alone.
+    NoChange,
+}
+
 /// Process a clipboard read result through the dedup/feedback-loop logic.
-/// Returns true if the content should be broadcast.
 ///
-/// Logging contract for the [Echo] tag (`info!`): emitted only when an
-/// IGNORED guard is active, on every monitor read. One of:
-///   `[Echo] Check: ignored=… current=… -> MATCH (clearing guard)`
-///   `[Echo] Check: ignored=… current=… -> MISS (reason=…)` followed by
+/// Logging contract for the [Echo] tag (`info!`):
+///   `[Echo] Check: ignored=… current=… -> MATCH (clearing guard)` — guard fired
+///   `[Echo] Check: ignored=… current=… -> MISS (reason=…)` — guard didn't fire
 ///   `[Echo] Triggering loop-back broadcast — IGNORED check missed`
-/// if the miss leads to a broadcast. A successful suppression is the
-/// MATCH branch; any MISS that goes on to broadcast is a bug.
+///     (only when a MISS leads to an actual broadcast)
+/// A MATCH should never be followed by a broadcast for the same content.
 pub fn should_process_content(
     current_content: &ClipboardContent,
     last_content: &ClipboardContent,
-) -> bool {
-    let mut should_process = false;
+) -> EchoVerdict {
+    if *current_content == ClipboardContent::None {
+        return EchoVerdict::NoChange;
+    }
+    let mut verdict = EchoVerdict::NoChange;
     {
         let mut ignored = IGNORED_CONTENT.lock().unwrap();
         let ign_desc = describe_content(&ignored);
         let cur_desc = describe_content(current_content);
         match &*ignored {
             ClipboardContent::None => {
-                if current_content != last_content && *current_content != ClipboardContent::None {
-                    should_process = true;
+                if current_content != last_content {
+                    verdict = EchoVerdict::Process;
                 }
             }
             ClipboardContent::Text(ign_text) => {
@@ -259,19 +279,14 @@ pub fn should_process_content(
                     if curr_text == ign_text {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
                         *ignored = ClipboardContent::None;
+                        verdict = EchoVerdict::Echo;
                     } else if current_content != last_content {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=text_differs)", ign_desc, cur_desc);
-                        should_process = true;
-                    } else {
-                        tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=text_differs, but matches last_content; suppressed)", ign_desc, cur_desc);
+                        verdict = EchoVerdict::Process;
                     }
-                } else if current_content != last_content
-                    && *current_content != ClipboardContent::None
-                {
+                } else if current_content != last_content {
                     tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Text but current isn't)", ign_desc, cur_desc);
-                    should_process = true;
-                } else if *current_content != ClipboardContent::None {
-                    tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs, but matches last_content; suppressed)", ign_desc, cur_desc);
+                    verdict = EchoVerdict::Process;
                 }
             }
             ClipboardContent::Files(ign_files) => {
@@ -279,15 +294,14 @@ pub fn should_process_content(
                     if curr_files == ign_files {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
                         *ignored = ClipboardContent::None;
+                        verdict = EchoVerdict::Echo;
                     } else if current_content != last_content {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=files_differ)", ign_desc, cur_desc);
-                        should_process = true;
+                        verdict = EchoVerdict::Process;
                     }
-                } else if current_content != last_content
-                    && *current_content != ClipboardContent::None
-                {
+                } else if current_content != last_content {
                     tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Files but current isn't)", ign_desc, cur_desc);
-                    should_process = true;
+                    verdict = EchoVerdict::Process;
                 }
             }
             ClipboardContent::Image(ign_blob) => {
@@ -295,15 +309,14 @@ pub fn should_process_content(
                     if image_blob_eq_stable(curr_blob, ign_blob) {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
                         *ignored = ClipboardContent::None;
+                        verdict = EchoVerdict::Echo;
                     } else if current_content != last_content {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=mime_differs)", ign_desc, cur_desc);
-                        should_process = true;
+                        verdict = EchoVerdict::Process;
                     }
-                } else if current_content != last_content
-                    && *current_content != ClipboardContent::None
-                {
+                } else if current_content != last_content {
                     tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Image but current isn't)", ign_desc, cur_desc);
-                    should_process = true;
+                    verdict = EchoVerdict::Process;
                 }
             }
             ClipboardContent::Rich {
@@ -314,26 +327,25 @@ pub fn should_process_content(
                     if rich_eq_stable(ign_text, ign_formats, text, formats) {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
                         *ignored = ClipboardContent::None;
+                        verdict = EchoVerdict::Echo;
                     } else if current_content != last_content {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=rich_differs)", ign_desc, cur_desc);
-                        should_process = true;
+                        verdict = EchoVerdict::Process;
                     }
-                } else if current_content != last_content
-                    && *current_content != ClipboardContent::None
-                {
+                } else if current_content != last_content {
                     tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Rich but current isn't)", ign_desc, cur_desc);
-                    should_process = true;
+                    verdict = EchoVerdict::Process;
                 }
             }
         }
     }
-    if should_process {
+    if matches!(verdict, EchoVerdict::Process) {
         tracing::info!(
             "[Echo] Triggering loop-back broadcast — IGNORED check missed; current={}",
             describe_content(current_content)
         );
     }
-    should_process
+    verdict
 }
 
 /// Process a changed clipboard content: build payload and broadcast.

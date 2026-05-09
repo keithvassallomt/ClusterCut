@@ -7,9 +7,7 @@
 /// The two crates run side-by-side on the same monitor thread; reads on all
 /// three platforms (X11, Windows, macOS) are non-destructive, so the
 /// existing text/file paths are unaffected if arboard is disabled or fails.
-use super::common::{
-    self, ClipboardContent, IGNORED_CONTENT,
-};
+use super::common::{self, ClipboardContent};
 use super::rich;
 use crate::protocol::{ClipboardBlob, ClipboardFormat};
 use crate::state::AppState;
@@ -520,25 +518,22 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 }
             };
 
-            if common::should_process_content(&current_content, &last_content) {
-                last_content = current_content.clone();
-                common::process_clipboard_change(
-                    current_content,
-                    &app_handle,
-                    &state,
-                    &transport,
-                );
-            } else if current_content != ClipboardContent::None {
-                // Update last_content for ignored/echo matches
-                let ignored = IGNORED_CONTENT.lock().unwrap();
-                if *ignored == ClipboardContent::None && current_content != last_content {
-                    // Content didn't change from an ignored echo perspective
-                } else if matches!(&*ignored, ClipboardContent::Text(t) if matches!(&current_content, ClipboardContent::Text(c) if c == t))
-                    || matches!(&*ignored, ClipboardContent::Files(f) if matches!(&current_content, ClipboardContent::Files(c) if c == f))
-                    || matches!(&*ignored, ClipboardContent::Image(b) if matches!(&current_content, ClipboardContent::Image(c) if c == b))
-                {
+            match common::should_process_content(&current_content, &last_content) {
+                common::EchoVerdict::Process => {
+                    last_content = current_content.clone();
+                    common::process_clipboard_change(
+                        current_content,
+                        &app_handle,
+                        &state,
+                        &transport,
+                    );
+                }
+                common::EchoVerdict::Echo => {
+                    // Echo guard fired: advance last_content so the next poll
+                    // sees this same content as "unchanged" instead of "new".
                     last_content = current_content;
                 }
+                common::EchoVerdict::NoChange => {}
             }
 
             thread::sleep(Duration::from_millis(500));
