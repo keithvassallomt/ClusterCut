@@ -1244,6 +1244,18 @@ fn verify_signature(key: &[u8; 32], id: &str, signature: &str) -> bool {
     false
 }
 
+// Drop a stashed SPAKE2 session key after 5 minutes if pairing never completes.
+// Normal completion paths remove the entry earlier, in which case this is a no-op.
+fn spawn_handshake_session_ttl(state: &AppState, addr_key: String) {
+    let sessions = state.handshake_sessions.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        if sessions.lock().unwrap().remove(&addr_key).is_some() {
+            tracing::warn!("Dropped stale handshake session for {} (TTL expired)", addr_key);
+        }
+    });
+}
+
 // Helper to probe a specific IP/Port
 async fn probe_ip(
     ip: std::net::IpAddr,
@@ -3228,6 +3240,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                         let mut sessions = listener_state.handshake_sessions.lock().unwrap();
                                         sessions.insert(addr.to_string(), session_key.clone());
                                     }
+                                    spawn_handshake_session_ttl(&listener_state, addr.to_string());
                                     let cluster_key_opt = {
                                         listener_state.cluster_key.lock().unwrap().clone()
                                     };
@@ -3296,8 +3309,11 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                 match crypto::finish_spake2(state, &msg).map_err(|e| e.to_string()) {
                     Ok(session_key) => {
                         tracing::info!("Auth Success (Initiator)! Waiting for Welcome...");
-                        let mut sessions = listener_state.handshake_sessions.lock().unwrap();
-                        sessions.insert(addr.to_string(), session_key);
+                        {
+                            let mut sessions = listener_state.handshake_sessions.lock().unwrap();
+                            sessions.insert(addr.to_string(), session_key);
+                        }
+                        spawn_handshake_session_ttl(&listener_state, addr.to_string());
                     }
                     Err(e) => {
                         tracing::error!("Auth Failed: {}", e);
