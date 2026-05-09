@@ -1,33 +1,81 @@
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rcgen::generate_simple_self_signed;
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+pub type FingerprintResolver = Arc<dyn Fn(SocketAddr) -> Option<Vec<u8>> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Transport {
     pub endpoint: Endpoint,
-    transport_config: ClientConfig,
-    file_config: ClientConfig,
+    skip_verify_transport_config: ClientConfig,
+    skip_verify_file_config: ClientConfig,
+    local_cert_der: Vec<u8>,
+    fingerprint_resolver: Arc<Mutex<Option<FingerprintResolver>>>,
 }
 
 impl Transport {
-    pub fn new(port: u16) -> Result<Self, Box<dyn Error>> {
-        let (cert_der, key_der) = generate_self_signed_cert()?;
-        let server_config = configure_server(cert_der, key_der)?;
+    /// Build a Transport from a pre-existing self-signed cert. Persisting and loading
+    /// the cert is the caller's responsibility — `Transport` doesn't touch disk.
+    pub fn new(port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<Self, Box<dyn Error>> {
+        let server_config = configure_server(cert_der.clone(), key_der)?;
 
-        let transport_config = configure_client(vec![b"clustercut-transport".to_vec()])?;
-        let file_config = configure_client(vec![b"clustercut-file".to_vec()])?;
+        // These are used (a) before a resolver is installed and (b) for the
+        // pairing handshake itself — connections where the peer's fingerprint
+        // is genuinely unknown. Once a resolver is installed, normal traffic
+        // pins to the looked-up fingerprint.
+        let skip_verify_transport_config = configure_client(vec![b"clustercut-transport".to_vec()], None)?;
+        let skip_verify_file_config = configure_client(vec![b"clustercut-file".to_vec()], None)?;
 
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         let mut endpoint = Endpoint::server(server_config, addr)?;
-        endpoint.set_default_client_config(transport_config.clone());
+        endpoint.set_default_client_config(skip_verify_transport_config.clone());
 
         Ok(Self {
             endpoint,
-            transport_config,
-            file_config,
+            skip_verify_transport_config,
+            skip_verify_file_config,
+            local_cert_der: cert_der,
+            fingerprint_resolver: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Install (or replace) the resolver that maps a peer address to its pinned
+    /// SHA-256 fingerprint. Call this once known_peers is loaded; until then
+    /// every send falls back to skip-verify.
+    pub fn set_fingerprint_resolver(&self, resolver: FingerprintResolver) {
+        *self.fingerprint_resolver.lock().unwrap() = Some(resolver);
+    }
+
+    /// SHA-256 of the local cert DER, used as the device's public TLS identity.
+    pub fn local_fingerprint(&self) -> Vec<u8> {
+        cert_fingerprint(&self.local_cert_der)
+    }
+
+    fn resolve_fingerprint(&self, addr: SocketAddr) -> Option<Vec<u8>> {
+        self.fingerprint_resolver
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|r| r(addr))
+    }
+
+    fn transport_config_for(&self, addr: SocketAddr) -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
+        match self.resolve_fingerprint(addr) {
+            Some(fp) => configure_client(vec![b"clustercut-transport".to_vec()], Some(fp))
+                .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() }),
+            None => Ok(self.skip_verify_transport_config.clone()),
+        }
+    }
+
+    fn file_config_for(&self, addr: SocketAddr) -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
+        match self.resolve_fingerprint(addr) {
+            Some(fp) => configure_client(vec![b"clustercut-file".to_vec()], Some(fp))
+                .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() }),
+            None => Ok(self.skip_verify_file_config.clone()),
+        }
     }
 
     pub async fn send_message(
@@ -35,10 +83,32 @@ impl Transport {
         addr: SocketAddr,
         data: &[u8],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Use connect_with to enforce specific ALPN config
+        let config = self.transport_config_for(addr)?;
+        self.send_message_with_config(addr, data, config).await
+    }
+
+    /// Pairing-flow send: bypasses fingerprint pinning because we don't yet
+    /// know the peer's fingerprint. The SPAKE2 + PIN handshake authenticates
+    /// the session at the application layer; cert pinning takes over for all
+    /// subsequent connections (see issue #9).
+    pub async fn send_message_unauthenticated(
+        &self,
+        addr: SocketAddr,
+        data: &[u8],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.send_message_with_config(addr, data, self.skip_verify_transport_config.clone())
+            .await
+    }
+
+    async fn send_message_with_config(
+        &self,
+        addr: SocketAddr,
+        data: &[u8],
+        config: ClientConfig,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let connection = self
             .endpoint
-            .connect_with(self.transport_config.clone(), addr, "clustercut")?
+            .connect_with(config, addr, "clustercut")?
             .await?;
         let (mut send, _recv) = connection.open_bi().await?;
 
@@ -57,10 +127,10 @@ impl Transport {
         &self,
         addr: SocketAddr,
     ) -> Result<(quinn::Connection, quinn::SendStream), Box<dyn Error + Send + Sync>> {
-        // Use connect_with to enforce specific ALPN config
+        let config = self.file_config_for(addr)?;
         let connection = self
             .endpoint
-            .connect_with(self.file_config.clone(), addr, "clustercut")?
+            .connect_with(config, addr, "clustercut")?
             .await?;
         // Use Uni stream for file transfer (Sender -> Receiver)
         let send = connection.open_uni().await?;
@@ -167,7 +237,7 @@ impl Transport {
     }
 }
 
-fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
+pub fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
     // Register BOTH protocols
     let cert = generate_simple_self_signed(vec![
         "clustercut-transport".into(),
@@ -175,6 +245,12 @@ fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
         "clustercut".into(), // Add generic SNI validity
     ])?;
     Ok((cert.cert.der().to_vec(), cert.signing_key.serialize_der()))
+}
+
+pub fn cert_fingerprint(cert_der: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(cert_der);
+    hasher.finalize().to_vec()
 }
 
 fn configure_server(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<ServerConfig, Box<dyn Error>> {
@@ -213,22 +289,41 @@ fn configure_server(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<ServerConfig,
     Ok(server_config)
 }
 
-fn configure_client(alpn_protocols: Vec<Vec<u8>>) -> Result<ClientConfig, Box<dyn Error>> {
+fn configure_client(
+    alpn_protocols: Vec<Vec<u8>>,
+    pinned_fingerprint: Option<Vec<u8>>,
+) -> Result<ClientConfig, Box<dyn Error>> {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{DigitallySignedStruct, SignatureScheme};
 
+    /// Verifier that pins the SHA-256 of the server's cert DER if a fingerprint
+    /// is configured. With `expected = None` it accepts any cert (pairing path
+    /// before fingerprint exchange, and legacy peers without a stored
+    /// fingerprint — see issue #9).
     #[derive(Debug)]
-    struct SkipServerVerification;
-    impl ServerCertVerifier for SkipServerVerification {
+    struct FingerprintVerifier {
+        expected: Option<Vec<u8>>,
+    }
+    impl ServerCertVerifier for FingerprintVerifier {
         fn verify_server_cert(
             &self,
-            _end_entity: &CertificateDer<'_>,
+            end_entity: &CertificateDer<'_>,
             _intermediates: &[CertificateDer<'_>],
             _server_name: &ServerName<'_>,
             _ocsp_response: &[u8],
             _now: UnixTime,
         ) -> Result<ServerCertVerified, rustls::Error> {
+            if let Some(expected) = &self.expected {
+                let actual = cert_fingerprint(end_entity.as_ref());
+                if actual.as_slice() != expected.as_slice() {
+                    return Err(rustls::Error::General(format!(
+                        "cert fingerprint mismatch: expected {}, got {}",
+                        hex_short(expected),
+                        hex_short(&actual)
+                    )));
+                }
+            }
             Ok(ServerCertVerified::assertion())
         }
 
@@ -264,7 +359,9 @@ fn configure_client(alpn_protocols: Vec<Vec<u8>>) -> Result<ClientConfig, Box<dy
 
     let mut client_config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_custom_certificate_verifier(Arc::new(FingerprintVerifier {
+            expected: pinned_fingerprint,
+        }))
         .with_no_client_auth();
 
     // Set ALPN protocols on the underlying rustls config
@@ -288,4 +385,12 @@ fn configure_client(alpn_protocols: Vec<Vec<u8>>) -> Result<ClientConfig, Box<dy
     quic_config.transport_config(Arc::new(transport_config));
 
     Ok(quic_config)
+}
+
+fn hex_short(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(8)
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()
 }

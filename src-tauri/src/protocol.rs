@@ -43,6 +43,17 @@ pub struct WelcomePayload {
     pub known_peers: Vec<crate::peer::Peer>,
     pub network_name: String,
     pub network_pin: String,
+    // SHA-256 of the responder's TLS cert DER. The initiator pins this for
+    // all future connections to the responder. Optional for backward compat
+    // with peers paired before cert-pinning landed.
+    #[serde(default)]
+    pub responder_fingerprint: Option<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PairFingerprintPayload {
+    pub device_id: String,
+    pub fingerprint: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -61,6 +72,13 @@ pub enum Message {
     // then encrypted with the SPAKE2+ session key — the unauthenticated TLS tunnel
     // must be assumed MITM-readable until cert-pinning lands (see issue #9).
     Welcome {
+        encrypted_payload: Vec<u8>,
+    },
+    // Sent by Initiator to Responder after Welcome, completing the bidirectional
+    // fingerprint exchange. Payload is JSON-serialized PairFingerprintPayload
+    // encrypted with the SPAKE2+ session key — bound to the SPAKE2 transcript
+    // so a MITM cannot substitute the initiator's fingerprint (see issue #9).
+    PairFingerprint {
         encrypted_payload: Vec<u8>,
     },
     // Gossip: Broadcast new peer to known peers

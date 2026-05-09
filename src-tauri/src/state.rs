@@ -97,6 +97,18 @@ impl AppState {
         self.shutdown.load(Ordering::SeqCst)
     }
 
+    /// Look up the pinned cert fingerprint for the peer at `addr`. Returns None
+    /// for peers not in known_peers, peers paired before cert-pinning landed,
+    /// or during the pairing flow itself — those connections fall back to
+    /// skip-verify (see issue #9).
+    pub fn fingerprint_for(&self, addr: std::net::SocketAddr) -> Option<Vec<u8>> {
+        let peers = self.known_peers.lock().unwrap();
+        peers
+            .values()
+            .find(|p| p.ip == addr.ip())
+            .and_then(|p| p.fingerprint.clone())
+    }
+
     pub fn add_peer(&self, peer: Peer) {
         let mut peers = self.peers.lock().unwrap();
         peers.insert(peer.id.clone(), peer);

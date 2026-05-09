@@ -912,6 +912,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "spake2",
  "system-configuration",
  "tauri",

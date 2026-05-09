@@ -1290,6 +1290,7 @@ async fn probe_ip(
         is_manual: true,
         network_name: Some(network_name),
         signature,
+        fingerprint: Some(transport.local_fingerprint()),
     };
 
     let msg = Message::PeerDiscovery(my_peer);
@@ -1333,7 +1334,8 @@ async fn probe_ip(
                              is_trusted: false,
                              is_manual: true,
                              network_name: None,
-                             signature: None, 
+                             signature: None,
+                             fingerprint: None,
                          };
                          peers.insert(id.clone(), peer.clone());
                          let _ = app_handle.emit("peer-update", &peer);
@@ -1588,7 +1590,7 @@ async fn start_pairing(
     let data = serde_json::to_vec(&msg_struct).map_err(|e| e.to_string())?;
 
     transport
-        .send_message(peer_addr, &data)
+        .send_message_unauthenticated(peer_addr, &data)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -2015,16 +2017,30 @@ pub fn run() {
             // Clear Cache on Startup
             clear_cache(app.handle());
 
+            // Load (or generate and persist) the device's TLS cert. Stable across
+            // restarts so peers can pin our fingerprint (see issue #9).
+            let (cert_der, key_der) = match storage::load_device_cert(app.handle()) {
+                Some((c, k)) => (c, k),
+                None => {
+                    let (c, k) = transport::generate_self_signed_cert()
+                        .expect("Failed to generate device cert");
+                    storage::save_device_cert(app.handle(), &c, &k);
+                    tracing::info!("Generated new device TLS cert and persisted to disk.");
+                    (c, k)
+                }
+            };
+
             // Initialize QUIC Transport (Fixed Port 4654 for Discovery, or random fallback)
-            let transport = tauri::async_runtime::block_on(async {  
-                match Transport::new(4654) {
+            let transport = tauri::async_runtime::block_on(async {
+                match Transport::new(4654, cert_der.clone(), key_der.clone()) {
                     Ok(t) => Ok(t),
                     Err(e) => {
                         tracing::warn!("Failed to bind port 4654 ({}). Falling back to random port.", e);
-                        Transport::new(0)
+                        Transport::new(0, cert_der, key_der)
                     }
                 }
             }).expect("Failed to create transport");
+
 
             let port = transport.local_addr().expect("Failed to get port").port();
             tracing::info!("QUIC Transport listening on port {}", port);
@@ -2109,8 +2125,9 @@ pub fn run() {
                 // 2. Load Known Peers
                 let mut kp_lock = state.known_peers.lock().unwrap();
                 *kp_lock = load_known_peers(app_handle);
-                
-                
+                drop(kp_lock);
+
+
                 // 4. Load Settings
                 let mut settings_lock = state.settings.lock().unwrap();
                 *settings_lock = load_settings(app_handle);
@@ -2279,6 +2296,7 @@ pub fn run() {
                                         is_manual: false, // Discovered via mDNS
                                         network_name: network_name_prop,
                                         signature: None,
+                                        fingerprint: None,
                                     };
 
                                     // Check if peer is already active to prevent duplicate notifications
@@ -2378,6 +2396,16 @@ pub fn run() {
             let listener_handle = app.handle().clone();
             let listener_state = (*app.state::<AppState>()).clone();
 
+            // Wire fingerprint resolver: known_peers is loaded by now, so
+            // post-pairing sends pin the looked-up fingerprint. Pairing-flow
+            // sends use the `_unauthenticated` variants and skip this lookup.
+            {
+                let resolver_state = listener_state.clone();
+                transport.set_fingerprint_resolver(std::sync::Arc::new(move |addr| {
+                    resolver_state.fingerprint_for(addr)
+                }));
+            }
+
             {
                 let mut t_lock = listener_state.transport.lock().unwrap();
                 *t_lock = Some(transport.clone());
@@ -2469,6 +2497,7 @@ pub fn run() {
                         is_manual: true,
                         network_name: Some(network_name),
                         signature,
+                        fingerprint: Some(hb_transport.local_fingerprint()),
                     };
 
                     let msg = Message::PeerDiscovery(my_peer);
@@ -3189,10 +3218,16 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                         device_id: local_id.clone(),
                     };
                     if let Ok(resp_data) = serde_json::to_vec(&resp_struct) {
-                        if transport_inside.send_message(addr, &resp_data).await.map_err(|e| e.to_string()).is_ok() {
+                        if transport_inside.send_message_unauthenticated(addr, &resp_data).await.map_err(|e| e.to_string()).is_ok() {
                             match crypto::finish_spake2(spake_state, &msg).map_err(|e| e.to_string()) {
                                 Ok(session_key) => {
                                     tracing::info!("Authentication Success for {}!", device_id);
+                                    // Stash the session key so we can decrypt the initiator's
+                                    // PairFingerprint follow-up message (issue #9).
+                                    {
+                                        let mut sessions = listener_state.handshake_sessions.lock().unwrap();
+                                        sessions.insert(addr.to_string(), session_key.clone());
+                                    }
                                     let cluster_key_opt = {
                                         listener_state.cluster_key.lock().unwrap().clone()
                                     };
@@ -3208,6 +3243,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                 known_peers,
                                                 network_name: network_name.clone(),
                                                 network_pin,
+                                                responder_fingerprint: Some(transport_inside.local_fingerprint()),
                                             };
                                             let encrypt_result = serde_json::to_vec(&payload)
                                                 .map_err(|e| e.to_string())
@@ -3217,19 +3253,20 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                             if let Ok(encrypted_payload) = encrypt_result {
                                                 let welcome = Message::Welcome { encrypted_payload };
                                                 if let Ok(welcome_data) = serde_json::to_vec(&welcome) {
-                                                    let _ = transport_inside.send_message(addr, &welcome_data).await;
+                                                    let _ = transport_inside.send_message_unauthenticated(addr, &welcome_data).await;
                                                     
                                                     let mut kp_lock = listener_state.known_peers.lock().unwrap();
                                                     let p = crate::peer::Peer {
                                                         id: device_id.clone(),
                                                         ip: addr.ip(),
                                                         port: addr.port(),
-                                                        hostname: format!("Peer ({})", addr.ip()), 
+                                                        hostname: format!("Peer ({})", addr.ip()),
                                                         last_seen: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
                                                         is_trusted: true,
                                                         is_manual: false,
                                                         network_name: Some(network_name),
                                                         signature: None,
+                                                        fingerprint: None, // filled in by PairFingerprint after Welcome
                                                     };
                                                     kp_lock.insert(device_id.clone(), p.clone());
                                                     save_known_peers(listener_handle.app_handle(), &kp_lock);
@@ -3289,17 +3326,17 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                  .map_err(|e| e.to_string())
                          });
                      match payload_result {
-                         Ok(crate::protocol::WelcomePayload { cluster_key, known_peers, network_name, network_pin }) => {
+                         Ok(crate::protocol::WelcomePayload { cluster_key, known_peers, network_name, network_pin, responder_fingerprint }) => {
                              tracing::info!("Joined Network: {}", network_name);
                              {
                                  let mut ck = listener_state.cluster_key.lock().unwrap();
                                  *ck = Some(cluster_key.clone());
                                  save_cluster_key(listener_handle.app_handle(), &cluster_key);
-                                 
+
                                  let mut nn = listener_state.network_name.lock().unwrap();
                                  *nn = network_name.clone();
                                  save_network_name(listener_handle.app_handle(), &network_name);
-                                 
+
                                  let mut np = listener_state.network_pin.lock().unwrap();
                                  *np = network_pin.clone();
                                  save_network_pin(listener_handle.app_handle(), &network_pin);
@@ -3309,25 +3346,56 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                              if let Some(discovery) = listener_state.discovery.lock().unwrap().as_mut() {
                                   let _ = discovery.register(&device_id, &network_name, port);
                              }
-                             let mut kp_lock = listener_state.known_peers.lock().unwrap();
-                             let mut runtime_peers = listener_state.peers.lock().unwrap();
-                             for peer in known_peers {
-                                 kp_lock.insert(peer.id.clone(), peer.clone());
-                                 runtime_peers.insert(peer.id.clone(), peer.clone());
-                                 let _ = listener_handle.emit("peer-update", &peer);
+                             {
+                                 let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                                 let mut runtime_peers = listener_state.peers.lock().unwrap();
+                                 for peer in known_peers {
+                                     kp_lock.insert(peer.id.clone(), peer.clone());
+                                     runtime_peers.insert(peer.id.clone(), peer.clone());
+                                     let _ = listener_handle.emit("peer-update", &peer);
+                                 }
+                                 save_known_peers(listener_handle.app_handle(), &kp_lock);
+
+                                 for (id, peer) in runtime_peers.iter_mut() {
+                                     if peer.ip == addr.ip() {
+                                         peer.is_trusted = true;
+                                         peer.network_name = Some(network_name.clone());
+                                         // Pin the responder's TLS fingerprint — the entire WelcomePayload was
+                                         // SPAKE2-encrypted, so this fingerprint is bound to the PIN-authenticated
+                                         // session and trustworthy (issue #9).
+                                         if responder_fingerprint.is_some() {
+                                             peer.fingerprint = responder_fingerprint.clone();
+                                         }
+                                         let _ = listener_handle.emit("peer-update", &*peer);
+                                         kp_lock.insert(id.clone(), peer.clone());
+                                         break;
+                                     }
+                                 }
+                                 save_known_peers(listener_handle.app_handle(), &kp_lock);
                              }
-                             save_known_peers(listener_handle.app_handle(), &kp_lock);
-                             
-                             for (id, peer) in runtime_peers.iter_mut() {
-                                 if peer.ip == addr.ip() {
-                                     peer.is_trusted = true;
-                                     peer.network_name = Some(network_name.clone());
-                                     let _ = listener_handle.emit("peer-update", &*peer);
-                                     kp_lock.insert(id.clone(), peer.clone());
-                                     break;
+
+                             // Complete the bidirectional fingerprint exchange: send our own
+                             // fingerprint back to the responder, encrypted with the SPAKE2 session key.
+                             let local_fp = transport_inside.local_fingerprint();
+                             let local_id = listener_state.local_device_id.lock().unwrap().clone();
+                             let fp_payload = crate::protocol::PairFingerprintPayload {
+                                 device_id: local_id,
+                                 fingerprint: local_fp,
+                             };
+                             if let Ok(plaintext) = serde_json::to_vec(&fp_payload) {
+                                 if let Ok(encrypted_payload) = crypto::encrypt(&sk_arr, &plaintext) {
+                                     let msg = Message::PairFingerprint { encrypted_payload };
+                                     if let Ok(data) = serde_json::to_vec(&msg) {
+                                         let _ = transport_inside.send_message_unauthenticated(addr, &data).await;
+                                     }
                                  }
                              }
-                             save_known_peers(listener_handle.app_handle(), &kp_lock);
+                             // Pairing complete on this side — drop the session key.
+                             listener_state
+                                 .handshake_sessions
+                                 .lock()
+                                 .unwrap()
+                                 .remove(&addr.to_string());
                          }
                          Err(e) => {
                              tracing::error!("Decryption Error: {}", e);
@@ -3342,6 +3410,54 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                  tracing::warn!("Received Welcome but no session key found for {}", addr);
                  let _ = listener_handle.emit("pairing-failed", "Pairing session expired. Please try again.");
              }
+        }
+        Message::PairFingerprint { encrypted_payload } => {
+            tracing::info!("Received PairFingerprint from {}", addr);
+            let session_key = {
+                let sessions = listener_state.handshake_sessions.lock().unwrap();
+                sessions.get(&addr.to_string()).cloned()
+            };
+            let Some(sk) = session_key else {
+                tracing::warn!("Received PairFingerprint but no session key for {}", addr);
+                return;
+            };
+            if sk.len() != 32 {
+                tracing::error!("Invalid session key length for PairFingerprint from {}", addr);
+                return;
+            }
+            let mut sk_arr = [0u8; 32];
+            sk_arr.copy_from_slice(&sk);
+
+            let payload_result = crypto::decrypt(&sk_arr, &encrypted_payload)
+                .map_err(|e| e.to_string())
+                .and_then(|plaintext| {
+                    serde_json::from_slice::<crate::protocol::PairFingerprintPayload>(&plaintext)
+                        .map_err(|e| e.to_string())
+                });
+            match payload_result {
+                Ok(crate::protocol::PairFingerprintPayload { device_id, fingerprint }) => {
+                    let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                    if let Some(peer) = kp_lock.get_mut(&device_id) {
+                        peer.fingerprint = Some(fingerprint);
+                        let updated = peer.clone();
+                        save_known_peers(listener_handle.app_handle(), &kp_lock);
+                        drop(kp_lock);
+                        let _ = listener_handle.emit("peer-update", &updated);
+                        tracing::info!("Pinned fingerprint for paired peer {}", device_id);
+                    } else {
+                        tracing::warn!("PairFingerprint for unknown peer id {}", device_id);
+                    }
+                    // Pairing is fully complete on this side; drop the session key.
+                    listener_state
+                        .handshake_sessions
+                        .lock()
+                        .unwrap()
+                        .remove(&addr.to_string());
+                }
+                Err(e) => {
+                    tracing::error!("Failed to decrypt PairFingerprint from {}: {}", addr, e);
+                }
+            }
         }
         Message::PeerDiscovery(mut peer) => {
             tracing::debug!("Received PeerDiscovery for {}", peer.hostname);
@@ -3381,8 +3497,13 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                 let kp = listener_state.known_peers.lock().unwrap();
                 if let Some(existing) = kp.get(&peer.id) {
                      peer.is_manual = existing.is_manual;
+                     // Don't let a gossip update without a fingerprint clobber an
+                     // already-pinned one. Sticky pinning until re-pair.
+                     if peer.fingerprint.is_none() {
+                         peer.fingerprint = existing.fingerprint.clone();
+                     }
                 } else {
-                     peer.is_manual = false; 
+                     peer.is_manual = false;
                 }
             }
             
@@ -3478,10 +3599,11 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                     port: transport_inside.local_addr().unwrap().port(),
                     hostname,
                     last_seen: 0,
-                    is_trusted: false, 
+                    is_trusted: false,
                     is_manual: true,
                     network_name: Some(network_name),
                     signature,
+                    fingerprint: Some(transport_inside.local_fingerprint()),
                 };
                 
                 let msg = Message::PeerDiscovery(my_peer);
