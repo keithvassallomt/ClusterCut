@@ -250,7 +250,6 @@ impl Transport {
                                 loop {
                                     match conn.accept_bi().await {
                                         Ok((_, mut recv)) => {
-                                            tracing::info!("Accepted message stream from {}", remote_addr);
                                             // Cap each message at 64 MB. Sized to fit a 10 MB raw
                                             // clipboard image after the wire-format expansion:
                                             // base64 (1.33×) inside ClipboardPayload JSON, then the
@@ -261,17 +260,7 @@ impl Transport {
                                             match recv.read_to_end(MESSAGE_BYTE_CAP).await {
                                                 Ok(buf) => {
                                                     if !buf.is_empty() {
-                                                        tracing::info!(
-                                                            "Read {} bytes from message stream {}",
-                                                            buf.len(),
-                                                            remote_addr
-                                                        );
                                                         on_receive_message(buf, remote_addr);
-                                                    } else {
-                                                        tracing::warn!(
-                                                            "Empty message stream from {} — skipping",
-                                                            remote_addr
-                                                        );
                                                     }
                                                 }
                                                 Err(quinn::ReadToEndError::TooLong) => {

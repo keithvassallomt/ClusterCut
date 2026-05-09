@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - Unreleased
+
+### Added
+- Image clipboard sync. Copy an image — for example with right-click → "Copy Image" in a browser, or from a screenshot tool — and it appears on your peers' clipboards, ready to paste into any app (Word, Preview, GIMP, etc.). Wired up across all four clipboard backends: X11, Wayland (KDE/Sway/Hyprland), GNOME Wayland (via the ClusterCut extension), Windows, and macOS. History view shows a thumbnail with dimensions and size. Inline cap of 10 MB raw image bytes per copy.
+- GNOME extension v4.0: new D-Bus methods on the existing `Clipboard2` interface (`GetMimetypes`, `ReadBlob`, `WriteBlob`) plus a `BlobChanged` signal, used to relay image clipboard data on GNOME Wayland. Fully backwards compatible — older apps that only know about text/files keep working unchanged with the new extension, and a 0.3.0 app paired with the older 3.0 extension silently falls back to text+files only.
 
 ### Security
 - Added a strict Content Security Policy to the Tauri WebView (`default-src 'self'`, no `'unsafe-eval'`, no remote sources). Defense-in-depth against XSS in untrusted data the app renders (clipboard contents, filenames). Thanks to @mdunphy for the suggestion (#10).
