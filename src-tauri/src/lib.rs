@@ -3266,14 +3266,30 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                             if let Ok(encrypted_payload) = encrypt_result {
                                                 let welcome = Message::Welcome { encrypted_payload };
                                                 if let Ok(welcome_data) = serde_json::to_vec(&welcome) {
-                                                    let _ = transport_inside.send_message_unauthenticated(addr, &welcome_data).await;
-                                                    
-                                                    let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                                                    // Insert the peer record *before* sending Welcome — the
+                                                    // initiator may fire PairFingerprint back inside the 500ms
+                                                    // post-send sleep, racing the responder's lookup.
+                                                    // Prefer the hostname mDNS already discovered; fall back to
+                                                    // a placeholder if the peer isn't in runtime peers yet.
+                                                    let prior_hostname = {
+                                                        let runtime_peers = listener_state.peers.lock().unwrap();
+                                                        runtime_peers
+                                                            .get(&device_id)
+                                                            .map(|p| p.hostname.clone())
+                                                            .or_else(|| {
+                                                                listener_state
+                                                                    .known_peers
+                                                                    .lock()
+                                                                    .unwrap()
+                                                                    .get(&device_id)
+                                                                    .map(|p| p.hostname.clone())
+                                                            })
+                                                    };
                                                     let p = crate::peer::Peer {
                                                         id: device_id.clone(),
                                                         ip: addr.ip(),
                                                         port: addr.port(),
-                                                        hostname: format!("Peer ({})", addr.ip()),
+                                                        hostname: prior_hostname.unwrap_or_else(|| format!("Peer ({})", addr.ip())),
                                                         last_seen: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
                                                         is_trusted: true,
                                                         is_manual: false,
@@ -3281,10 +3297,15 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                         signature: None,
                                                         fingerprint: None, // filled in by PairFingerprint after Welcome
                                                     };
-                                                    kp_lock.insert(device_id.clone(), p.clone());
-                                                    save_known_peers(listener_handle.app_handle(), &kp_lock);
+                                                    {
+                                                        let mut kp_lock = listener_state.known_peers.lock().unwrap();
+                                                        kp_lock.insert(device_id.clone(), p.clone());
+                                                        save_known_peers(listener_handle.app_handle(), &kp_lock);
+                                                    }
                                                     listener_state.add_peer(p.clone());
                                                     let _ = listener_handle.emit("peer-update", &p);
+
+                                                    let _ = transport_inside.send_message_unauthenticated(addr, &welcome_data).await;
                                                     gossip_peer(&p, &listener_state, &transport_inside, Some(addr));
                                                 }
                                             }
