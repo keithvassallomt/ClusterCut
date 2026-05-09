@@ -232,13 +232,13 @@ Today both ends just trust that the wire shape matches. With more formats in fli
 |---|---|---|
 | 1 | Wire-format plumbing (`ClipboardFormat`, `formats` field, signature, round-trip tests) | ✅ complete |
 | 2 | Backend B — Wayland wlroots (extend MIME probe + multi-MimeSource write) | ✅ complete |
-| 3 | Backend A — Windows + macOS (HTML/RTF reads/writes; CF_HTML wrap/strip helpers). **X11 intentionally out of scope** — too costly for a declining platform | ⬜ not started |
-| 4 | Backend C — GNOME extension v4.0 (add format methods to the same v4.0 release as image blobs) | ⬜ not started |
-| 5 | Frontend — rich previews, plain-vs-rich badge | ⬜ not started |
-| 6 | Smart-capture allowlist + cross-app edge cases (Word, Apple Mail, Outlook, Notion, VS Code) | ⬜ not started |
+| 3 | Backend A — Windows + macOS (HTML/RTF reads/writes; CF_HTML wrap/strip helpers). **X11 intentionally out of scope** — too costly for a declining platform | ✅ complete (needs verification on real Win/macOS builds) |
+| 4 | Backend C — GNOME extension v4.0 (add format methods to the same v4.0 release as image blobs) | ✅ complete |
+| 5 | Frontend — Rich-format badge in history + manual-sync modal (no inline HTML rendering — would need DOMPurify; current strict CSP keeps it conservative) | ✅ complete |
+| 6 | Smart-capture allowlist + cross-app polish (`;charset=utf-8` MIME variants, 16 MB per-format cap on the GNOME extension to match other backends, explicit allowlist comments documenting which vendor blobs are intentionally skipped) | ✅ complete |
 
 ### Release polish (after Parts 1 + 2 are both in)
 
 | # | Phase | Status |
 |---|---|---|
-| 7 | CHANGELOG, metainfo, **docs (note rich-text not supported on X11)**, end-to-end testing, EGO submission for extension v4.0 | ⏸ deferred until rich-text lands |
+| 7 | CHANGELOG, metainfo, **docs (note rich-text not supported on X11)**, end-to-end testing on Win/macOS/GNOME, EGO submission for extension v4.0 | ⏸ remaining |

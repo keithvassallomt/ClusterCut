@@ -36,7 +36,22 @@ const IMAGE_MIME_PRIORITY: &[&str] = &[
 /// carry formatted content (HTML/RTF) that destination apps can pick up
 /// instead of the plain text — the difference between pasting from Word
 /// into Word and getting formatting vs getting raw text.
+///
+/// Strict allowlist: vendor-specific blobs like
+/// `application/x-qt-windows-mime;value="Native"`,
+/// `chromium/x-renderer-taint`, `org.chromium.web-custom-data`, and
+/// `text/_moz_htmlcontext` are never probed — they're either OS-internal,
+/// app-internal metadata, or duplicate of the plain-text version, and
+/// shipping them would just bloat the wire format.
 const RICH_TEXT_MIME_PRIORITY: &[&str] = &["text/html", "text/rtf"];
+
+/// Returns true if `offered` contains a MIME that matches `prefix`, allowing
+/// for trailing parameters (e.g. `text/html;charset=utf-8` matches the prefix
+/// `text/html`). Some apps include the charset suffix; the canonical form is
+/// the bare type.
+fn offered_contains_prefix(offered: &std::collections::HashSet<String>, prefix: &str) -> bool {
+    offered.iter().any(|m| m == prefix || m.starts_with(&format!("{};", prefix)))
+}
 
 /// Hard cap on bytes we'll read from a single rich-text representation.
 /// HTML / RTF from real apps (Word, browsers) are usually well under 1 MB
@@ -157,19 +172,34 @@ fn read_clipboard_rich() -> Option<(String, Vec<ClipboardFormat>)> {
     };
 
     // Collect any rich-text formats actually advertised by the source.
+    // Prefix-match so apps that offer `text/html;charset=utf-8` (rare but
+    // permitted by the spec) are still picked up under the canonical
+    // `text/html` mime in the ClipboardFormat we emit.
     let mut formats: Vec<ClipboardFormat> = Vec::new();
-    for mime in RICH_TEXT_MIME_PRIORITY {
-        if !offered.contains(*mime) {
+    for prefix in RICH_TEXT_MIME_PRIORITY {
+        if !offered_contains_prefix(&offered, prefix) {
             continue;
         }
+        // Pass the actual offered MIME to wlr — it serves bytes by exact match.
+        let actual: &str = if offered.contains(*prefix) {
+            *prefix
+        } else {
+            match offered
+                .iter()
+                .find(|m| m.starts_with(&format!("{};", prefix)))
+            {
+                Some(m) => m.as_str(),
+                None => continue,
+            }
+        };
         let mut pipe = match get_contents(
             ClipboardType::Regular,
             Seat::Unspecified,
-            PasteMimeType::Specific(mime),
+            PasteMimeType::Specific(actual),
         ) {
             Ok((p, _)) => p,
             Err(e) => {
-                tracing::debug!("clipboard rich read failed for {}: {}", mime, e);
+                tracing::debug!("clipboard rich read failed for {}: {}", actual, e);
                 continue;
             }
         };
@@ -187,7 +217,7 @@ fn read_clipboard_rich() -> Option<(String, Vec<ClipboardFormat>)> {
         if buf.len() as u64 > MAX_RICH_TEXT_READ_BYTES {
             tracing::warn!(
                 "Clipboard {} exceeds {} byte read cap; skipping format.",
-                mime,
+                actual,
                 MAX_RICH_TEXT_READ_BYTES
             );
             continue;
@@ -196,9 +226,9 @@ fn read_clipboard_rich() -> Option<(String, Vec<ClipboardFormat>)> {
         // bytes don't decode as UTF-8 we drop the format rather than send
         // potentially corrupt text — the receiver wouldn't know what to do.
         match String::from_utf8(buf) {
-            Ok(s) => formats.push(ClipboardFormat::from_text(*mime, s)),
+            Ok(s) => formats.push(ClipboardFormat::from_text(*prefix, s)),
             Err(e) => {
-                tracing::warn!("Clipboard {} did not decode as UTF-8: {}", mime, e);
+                tracing::warn!("Clipboard {} did not decode as UTF-8: {}", actual, e);
             }
         }
     }

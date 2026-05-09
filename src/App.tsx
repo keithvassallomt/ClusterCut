@@ -58,6 +58,17 @@ type ClipboardBlobPreview = {
   object_url: string; // generated at receive time via URL.createObjectURL
 };
 
+// Lightweight summary of an alternate clipboard format (text/html, text/rtf, …)
+// used purely for the history badge. We deliberately don't carry the actual
+// bytes through the React state — they ride on the underlying ClipboardPayload
+// and get re-stocked on the OS clipboard by the backend; the UI just signals
+// to the user that the item has rich formatting available.
+type ClipboardFormatPreview = {
+  mime_type: string;
+  binary: boolean;
+  size: number; // length of the wire `data` string (base64 if binary, UTF-8 otherwise)
+};
+
 type HistoryItem = {
   id: string;
   origin: "local" | "remote";
@@ -66,6 +77,7 @@ type HistoryItem = {
   text: string;
   files?: { name: string; size: number; }[];
   blob?: ClipboardBlobPreview;
+  formats?: ClipboardFormatPreview[];
   sender_id?: string;
 };
 
@@ -95,6 +107,38 @@ function blobFromPayload(payloadBlob: any): ClipboardBlobPreview | undefined {
     size: bytes.length,
     object_url: url,
   };
+}
+
+// Build the lightweight format summary used by the history "Rich text" badge.
+// We don't decode or render the format bytes in the WebView — that would need
+// HTML sanitization (no DOMPurify in deps) and runs counter to the strict CSP
+// added in the security pass. The bytes stay on the underlying ClipboardPayload
+// and get re-stocked onto the OS clipboard by the backend; the UI just
+// surfaces "this item carries formatted content" to the user.
+function formatsFromPayload(payloadFormats: any): ClipboardFormatPreview[] | undefined {
+  if (!Array.isArray(payloadFormats) || payloadFormats.length === 0) return undefined;
+  const list: ClipboardFormatPreview[] = [];
+  for (const f of payloadFormats) {
+    if (!f || typeof f.mime_type !== "string" || typeof f.data !== "string") continue;
+    list.push({
+      mime_type: f.mime_type,
+      binary: !!f.binary,
+      size: f.data.length,
+    });
+  }
+  return list.length > 0 ? list : undefined;
+}
+
+// Short label per MIME for the badge — falls back to the raw MIME for anything
+// not in the curated list. New rich-text formats added in future would just
+// show their MIME until added here.
+function shortRichLabel(mime: string): string {
+  switch (mime) {
+    case "text/html": return "HTML";
+    case "text/rtf": return "RTF";
+    case "image/svg+xml": return "SVG";
+    default: return mime;
+  }
 }
 
 // Simple Time Ago Helper
@@ -393,7 +437,7 @@ export default function App() {
   // Manual Sync State
   // Manual Sync State
   const [manualSyncOpen, setManualSyncOpen] = useState(false);
-  const [pendingReceive, setPendingReceive] = useState<{ text: string, sender: string, timestamp: number, blob?: ClipboardBlobPreview } | null>(null);
+  const [pendingReceive, setPendingReceive] = useState<{ text: string, sender: string, timestamp: number, blob?: ClipboardBlobPreview, formats?: ClipboardFormatPreview[] } | null>(null);
   const [localClipboard, setLocalClipboard] = useState(""); // Current local
   const [lastSentClipboard, setLastSentClipboard] = useState(""); // Last successfully sent
   const [lastReceivedClipboard, setLastReceivedClipboard] = useState(""); // Last received from cluster
@@ -715,6 +759,7 @@ export default function App() {
         text: p.text || "",
         files: p.files,
         blob: blobFromPayload(p.blob),
+        formats: formatsFromPayload(p.formats),
       };
 
       // Update Local State but NOT 'lastSentClipboard'
@@ -742,6 +787,7 @@ export default function App() {
         text: p.text || "",
         files: p.files,
         blob: blobFromPayload(p.blob),
+        formats: formatsFromPayload(p.formats),
       };
 
       // Update Local Clipboard State
@@ -785,6 +831,7 @@ export default function App() {
           sender: p.sender,
           timestamp: p.timestamp,
           blob: blobFromPayload(p.blob),
+          formats: formatsFromPayload(p.formats),
         };
       });
     });
@@ -1749,6 +1796,14 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
                         )}
                       </Badge>
                       <span className="text-xs text-zinc-500 dark:text-zinc-400">{timeAgo(it.ts)}</span>
+                      {it.formats && it.formats.length > 0 && (
+                        <span
+                          className="inline-flex items-center rounded-md bg-violet-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-700 dark:bg-violet-500/15 dark:text-violet-200"
+                          title={`Rich formats: ${it.formats.map(f => f.mime_type).join(", ")}`}
+                        >
+                          Rich · {it.formats.map(f => shortRichLabel(f.mime_type)).join(", ")}
+                        </span>
+                      )}
                     </div>
                     {it.text && <div className="mt-2 line-clamp-3 whitespace-pre-wrap text-sm text-zinc-900 dark:text-zinc-50">{it.text}</div>}
 
@@ -2435,7 +2490,7 @@ function ManualSyncModal({
   open: boolean;
   onClose: () => void;
   localContent: string;
-  remoteContent: { text: string, sender: string, timestamp: number, blob?: ClipboardBlobPreview } | null;
+  remoteContent: { text: string, sender: string, timestamp: number, blob?: ClipboardBlobPreview, formats?: ClipboardFormatPreview[] } | null;
   onSend: () => void;
   onReceive: () => void;
 }) {
@@ -2491,7 +2546,14 @@ function ManualSyncModal({
                       </div>
                     </div>
                   ) : (
-                    remoteContent.text
+                    <>
+                      {remoteContent.formats && remoteContent.formats.length > 0 && (
+                        <div className="mb-2 inline-flex items-center rounded-md bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-200 font-sans">
+                          Rich · {remoteContent.formats.map(f => shortRichLabel(f.mime_type)).join(", ")}
+                        </div>
+                      )}
+                      {remoteContent.text}
+                    </>
                   )}
                   <div className="absolute bottom-2 right-2 flex gap-2">
                     <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded text-zinc-400">

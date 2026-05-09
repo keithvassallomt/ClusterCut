@@ -94,7 +94,30 @@ const CLIPBOARD_DBUS_IFACE = `
 // Rich-text MIME types we relay alongside plain text. Same priority as the
 // wlroots backend — text/html before text/rtf. Apps usually offer both when
 // formatted text is on the clipboard.
+//
+// Strict allowlist: vendor-specific blobs like
+// `application/x-qt-windows-mime;value="Native"`,
+// `chromium/x-renderer-taint`, `org.chromium.web-custom-data`, and
+// `text/_moz_htmlcontext` are never probed — they're either OS-internal,
+// app-internal metadata, or duplicate of plain text.
 const RICH_TEXT_MIME_PRIORITY = ['text/html', 'text/rtf'];
+
+// 16 MB per-format cap, matches wlroots / Win / mac backends. Word HTML can be
+// surprisingly large (lots of Office namespace metadata) but well under 1 MB
+// in practice; this cap is well above expected values and well below the
+// 64 MB transport per-message cap on the Rust side.
+const MAX_RICH_TEXT_BYTES = 16 * 1024 * 1024;
+
+// Prefix-aware MIME match: handles `text/html;charset=utf-8` (rare but
+// spec-permitted) by treating it as `text/html`.
+function findOfferedMime(offered, prefix) {
+    if (offered.includes(prefix)) return prefix;
+    const param = `${prefix};`;
+    for (const m of offered) {
+        if (m.startsWith(param)) return m;
+    }
+    return null;
+}
 
 // Image MIME types we relay over D-Bus, in preference order. The Rust side
 // normalises everything to PNG before broadcasting, so all that matters here
@@ -400,8 +423,15 @@ export default class ClusterCutExtension extends Extension {
 
         // Rich-text probe — covers Word / browsers / Pages / Apple Mail etc.
         // sitting above plain text so we capture the formatted representation
-        // alongside the plain-text fallback the source also offers.
-        const richMimes = RICH_TEXT_MIME_PRIORITY.filter(m => mimetypes.includes(m));
+        // alongside the plain-text fallback the source also offers. Each entry
+        // in richMimes is { canonical, offered } so we can pass the actual
+        // advertised MIME to St.Clipboard.get_content but emit the canonical
+        // prefix in the FormatsChanged signal for receivers.
+        const richMimes = [];
+        for (const prefix of RICH_TEXT_MIME_PRIORITY) {
+            const offered = findOfferedMime(mimetypes, prefix);
+            if (offered) richMimes.push({ canonical: prefix, offered });
+        }
         if (richMimes.length > 0) {
             this._readAndEmitFormats(richMimes);
             return;
@@ -562,12 +592,20 @@ export default class ClusterCutExtension extends Extension {
             });
         };
 
-        for (const mime of richMimes) {
-            clipboard.get_content(St.ClipboardType.CLIPBOARD, mime, (cb, bytes) => {
+        for (const entry of richMimes) {
+            clipboard.get_content(St.ClipboardType.CLIPBOARD, entry.offered, (cb, bytes) => {
                 if (bytes) {
                     const data = bytes.get_data ? bytes.get_data() : bytes;
                     if (data && data.length > 0) {
-                        collected.push([mime, data]);
+                        if (data.length > MAX_RICH_TEXT_BYTES) {
+                            console.warn(
+                                `Clipboard ${entry.offered} exceeds ${MAX_RICH_TEXT_BYTES} byte cap; skipping format.`
+                            );
+                        } else {
+                            // Emit canonical MIME so receivers see `text/html`
+                            // rather than `text/html;charset=utf-8` etc.
+                            collected.push([entry.canonical, data]);
+                        }
                     }
                 }
                 pending -= 1;
