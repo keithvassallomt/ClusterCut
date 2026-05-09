@@ -273,17 +273,21 @@ mod macos {
     /// Write plain text + rich formats atomically. NSPasteboard's
     /// `clearContents` then `setData:forType:` for each MIME publishes them
     /// as a single ownership change — destination apps see the full buffet.
+    ///
+    /// **Declaration order matters.** NSPasteboard treats the first type in
+    /// `declareTypes:owner:` as the canonical type. Apps like TextEdit iterate
+    /// every available type and pick the richest they understand, but apps
+    /// like Pages prefer the canonical one — so we put rich formats first
+    /// and plain text last, otherwise Pages pastes as plain even though HTML
+    /// is on the clipboard.
     pub fn write_all(text: &str, formats: &[ClipboardFormat]) -> Result<(), String> {
         let pb = pasteboard();
 
-        // Build the list of types we're about to declare, then declareTypes:owner:
-        // and set each in turn. Order doesn't matter for paste behaviour.
-        let mut types_vec: Vec<Retained<NSString>> =
-            vec![NSString::from_str("public.utf8-plain-text")];
+        let mut types_vec: Vec<Retained<NSString>> = Vec::new();
         for f in formats {
             let uti = match f.mime_type.as_str() {
-                "text/html" => "public.html",
                 "text/rtf" => "public.rtf",
+                "text/html" => "public.html",
                 other => {
                     tracing::debug!("Skipping unsupported rich-text MIME on macOS: {}", other);
                     continue;
@@ -291,6 +295,9 @@ mod macos {
             };
             types_vec.push(NSString::from_str(uti));
         }
+        // Plain text last so it acts as the fallback for plain-only consumers
+        // without becoming the canonical type when richer formats are present.
+        types_vec.push(NSString::from_str("public.utf8-plain-text"));
         let types_array = NSArray::from_retained_slice(&types_vec);
 
         unsafe {
