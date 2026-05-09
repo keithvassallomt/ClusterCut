@@ -10,7 +10,8 @@
 use super::common::{
     self, ClipboardContent, IGNORED_CONTENT,
 };
-use crate::protocol::ClipboardBlob;
+use super::rich;
+use crate::protocol::{ClipboardBlob, ClipboardFormat};
 use crate::state::AppState;
 use crate::transport::Transport;
 use std::time::Duration;
@@ -178,6 +179,19 @@ fn read_clipboard(
         }
     }
 
+    // Rich-text probe (HTML / RTF) — sits above plain text so when Word /
+    // browsers offer both `text/plain` and `text/html` we capture both.
+    // X11 returns an empty Vec from rich::read_clipboard_rich_formats so
+    // the X11 plain-text path below is taken unchanged.
+    let rich_formats = rich::read_clipboard_rich_formats();
+    if !rich_formats.is_empty() {
+        let text = clip.read_text().unwrap_or_default();
+        return ClipboardContent::Rich {
+            text,
+            formats: rich_formats,
+        };
+    }
+
     match clip.read_text() {
         Ok(text) => {
             if !text.is_empty() {
@@ -263,6 +277,27 @@ pub fn set_clipboard_paths(app: &AppHandle, paths: Vec<String>) {
 
 pub fn set_clipboard_image(app: &AppHandle, blob: ClipboardBlob) {
     common::set_clipboard_blob_with_ignore(app, blob, write_clipboard_image_arboard);
+}
+
+/// Write plain text + HTML/RTF formats. On X11 the rich module returns an
+/// error; we fall back to writing plain text via tauri-plugin-clipboard so
+/// the user still gets *something* — graceful degradation matches what
+/// `set_clipboard_rich` in mod.rs documents.
+fn write_rich(app: &AppHandle, text: &str, formats: &[ClipboardFormat]) -> Result<(), String> {
+    match rich::write_clipboard_rich(text, formats) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::debug!(
+                "Rich-text write unsupported on this platform ({}); falling back to plain text",
+                e
+            );
+            write_text(app, text.to_string())
+        }
+    }
+}
+
+pub fn set_clipboard_rich(app: &AppHandle, text: String, formats: Vec<ClipboardFormat>) {
+    common::set_clipboard_rich_with_ignore(app, text, formats, write_rich);
 }
 
 /// Read clipboard text directly (for manual send shortcut).

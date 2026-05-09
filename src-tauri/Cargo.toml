@@ -82,8 +82,12 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Networking_Connectivity",
 ] }
+clipboard-win = "5.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 system-configuration = "0.6"
 nsworkspace = "0.2"
 core-foundation = "0.9"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSArray"] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }
