@@ -66,6 +66,10 @@ mod windows {
     /// the image path uses.
     const ATTEMPTS: usize = 10;
 
+    fn html_format_id() -> Option<u32> {
+        raw::register_format("HTML Format").map(|f| f.get())
+    }
+
     fn rtf_format_id() -> Option<u32> {
         raw::register_format("Rich Text Format").map(|f| f.get())
     }
@@ -73,7 +77,22 @@ mod windows {
     /// Read both HTML and RTF (if present) from a single clipboard open so
     /// the snapshot is consistent — otherwise a fast-changing clipboard
     /// could give us HTML from one copy event and RTF from the next.
+    ///
+    /// `IsClipboardFormatAvailable` is checked first so we only open the
+    /// clipboard when rich text is actually present. The 500 ms monitor poll
+    /// otherwise piles three opens (files + image + rich) onto every cycle,
+    /// starving concurrent writers (e.g. arboard's set_image retries) and
+    /// surfacing as ERROR_CLIPBOARD_NOT_OPEN on the setter side.
     pub fn read_all() -> Vec<ClipboardFormat> {
+        let html_id = html_format_id();
+        let rtf_id = rtf_format_id();
+
+        let html_avail = html_id.map(raw::is_format_avail).unwrap_or(false);
+        let rtf_avail = rtf_id.map(raw::is_format_avail).unwrap_or(false);
+        if !html_avail && !rtf_avail {
+            return Vec::new();
+        }
+
         let mut out = Vec::new();
         let _clip = match Clipboard::new_attempts(ATTEMPTS) {
             Ok(c) => c,
@@ -87,31 +106,33 @@ mod windows {
         // header for us, returning the HTML fragment as a String. `Html::new`
         // registers the CF_HTML format atom — None means the registration call
         // failed, in which case there's nothing to read.
-        let mut html_buf = String::new();
-        match Html::new() {
-            Some(html) => match html.read_clipboard(&mut html_buf) {
-                Ok(_) if !html_buf.is_empty() => {
-                    if html_buf.len() > MAX_RICH_TEXT_BYTES {
-                        tracing::warn!(
-                            "Clipboard HTML ({} bytes) exceeds {} byte cap; skipping format.",
-                            html_buf.len(),
-                            MAX_RICH_TEXT_BYTES
-                        );
-                    } else {
-                        out.push(ClipboardFormat::from_text("text/html", html_buf));
+        if html_avail {
+            let mut html_buf = String::new();
+            match Html::new() {
+                Some(html) => match html.read_clipboard(&mut html_buf) {
+                    Ok(_) if !html_buf.is_empty() => {
+                        if html_buf.len() > MAX_RICH_TEXT_BYTES {
+                            tracing::warn!(
+                                "Clipboard HTML ({} bytes) exceeds {} byte cap; skipping format.",
+                                html_buf.len(),
+                                MAX_RICH_TEXT_BYTES
+                            );
+                        } else {
+                            out.push(ClipboardFormat::from_text("text/html", html_buf));
+                        }
                     }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!("Html getter returned: {}", e);
+                    }
+                },
+                None => {
+                    tracing::debug!("Couldn't register CF_HTML format atom");
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::debug!("Html getter returned: {}", e);
-                }
-            },
-            None => {
-                tracing::debug!("Couldn't register CF_HTML format atom");
             }
         }
 
-        if let Some(rtf_id) = rtf_format_id() {
+        if let (true, Some(rtf_id)) = (rtf_avail, rtf_id) {
             let mut rtf_buf: Vec<u8> = Vec::new();
             match RawData(rtf_id).read_clipboard(&mut rtf_buf) {
                 Ok(_) if !rtf_buf.is_empty() => {
