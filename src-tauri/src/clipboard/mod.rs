@@ -1,7 +1,7 @@
 pub mod common;
 mod plugin;
 
-use crate::protocol::ClipboardBlob;
+use crate::protocol::{ClipboardBlob, ClipboardFormat};
 
 #[cfg(target_os = "linux")]
 mod wayland;
@@ -138,6 +138,41 @@ pub fn set_clipboard_paths(app: &AppHandle, paths: Vec<String>) {
             ClipboardBackend::Degraded => {
                 tracing::warn!(
                     "Clipboard file write attempted in degraded mode — no backend available"
+                );
+            }
+        }
+    }
+}
+
+/// Write plain text plus alternate format representations (text/html, text/rtf,
+/// …) onto the local clipboard so the destination app can pick whichever
+/// format it understands best. Currently only the wlroots Wayland backend has
+/// the multi-MIME write path; on other backends we fall back to writing the
+/// plain-text portion only — graceful degradation, the receiver still gets
+/// the text, just loses the formatting for now (Phase 3 / 4 will fill in
+/// the rich-text path on those backends too).
+pub fn set_clipboard_rich(app: &AppHandle, text: String, formats: Vec<ClipboardFormat>) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = formats;
+        plugin::set_clipboard(app, text);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match get_backend() {
+            ClipboardBackend::WlrDataControl => wayland::set_clipboard_rich(app, text, formats),
+            ClipboardBackend::Plugin => {
+                let _ = formats;
+                plugin::set_clipboard(app, text);
+            }
+            ClipboardBackend::GnomeExtension => {
+                let _ = formats;
+                dbus_clipboard::set_clipboard(app, text);
+            }
+            ClipboardBackend::Degraded => {
+                tracing::warn!(
+                    "Clipboard rich write attempted in degraded mode — no backend available"
                 );
             }
         }

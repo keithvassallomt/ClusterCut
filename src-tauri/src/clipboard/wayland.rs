@@ -3,7 +3,7 @@
 ///
 /// Uses polling with get_contents (not subprocess spawning), so no flickering.
 use super::common::{self, ClipboardContent};
-use crate::protocol::ClipboardBlob;
+use crate::protocol::{ClipboardBlob, ClipboardFormat};
 use crate::state::AppState;
 use crate::transport::Transport;
 use std::io::Read;
@@ -31,6 +31,19 @@ const IMAGE_MIME_PRIORITY: &[&str] = &[
     "image/tiff",
     "image/gif",
 ];
+
+/// Rich-text MIME types we relay verbatim alongside the plain text. These
+/// carry formatted content (HTML/RTF) that destination apps can pick up
+/// instead of the plain text — the difference between pasting from Word
+/// into Word and getting formatting vs getting raw text.
+const RICH_TEXT_MIME_PRIORITY: &[&str] = &["text/html", "text/rtf"];
+
+/// Hard cap on bytes we'll read from a single rich-text representation.
+/// HTML / RTF from real apps (Word, browsers) are usually well under 1 MB
+/// even with embedded images, but Word can attach big metadata blobs.
+/// 16 MB is well above expected values and well below the 64 MB transport
+/// per-message cap.
+const MAX_RICH_TEXT_READ_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Check if wlr-data-control is available by attempting a paste.
 pub fn is_available() -> bool {
@@ -134,12 +147,83 @@ fn read_clipboard_image() -> Option<ClipboardBlob> {
     common::normalize_image_blob_from_bytes(buf, mime)
 }
 
+/// Read alternate text formats (HTML, RTF) alongside the primary plain text.
+/// Returns None if the OS clipboard offers nothing more than plain text — in
+/// which case the caller should fall through to the plain-text path.
+fn read_clipboard_rich() -> Option<(String, Vec<ClipboardFormat>)> {
+    let offered = match get_mime_types(ClipboardType::Regular, Seat::Unspecified) {
+        Ok(set) => set,
+        Err(_) => return None,
+    };
+
+    // Collect any rich-text formats actually advertised by the source.
+    let mut formats: Vec<ClipboardFormat> = Vec::new();
+    for mime in RICH_TEXT_MIME_PRIORITY {
+        if !offered.contains(*mime) {
+            continue;
+        }
+        let mut pipe = match get_contents(
+            ClipboardType::Regular,
+            Seat::Unspecified,
+            PasteMimeType::Specific(mime),
+        ) {
+            Ok((p, _)) => p,
+            Err(e) => {
+                tracing::debug!("clipboard rich read failed for {}: {}", mime, e);
+                continue;
+            }
+        };
+        let mut buf = Vec::new();
+        if (&mut pipe)
+            .take(MAX_RICH_TEXT_READ_BYTES + 1)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            continue;
+        }
+        if buf.is_empty() {
+            continue;
+        }
+        if buf.len() as u64 > MAX_RICH_TEXT_READ_BYTES {
+            tracing::warn!(
+                "Clipboard {} exceeds {} byte read cap; skipping format.",
+                mime,
+                MAX_RICH_TEXT_READ_BYTES
+            );
+            continue;
+        }
+        // text/html and text/rtf are UTF-8 (and 7-bit ASCII for RTF). If the
+        // bytes don't decode as UTF-8 we drop the format rather than send
+        // potentially corrupt text — the receiver wouldn't know what to do.
+        match String::from_utf8(buf) {
+            Ok(s) => formats.push(ClipboardFormat::from_text(*mime, s)),
+            Err(e) => {
+                tracing::warn!("Clipboard {} did not decode as UTF-8: {}", mime, e);
+            }
+        }
+    }
+
+    if formats.is_empty() {
+        return None;
+    }
+
+    // We need a primary plain text alongside the rich formats. If the source
+    // didn't advertise text/plain, fall back to an empty string — receivers
+    // still get the formatted content, and apps that can only paste plain
+    // text will get an empty paste rather than a half-formatted one.
+    let text = read_clipboard_text().unwrap_or_default();
+    Some((text, formats))
+}
+
 fn read_clipboard() -> ClipboardContent {
     if let Some(files) = read_clipboard_files() {
         return ClipboardContent::Files(files);
     }
     if let Some(blob) = read_clipboard_image() {
         return ClipboardContent::Image(blob);
+    }
+    if let Some((text, formats)) = read_clipboard_rich() {
+        return ClipboardContent::Rich { text, formats };
     }
     if let Some(text) = read_clipboard_text() {
         return ClipboardContent::Text(text);
@@ -206,6 +290,28 @@ fn write_image(_app: &AppHandle, blob: &ClipboardBlob) -> Result<(), String> {
     .map_err(|e| format!("wl-clipboard-rs copy image failed: {}", e))
 }
 
+/// Write plain text + alternate format representations (text/html, text/rtf, …)
+/// as a single clipboard offering, so the destination app can pick whichever
+/// MIME it understands best — matching the buffet the source originally had.
+fn write_rich(_app: &AppHandle, text: &str, formats: &[ClipboardFormat]) -> Result<(), String> {
+    let mut sources: Vec<MimeSource> = Vec::with_capacity(1 + formats.len());
+    sources.push(MimeSource {
+        source: Source::Bytes(text.as_bytes().to_vec().into()),
+        mime_type: CopyMimeType::Text,
+    });
+    for f in formats {
+        let bytes = f.raw_bytes()?;
+        sources.push(MimeSource {
+            source: Source::Bytes(bytes.into()),
+            mime_type: CopyMimeType::Specific(f.mime_type.clone()),
+        });
+    }
+
+    let opts = CopyOptions::new();
+    opts.copy_multi(sources)
+        .map_err(|e| format!("wl-clipboard-rs copy rich failed: {}", e))
+}
+
 pub fn set_clipboard(app: &AppHandle, text: String) {
     common::set_clipboard_with_ignore(app, text, write_text);
 }
@@ -216,6 +322,10 @@ pub fn set_clipboard_paths(app: &AppHandle, paths: Vec<String>) {
 
 pub fn set_clipboard_image(app: &AppHandle, blob: ClipboardBlob) {
     common::set_clipboard_blob_with_ignore(app, blob, write_image);
+}
+
+pub fn set_clipboard_rich(app: &AppHandle, text: String, formats: Vec<ClipboardFormat>) {
+    common::set_clipboard_rich_with_ignore(app, text, formats, write_rich);
 }
 
 pub fn read_text(_app: &AppHandle) -> Result<String, String> {

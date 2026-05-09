@@ -1,5 +1,5 @@
 use crate::crypto;
-use crate::protocol::{ClipboardBlob, ClipboardPayload, FileMetadata, Message};
+use crate::protocol::{ClipboardBlob, ClipboardFormat, ClipboardPayload, FileMetadata, Message};
 use crate::state::AppState;
 use crate::transport::Transport;
 use std::thread;
@@ -137,6 +137,13 @@ pub enum ClipboardContent {
     Text(String),
     Files(Vec<String>),
     Image(ClipboardBlob),
+    /// Plain text plus one or more alternate format representations
+    /// (text/html, text/rtf, …). Used when the OS clipboard offers rich
+    /// formats — receivers re-stock all the formats they can write.
+    Rich {
+        text: String,
+        formats: Vec<ClipboardFormat>,
+    },
     None,
 }
 
@@ -187,6 +194,22 @@ pub fn should_process_content(
             ClipboardContent::Image(ign_blob) => {
                 if let ClipboardContent::Image(curr_blob) = current_content {
                     if curr_blob == ign_blob {
+                        *ignored = ClipboardContent::None;
+                    } else if current_content != last_content {
+                        should_process = true;
+                    }
+                } else if current_content != last_content
+                    && *current_content != ClipboardContent::None
+                {
+                    should_process = true;
+                }
+            }
+            ClipboardContent::Rich {
+                text: ign_text,
+                formats: ign_formats,
+            } => {
+                if let ClipboardContent::Rich { text, formats } = current_content {
+                    if text == ign_text && formats == ign_formats {
                         *ignored = ClipboardContent::None;
                     } else if current_content != last_content {
                         should_process = true;
@@ -381,6 +404,45 @@ pub fn process_clipboard_change(
 
             broadcast_clipboard(app_handle, state, transport, payload_obj);
         }
+        ClipboardContent::Rich { text, formats } => {
+            tracing::debug!(
+                "Clipboard Rich Change Detected (text_len={}, format_count={})",
+                text.len(),
+                formats.len()
+            );
+
+            let hostname = crate::get_hostname_internal();
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let local_id = state.local_device_id.lock().unwrap().clone();
+            let payload_obj = ClipboardPayload {
+                id: msg_id,
+                text,
+                files: None,
+                blob: None,
+                formats: Some(formats),
+                timestamp: ts,
+                sender: hostname,
+                sender_id: local_id,
+            };
+
+            let sig = payload_signature(&payload_obj);
+            {
+                let mut last_global = state.last_clipboard_content.lock().unwrap();
+                if *last_global == sig {
+                    tracing::debug!(
+                        "Ignoring broadcast - rich payload matches last_clipboard_content"
+                    );
+                    return;
+                }
+                *last_global = sig;
+            }
+
+            broadcast_clipboard(app_handle, state, transport, payload_obj);
+        }
         ClipboardContent::None => {}
     }
 }
@@ -496,6 +558,40 @@ pub fn set_clipboard_paths_with_ignore(app: &AppHandle, paths: Vec<String>, writ
             tracing::error!("Failed to set clipboard files: {}", e);
         } else {
             tracing::debug!("Successfully set local clipboard files.");
+        }
+    });
+}
+
+/// Set clipboard rich content (plain text plus alternate formats like
+/// text/html and text/rtf), with feedback loop prevention. The IGNORED_CONTENT
+/// guard fires if the same Rich payload bounces straight back to us.
+pub fn set_clipboard_rich_with_ignore(
+    app: &AppHandle,
+    text: String,
+    formats: Vec<ClipboardFormat>,
+    write_fn: fn(&AppHandle, &str, &[ClipboardFormat]) -> Result<(), String>,
+) {
+    let app_handle = app.clone();
+    let text_clone = text.clone();
+    let formats_clone = formats.clone();
+
+    thread::spawn(move || {
+        {
+            let mut ignored = IGNORED_CONTENT.lock().unwrap();
+            *ignored = ClipboardContent::Rich {
+                text: text_clone.clone(),
+                formats: formats_clone.clone(),
+            };
+        }
+
+        if let Err(e) = write_fn(&app_handle, &text_clone, &formats_clone) {
+            tracing::error!("Failed to set clipboard rich content: {}", e);
+        } else {
+            tracing::debug!(
+                "Successfully set local clipboard rich (text_len={}, format_count={}).",
+                text_clone.len(),
+                formats_clone.len()
+            );
         }
     });
 }

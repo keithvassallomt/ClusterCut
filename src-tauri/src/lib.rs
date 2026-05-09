@@ -1851,6 +1851,13 @@ async fn confirm_pending_clipboard(
         tracing::info!("Confirming pending clipboard from {}", payload.sender);
         if let Some(blob) = payload.blob.clone() {
             clipboard::set_clipboard_image(&app_handle, blob);
+        } else if let Some(formats) = payload
+            .formats
+            .as_ref()
+            .filter(|fs| !fs.is_empty())
+            .cloned()
+        {
+            clipboard::set_clipboard_rich(&app_handle, payload.text.clone(), formats);
         } else {
             clipboard::set_clipboard(&app_handle, payload.text.clone());
         }
@@ -3201,8 +3208,36 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 }
                             }
 
-                            // TEXT HANDLING
-                            if !text.is_empty() {
+                            // RICH HANDLING (text + alternate formats like text/html, text/rtf).
+                            // Takes precedence over plain TEXT HANDLING so destination apps see
+                            // the multi-MIME buffet the source had. Backends that can't yet write
+                            // multi-format fall back to plain text inside set_clipboard_rich.
+                            let rich_formats = payload_obj
+                                .formats
+                                .as_ref()
+                                .filter(|fs| !fs.is_empty())
+                                .cloned();
+
+                            if let Some(formats) = rich_formats {
+                                let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
+                                if auto_receiver {
+                                    clipboard::set_clipboard_rich(&listener_handle, text.clone(), formats);
+                                    let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                } else {
+                                    tracing::info!("[Clipboard] Auto-receive OFF. Storing pending rich clipboard from {}", sender);
+                                    {
+                                        let mut pending = listener_state.pending_clipboard.lock().unwrap();
+                                        *pending = Some(payload_obj.clone());
+                                    }
+                                    let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                }
+
+                                let notifications = listener_state.settings.lock().unwrap().notifications.clone();
+                                if notifications.data_received {
+                                    send_notification(&listener_handle, "Clipboard Received", "Formatted content copied to clipboard", false, Some(2), "history", NotificationPayload::None);
+                                }
+                            } else if !text.is_empty() {
+                                // TEXT HANDLING — plain text only, no rich formats present.
                                 let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
                                 if auto_receiver {
                                     clipboard::set_clipboard(&listener_handle, text.clone());
@@ -3216,7 +3251,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                     }
                                     let _ = listener_handle.emit("clipboard-pending", &payload_obj);
                                 }
-                                
+
                                 let notifications = listener_state.settings.lock().unwrap().notifications.clone();
                                 if notifications.data_received {
                                     send_notification(&listener_handle, "Clipboard Received", "Content copied to clipboard", false, Some(2), "history", NotificationPayload::None);
