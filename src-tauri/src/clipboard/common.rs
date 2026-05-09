@@ -153,28 +153,50 @@ pub enum ClipboardContent {
 pub static IGNORED_CONTENT: Lazy<Arc<Mutex<ClipboardContent>>> =
     Lazy::new(|| Arc::new(Mutex::new(ClipboardContent::None)));
 
+/// One-line summary of a `ClipboardContent` for log lines. Keep it compact
+/// so an event chain (`Set IGNORED → Check → MATCH/MISS → Broadcast?`) reads
+/// inline without wrapping.
+pub fn describe_content(c: &ClipboardContent) -> String {
+    match c {
+        ClipboardContent::None => "None".to_string(),
+        ClipboardContent::Text(s) => format!("Text(len={})", s.len()),
+        ClipboardContent::Files(f) => format!("Files(count={})", f.len()),
+        ClipboardContent::Image(b) => {
+            let dims = match (b.width, b.height) {
+                (Some(w), Some(h)) => format!("{}x{}", w, h),
+                _ => "?".to_string(),
+            };
+            format!(
+                "Image(mime={}, decoded={}, dims={})",
+                b.mime_type,
+                b.decoded_len(),
+                dims
+            )
+        }
+        ClipboardContent::Rich { text, formats } => {
+            let mimes: Vec<&str> = formats.iter().map(|f| f.mime_type.as_str()).collect();
+            format!("Rich(text_len={}, formats=[{}])", text.len(), mimes.join(", "))
+        }
+    }
+}
+
 /// Stable equivalence for image blobs across an OS-clipboard round-trip.
 ///
-/// `ClipboardBlob`'s derived `PartialEq` compares the base64 `data` field
-/// byte-for-byte, but a blob written via `arboard::set_image` and then read
-/// back via the monitor's `arboard::get_image` is RGBA-decoded then PNG-
-/// re-encoded by the `image` crate, producing different bytes for the same
-/// pixels. That false negative on the IGNORED_CONTENT match is what made
-/// the receiver re-broadcast every image it received — see TIRI.
+/// The IGNORED guard is a *one-shot* check whose only job is to suppress our
+/// own echo: we wrote an image to the OS clipboard and want to ignore the
+/// next read of "an image". The OS layer mangles both the bytes (RGBA → DIB
+/// → RGBA → re-encoded PNG produces different bytes for the same pixels)
+/// **and** the reported dimensions on Windows (CF_DIB header padding /
+/// alignment can shift width or height by a handful of pixels), so a strict
+/// `(mime, dims)` check produces false negatives that make the receiver
+/// re-broadcast every image it accepts. Same-mime image-vs-image is
+/// therefore treated as our own echo unconditionally.
 ///
-/// Equivalence is now `(mime_type, width, height)` when both sides have
-/// dimensions (which is the normal path — every backend that produces a
-/// `ClipboardBlob` populates them). Falls back to byte-exact when either
-/// side is missing dimensions, so legacy or hand-built blobs without
-/// `width`/`height` still get sensible behaviour.
+/// False-suppression cost: if the user copies a *different* image within
+/// one poll cycle of receiving one, the new image is suppressed for that
+/// cycle and broadcast on the next (~500 ms later). Acceptable.
 fn image_blob_eq_stable(a: &ClipboardBlob, b: &ClipboardBlob) -> bool {
-    if a.mime_type != b.mime_type {
-        return false;
-    }
-    match ((a.width, a.height), (b.width, b.height)) {
-        ((Some(aw), Some(ah)), (Some(bw), Some(bh))) => aw == bw && ah == bh,
-        _ => a.data == b.data,
-    }
+    a.mime_type == b.mime_type
 }
 
 /// Stable equivalence for rich-text payloads across an OS-clipboard round-
@@ -209,6 +231,14 @@ fn rich_eq_stable(
 
 /// Process a clipboard read result through the dedup/feedback-loop logic.
 /// Returns true if the content should be broadcast.
+///
+/// Logging contract for the [Echo] tag (`info!`): emitted only when an
+/// IGNORED guard is active, on every monitor read. One of:
+///   `[Echo] Check: ignored=… current=… -> MATCH (clearing guard)`
+///   `[Echo] Check: ignored=… current=… -> MISS (reason=…)` followed by
+///   `[Echo] Triggering loop-back broadcast — IGNORED check missed`
+/// if the miss leads to a broadcast. A successful suppression is the
+/// MATCH branch; any MISS that goes on to broadcast is a bug.
 pub fn should_process_content(
     current_content: &ClipboardContent,
     last_content: &ClipboardContent,
@@ -216,6 +246,8 @@ pub fn should_process_content(
     let mut should_process = false;
     {
         let mut ignored = IGNORED_CONTENT.lock().unwrap();
+        let ign_desc = describe_content(&ignored);
+        let cur_desc = describe_content(current_content);
         match &*ignored {
             ClipboardContent::None => {
                 if current_content != last_content && *current_content != ClipboardContent::None {
@@ -225,42 +257,52 @@ pub fn should_process_content(
             ClipboardContent::Text(ign_text) => {
                 if let ClipboardContent::Text(curr_text) = current_content {
                     if curr_text == ign_text {
+                        tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
                         *ignored = ClipboardContent::None;
                     } else if current_content != last_content {
+                        tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=text_differs)", ign_desc, cur_desc);
                         should_process = true;
+                    } else {
+                        tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=text_differs, but matches last_content; suppressed)", ign_desc, cur_desc);
                     }
                 } else if current_content != last_content
                     && *current_content != ClipboardContent::None
                 {
+                    tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Text but current isn't)", ign_desc, cur_desc);
                     should_process = true;
+                } else if *current_content != ClipboardContent::None {
+                    tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs, but matches last_content; suppressed)", ign_desc, cur_desc);
                 }
             }
             ClipboardContent::Files(ign_files) => {
                 if let ClipboardContent::Files(curr_files) = current_content {
                     if curr_files == ign_files {
+                        tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
                         *ignored = ClipboardContent::None;
                     } else if current_content != last_content {
+                        tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=files_differ)", ign_desc, cur_desc);
                         should_process = true;
                     }
                 } else if current_content != last_content
                     && *current_content != ClipboardContent::None
                 {
+                    tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Files but current isn't)", ign_desc, cur_desc);
                     should_process = true;
                 }
             }
             ClipboardContent::Image(ign_blob) => {
                 if let ClipboardContent::Image(curr_blob) = current_content {
-                    // Stable comparison closes TIRI — a PNG round-tripped
-                    // through the OS clipboard has different bytes but the
-                    // same (mime, dims) and is therefore our own echo.
                     if image_blob_eq_stable(curr_blob, ign_blob) {
+                        tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
                         *ignored = ClipboardContent::None;
                     } else if current_content != last_content {
+                        tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=mime_differs)", ign_desc, cur_desc);
                         should_process = true;
                     }
                 } else if current_content != last_content
                     && *current_content != ClipboardContent::None
                 {
+                    tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Image but current isn't)", ign_desc, cur_desc);
                     should_process = true;
                 }
             }
@@ -269,22 +311,27 @@ pub fn should_process_content(
                 formats: ign_formats,
             } => {
                 if let ClipboardContent::Rich { text, formats } = current_content {
-                    // Stable comparison: text is byte-stable across the
-                    // round-trip; the format data may be normalised by the
-                    // OS clipboard layer, so we ignore per-format bytes
-                    // and just compare the MIME set.
                     if rich_eq_stable(ign_text, ign_formats, text, formats) {
+                        tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
                         *ignored = ClipboardContent::None;
                     } else if current_content != last_content {
+                        tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=rich_differs)", ign_desc, cur_desc);
                         should_process = true;
                     }
                 } else if current_content != last_content
                     && *current_content != ClipboardContent::None
                 {
+                    tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Rich but current isn't)", ign_desc, cur_desc);
                     should_process = true;
                 }
             }
         }
+    }
+    if should_process {
+        tracing::info!(
+            "[Echo] Triggering loop-back broadcast — IGNORED check missed; current={}",
+            describe_content(current_content)
+        );
     }
     should_process
 }
@@ -597,6 +644,7 @@ pub fn set_clipboard_with_ignore(app: &AppHandle, text: String, write_fn: fn(&Ap
         {
             let mut ignored = IGNORED_CONTENT.lock().unwrap();
             *ignored = ClipboardContent::Text(text_clone.clone());
+            tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&ignored));
         }
 
         if let Err(e) = write_fn(&app_handle, text_clone) {
@@ -616,6 +664,7 @@ pub fn set_clipboard_paths_with_ignore(app: &AppHandle, paths: Vec<String>, writ
         {
             let mut ignored = IGNORED_CONTENT.lock().unwrap();
             *ignored = ClipboardContent::Files(paths_clone.clone());
+            tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&ignored));
         }
 
         if let Err(e) = write_fn(&app_handle, paths_clone) {
@@ -646,6 +695,7 @@ pub fn set_clipboard_rich_with_ignore(
                 text: text_clone.clone(),
                 formats: formats_clone.clone(),
             };
+            tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&ignored));
         }
 
         if let Err(e) = write_fn(&app_handle, &text_clone, &formats_clone) {
@@ -675,6 +725,7 @@ pub fn set_clipboard_blob_with_ignore(
         {
             let mut ignored = IGNORED_CONTENT.lock().unwrap();
             *ignored = ClipboardContent::Image(blob_clone.clone());
+            tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&ignored));
         }
 
         if let Err(e) = write_fn(&app_handle, &blob_clone) {
@@ -768,10 +819,14 @@ mod tests {
     }
 
     #[test]
-    fn image_blob_eq_stable_distinguishes_different_dimensions() {
+    fn image_blob_eq_stable_matches_when_dimensions_differ() {
+        // The Windows CF_DIB round-trip can shift reported dims by a handful
+        // of pixels (header padding artifacts). Same-mime images are now
+        // treated as our own echo regardless — the IGNORED guard is one-shot
+        // so the false-suppression cost is at most one poll cycle.
         let a = blob("image/png", "X", Some(1280), Some(720));
         let b = blob("image/png", "X", Some(640), Some(480));
-        assert!(!image_blob_eq_stable(&a, &b));
+        assert!(image_blob_eq_stable(&a, &b));
     }
 
     #[test]
@@ -782,14 +837,12 @@ mod tests {
     }
 
     #[test]
-    fn image_blob_eq_stable_falls_back_to_bytes_when_dimensions_absent() {
-        // Without dims we have no choice but byte-exact — preserves old
-        // behaviour for any backend that doesn't populate width/height.
+    fn image_blob_eq_stable_matches_same_mime_without_dimensions() {
+        // No dims present (legacy/hand-built blobs) still match if the mime
+        // matches — same one-shot rationale.
         let a = blob("image/png", "X", None, None);
-        let b = blob("image/png", "X", None, None);
-        let c = blob("image/png", "Y", None, None);
+        let b = blob("image/png", "Y", None, None);
         assert!(image_blob_eq_stable(&a, &b));
-        assert!(!image_blob_eq_stable(&a, &c));
     }
 
     #[test]

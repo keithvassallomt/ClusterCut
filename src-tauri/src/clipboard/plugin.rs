@@ -34,6 +34,19 @@ enum WorkerCommand {
         rgba: Vec<u8>,
         response: mpsc::Sender<Result<(), String>>,
     },
+    /// Windows-only: write plain text via clipboard-win, calling
+    /// `EmptyClipboard` first so stale CF_HTML / CF_RTF formats from a
+    /// previous copy don't survive alongside the new CF_UNICODETEXT and
+    /// trick the monitor's rich-text probe into reporting `Rich(text +
+    /// stale_html)` — which would mismatch the `Text` IGNORED guard and
+    /// bounce every received text back to the sender. tauri-plugin-clipboard
+    /// on Windows calls `SetClipboardData(CF_UNICODETEXT, …)` without
+    /// `EmptyClipboard`, so we route through the worker instead.
+    #[cfg(target_os = "windows")]
+    SetText {
+        text: String,
+        response: mpsc::Sender<Result<(), String>>,
+    },
 }
 
 /// Worker command sender, populated by `start_monitor`. The image write path
@@ -164,6 +177,24 @@ fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Resu
     }
 }
 
+/// Windows worker helper: empty the clipboard and write plain text via
+/// clipboard-win. The empty step is the whole point — it kills any stale
+/// CF_HTML / CF_RTF that a prior copy left behind, so the monitor's
+/// rich-text probe returns nothing on the next read and the `Text` IGNORED
+/// guard matches cleanly.
+#[cfg(target_os = "windows")]
+fn set_text_clearing_clipboard(text: &str) -> Result<(), String> {
+    use clipboard_win::{formats::Unicode, raw, Clipboard, Setter};
+    const ATTEMPTS: usize = 10;
+    let _clip = Clipboard::new_attempts(ATTEMPTS)
+        .map_err(|e| format!("OpenClipboard: {}", e))?;
+    raw::empty().map_err(|e| format!("EmptyClipboard: {}", e))?;
+    Unicode
+        .write_clipboard(&text)
+        .map_err(|e| format!("CF_UNICODETEXT: {}", e))?;
+    Ok(())
+}
+
 /// Worker-thread side of the image write. Uses the persistent
 /// `arboard::Clipboard` handle so `OpenClipboard`/`CloseClipboard` happen on
 /// the same thread that does all clipboard reads — no cross-thread contention.
@@ -262,9 +293,33 @@ fn read_clipboard(
 }
 
 fn write_text(app: &AppHandle, text: String) -> Result<(), String> {
-    app.state::<Clipboard>()
-        .write_text(text)
-        .map_err(|e| e.to_string())
+    #[cfg(target_os = "windows")]
+    {
+        let _ = app;
+        let sender = WORKER_CMD_TX
+            .get()
+            .ok_or_else(|| "clipboard worker not initialised".to_string())?
+            .clone();
+        let (tx, rx) = mpsc::channel();
+        sender
+            .send(WorkerCommand::SetText { text, response: tx })
+            .map_err(|_| "clipboard worker channel closed".to_string())?;
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err("clipboard worker did not respond within 5 s".to_string())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("clipboard worker dropped response channel".to_string())
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        app.state::<Clipboard>()
+            .write_text(text)
+            .map_err(|e| e.to_string())
+    }
 }
 
 fn write_files(app: &AppHandle, files: Vec<String>) -> Result<(), String> {
@@ -417,6 +472,11 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                     // Best-effort: if the caller already gave up (timeout),
                     // the receiver side is gone and send returns Err. Either
                     // way the worker continues servicing future commands.
+                    let _ = response.send(result);
+                }
+                #[cfg(target_os = "windows")]
+                WorkerCommand::SetText { text, response } => {
+                    let result = set_text_clearing_clipboard(&text);
                     let _ = response.send(result);
                 }
             }
