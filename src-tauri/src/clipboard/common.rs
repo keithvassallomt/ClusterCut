@@ -9,6 +9,7 @@ use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
 
 /// Wire-format size cap for clipboard image blobs. Sender drops anything over.
+#[cfg(target_os = "linux")]
 pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Compute a stable, cheap content fingerprint for a `ClipboardPayload` used
@@ -67,6 +68,7 @@ pub fn payload_signature(payload: &ClipboardPayload) -> String {
 
 /// Map a MIME string to an `image::ImageFormat`. Returns `None` for unknown
 /// types so callers can skip unsupported sources cleanly.
+#[cfg(target_os = "linux")]
 pub fn image_format_for_mime(mime: &str) -> Option<image::ImageFormat> {
     match mime {
         "image/png" => Some(image::ImageFormat::Png),
@@ -87,6 +89,7 @@ pub fn image_format_for_mime(mime: &str) -> Option<image::ImageFormat> {
 ///
 /// PNG sources skip the re-encode step — we just validate the bytes by
 /// loading them and reuse the original buffer.
+#[cfg(target_os = "linux")]
 pub fn normalize_image_blob_from_bytes(
     bytes: Vec<u8>,
     source_mime: &str,

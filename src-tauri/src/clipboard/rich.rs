@@ -233,7 +233,7 @@ mod macos {
     const MAX_RICH_TEXT_BYTES: usize = 16 * 1024 * 1024;
 
     fn pasteboard() -> Retained<NSPasteboard> {
-        unsafe { NSPasteboard::generalPasteboard() }
+        NSPasteboard::generalPasteboard()
     }
 
     /// Read HTML and RTF if present. Single pasteboard handle keeps the
@@ -244,9 +244,9 @@ mod macos {
 
         for (uti, mime) in [("public.html", "text/html"), ("public.rtf", "text/rtf")] {
             let uti_ns = NSString::from_str(uti);
-            let data: Option<Retained<NSData>> = unsafe { pb.dataForType(&uti_ns) };
+            let data: Option<Retained<NSData>> = pb.dataForType(&uti_ns);
             let Some(data) = data else { continue };
-            let len = unsafe { data.length() };
+            let len = data.length();
             if len == 0 {
                 continue;
             }
@@ -259,14 +259,7 @@ mod macos {
                 );
                 continue;
             }
-            // NSData → Vec<u8>: copy the bytes pointed at by `bytes()` over
-            // `length()` bytes. NSData is immutable so the slice is stable
-            // for the duration of this borrow.
-            let bytes = unsafe {
-                let ptr = data.bytes();
-                std::slice::from_raw_parts(ptr.as_ptr() as *const u8, len).to_vec()
-            };
-            match String::from_utf8(bytes) {
+            match String::from_utf8(data.to_vec()) {
                 Ok(s) => out.push(ClipboardFormat::from_text(mime, s)),
                 Err(e) => {
                     tracing::warn!("Clipboard {} did not decode as UTF-8: {}", mime, e);
@@ -308,7 +301,7 @@ mod macos {
         // Plain text first so apps that only consume text/plain still work.
         let text_uti = NSString::from_str("public.utf8-plain-text");
         let text_data = NSData::with_bytes(text.as_bytes());
-        let ok = unsafe { pb.setData_forType(Some(&text_data), &text_uti) };
+        let ok = pb.setData_forType(Some(&text_data), &text_uti);
         if !ok {
             return Err("setData:forType: returned false for plain text".to_string());
         }
@@ -322,7 +315,7 @@ mod macos {
             let bytes = f.raw_bytes()?;
             let uti_ns = NSString::from_str(uti);
             let data = NSData::with_bytes(&bytes);
-            let ok = unsafe { pb.setData_forType(Some(&data), &uti_ns) };
+            let ok = pb.setData_forType(Some(&data), &uti_ns);
             if !ok {
                 tracing::warn!("setData:forType: returned false for {}", uti);
             }
