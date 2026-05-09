@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - Added a strict Content Security Policy to the Tauri WebView (`default-src 'self'`, no `'unsafe-eval'`, no remote sources). Defense-in-depth against XSS in untrusted data the app renders (clipboard contents, filenames). Thanks to @mdunphy for the suggestion (#10).
+- The pairing `Welcome` message now encrypts its full payload (cluster key, known peers, network name, **and network PIN**) under the SPAKE2 session key. Previously only the cluster key was encrypted, so an active MITM on the unauthenticated TLS tunnel could read the network PIN and peer list during pairing. Also stopped logging the network PIN on join. Thanks to @mdunphy for the report (#9). **Pairing wire format changed — peers running older versions cannot pair with peers running this version.**
 
 ### Changed
 - Bumped `@tauri-apps/api` to `~2.10.0` (#11).

@@ -38,6 +38,14 @@ pub struct FileStreamHeader {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WelcomePayload {
+    pub cluster_key: Vec<u8>,
+    pub known_peers: Vec<crate::peer::Peer>,
+    pub network_name: String,
+    pub network_pin: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
     Clipboard(Vec<u8>), // Encrypted ClipboardPayload
     PairRequest {
@@ -48,12 +56,12 @@ pub enum Message {
         msg: Vec<u8>,
         device_id: String,
     },
-    // Sent by Responder to Initiator after successful handshake
+    // Sent by Responder to Initiator after successful handshake.
+    // Entire payload (cluster key, known peers, network name, PIN) is JSON-serialized
+    // then encrypted with the SPAKE2+ session key — the unauthenticated TLS tunnel
+    // must be assumed MITM-readable until cert-pinning lands (see issue #9).
     Welcome {
-        encrypted_cluster_key: Vec<u8>, // Encrypted with SPAKE2+ session key
-        known_peers: Vec<crate::peer::Peer>,
-        network_name: String,
-        network_pin: String,
+        encrypted_payload: Vec<u8>,
     },
     // Gossip: Broadcast new peer to known peers
     PeerDiscovery(crate::peer::Peer),

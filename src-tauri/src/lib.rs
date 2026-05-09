@@ -3200,16 +3200,22 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                         let mut session_key_arr = [0u8; 32];
                                         if session_key.len() == 32 {
                                             session_key_arr.copy_from_slice(&session_key);
-                                            if let Ok(encrypted_ck) = crypto::encrypt(&session_key_arr, &cluster_key).map_err(|e| e.to_string()) {
-                                                let known_peers = listener_state.known_peers.lock().unwrap().values().cloned().collect();
-                                                let network_name = listener_state.network_name.lock().unwrap().clone();
-                                                let network_pin = listener_state.network_pin.lock().unwrap().clone();
-                                                let welcome = Message::Welcome {
-                                                    encrypted_cluster_key: encrypted_ck,
-                                                    known_peers,
-                                                    network_name: network_name.clone(),
-                                                    network_pin
-                                                };
+                                            let known_peers = listener_state.known_peers.lock().unwrap().values().cloned().collect();
+                                            let network_name = listener_state.network_name.lock().unwrap().clone();
+                                            let network_pin = listener_state.network_pin.lock().unwrap().clone();
+                                            let payload = crate::protocol::WelcomePayload {
+                                                cluster_key,
+                                                known_peers,
+                                                network_name: network_name.clone(),
+                                                network_pin,
+                                            };
+                                            let encrypt_result = serde_json::to_vec(&payload)
+                                                .map_err(|e| e.to_string())
+                                                .and_then(|plaintext| {
+                                                    crypto::encrypt(&session_key_arr, &plaintext).map_err(|e| e.to_string())
+                                                });
+                                            if let Ok(encrypted_payload) = encrypt_result {
+                                                let welcome = Message::Welcome { encrypted_payload };
                                                 if let Ok(welcome_data) = serde_json::to_vec(&welcome) {
                                                     let _ = transport_inside.send_message(addr, &welcome_data).await;
                                                     
@@ -3266,7 +3272,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                 let _ = listener_handle.emit("pairing-failed", "Pairing session expired. Please try again.");
             }
         }
-        Message::Welcome { encrypted_cluster_key, known_peers, network_name, network_pin } => {
+        Message::Welcome { encrypted_payload } => {
              tracing::info!("Received WELCOME from {}", addr);
              let session_key = {
                  let sessions = listener_state.handshake_sessions.lock().unwrap();
@@ -3276,9 +3282,15 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                  let mut sk_arr = [0u8; 32];
                  if sk.len() == 32 {
                      sk_arr.copy_from_slice(&sk);
-                     match crypto::decrypt(&sk_arr, &encrypted_cluster_key).map_err(|e| e.to_string()) {
-                         Ok(cluster_key) => {
-                             tracing::info!("Joined Network: {} (PIN: {})", network_name, network_pin);
+                     let payload_result = crypto::decrypt(&sk_arr, &encrypted_payload)
+                         .map_err(|e| e.to_string())
+                         .and_then(|plaintext| {
+                             serde_json::from_slice::<crate::protocol::WelcomePayload>(&plaintext)
+                                 .map_err(|e| e.to_string())
+                         });
+                     match payload_result {
+                         Ok(crate::protocol::WelcomePayload { cluster_key, known_peers, network_name, network_pin }) => {
+                             tracing::info!("Joined Network: {}", network_name);
                              {
                                  let mut ck = listener_state.cluster_key.lock().unwrap();
                                  *ck = Some(cluster_key.clone());
