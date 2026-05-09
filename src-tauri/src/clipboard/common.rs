@@ -153,6 +153,60 @@ pub enum ClipboardContent {
 pub static IGNORED_CONTENT: Lazy<Arc<Mutex<ClipboardContent>>> =
     Lazy::new(|| Arc::new(Mutex::new(ClipboardContent::None)));
 
+/// Stable equivalence for image blobs across an OS-clipboard round-trip.
+///
+/// `ClipboardBlob`'s derived `PartialEq` compares the base64 `data` field
+/// byte-for-byte, but a blob written via `arboard::set_image` and then read
+/// back via the monitor's `arboard::get_image` is RGBA-decoded then PNG-
+/// re-encoded by the `image` crate, producing different bytes for the same
+/// pixels. That false negative on the IGNORED_CONTENT match is what made
+/// the receiver re-broadcast every image it received — see TIRI.
+///
+/// Equivalence is now `(mime_type, width, height)` when both sides have
+/// dimensions (which is the normal path — every backend that produces a
+/// `ClipboardBlob` populates them). Falls back to byte-exact when either
+/// side is missing dimensions, so legacy or hand-built blobs without
+/// `width`/`height` still get sensible behaviour.
+fn image_blob_eq_stable(a: &ClipboardBlob, b: &ClipboardBlob) -> bool {
+    if a.mime_type != b.mime_type {
+        return false;
+    }
+    match ((a.width, a.height), (b.width, b.height)) {
+        ((Some(aw), Some(ah)), (Some(bw), Some(bh))) => aw == bw && ah == bh,
+        _ => a.data == b.data,
+    }
+}
+
+/// Stable equivalence for rich-text payloads across an OS-clipboard round-
+/// trip. The `text` field round-trips byte-stably (every backend stores
+/// plain UTF-8 text verbatim — NSPasteboard, Win32 CF_UNICODETEXT, and
+/// Wayland `text/plain` all preserve bytes), but the per-format `data`
+/// strings can be normalised by the OS layer (line endings, charset
+/// declarations, etc.). Equivalence is `(text, sorted MIME set)` — drops
+/// the per-format byte length comparison that was making the receiver
+/// re-broadcast every rich-text paste it accepted.
+///
+/// Edge case: two distinct rich copies that happen to have the same plain
+/// text and the same MIME set would compare equal. Vanishingly unlikely
+/// in practice, and the cost of mis-suppressing one such copy is much
+/// lower than the cost of bouncing every rich copy.
+fn rich_eq_stable(
+    ign_text: &str,
+    ign_formats: &[ClipboardFormat],
+    curr_text: &str,
+    curr_formats: &[ClipboardFormat],
+) -> bool {
+    if ign_text != curr_text {
+        return false;
+    }
+    let mut ign_mimes: Vec<&str> = ign_formats.iter().map(|f| f.mime_type.as_str()).collect();
+    let mut curr_mimes: Vec<&str> =
+        curr_formats.iter().map(|f| f.mime_type.as_str()).collect();
+    ign_mimes.sort();
+    curr_mimes.sort();
+    ign_mimes == curr_mimes
+}
+
 /// Process a clipboard read result through the dedup/feedback-loop logic.
 /// Returns true if the content should be broadcast.
 pub fn should_process_content(
@@ -196,7 +250,10 @@ pub fn should_process_content(
             }
             ClipboardContent::Image(ign_blob) => {
                 if let ClipboardContent::Image(curr_blob) = current_content {
-                    if curr_blob == ign_blob {
+                    // Stable comparison closes TIRI — a PNG round-tripped
+                    // through the OS clipboard has different bytes but the
+                    // same (mime, dims) and is therefore our own echo.
+                    if image_blob_eq_stable(curr_blob, ign_blob) {
                         *ignored = ClipboardContent::None;
                     } else if current_content != last_content {
                         should_process = true;
@@ -212,7 +269,11 @@ pub fn should_process_content(
                 formats: ign_formats,
             } => {
                 if let ClipboardContent::Rich { text, formats } = current_content {
-                    if text == ign_text && formats == ign_formats {
+                    // Stable comparison: text is byte-stable across the
+                    // round-trip; the format data may be normalised by the
+                    // OS clipboard layer, so we ignore per-format bytes
+                    // and just compare the MIME set.
+                    if rich_eq_stable(ign_text, ign_formats, text, formats) {
                         *ignored = ClipboardContent::None;
                     } else if current_content != last_content {
                         should_process = true;
@@ -684,5 +745,94 @@ mod tests {
         let a = payload_with("first", Some(vec![html.clone()]));
         let b = payload_with("second", Some(vec![html]));
         assert_ne!(payload_signature(&a), payload_signature(&b));
+    }
+
+    // ─── TIRI: stable IGNORED_CONTENT comparison ───────────────────────────
+
+    fn blob(mime: &str, data: &str, w: Option<u32>, h: Option<u32>) -> ClipboardBlob {
+        ClipboardBlob {
+            mime_type: mime.to_string(),
+            data: data.to_string(),
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn image_blob_eq_stable_matches_round_tripped_bytes() {
+        // Same dims, different bytes — what TIRI looks like on the wire.
+        let a = blob("image/png", "AAA…ORIGINAL_BYTES…", Some(1280), Some(720));
+        let b = blob("image/png", "ZZZ…ROUNDTRIPPED…", Some(1280), Some(720));
+        assert_ne!(a, b, "byte-exact PartialEq must still see them as different");
+        assert!(image_blob_eq_stable(&a, &b), "stable comparator must match");
+    }
+
+    #[test]
+    fn image_blob_eq_stable_distinguishes_different_dimensions() {
+        let a = blob("image/png", "X", Some(1280), Some(720));
+        let b = blob("image/png", "X", Some(640), Some(480));
+        assert!(!image_blob_eq_stable(&a, &b));
+    }
+
+    #[test]
+    fn image_blob_eq_stable_distinguishes_different_mime() {
+        let a = blob("image/png", "X", Some(100), Some(100));
+        let b = blob("image/jpeg", "X", Some(100), Some(100));
+        assert!(!image_blob_eq_stable(&a, &b));
+    }
+
+    #[test]
+    fn image_blob_eq_stable_falls_back_to_bytes_when_dimensions_absent() {
+        // Without dims we have no choice but byte-exact — preserves old
+        // behaviour for any backend that doesn't populate width/height.
+        let a = blob("image/png", "X", None, None);
+        let b = blob("image/png", "X", None, None);
+        let c = blob("image/png", "Y", None, None);
+        assert!(image_blob_eq_stable(&a, &b));
+        assert!(!image_blob_eq_stable(&a, &c));
+    }
+
+    #[test]
+    fn rich_eq_stable_matches_normalised_format_bytes() {
+        // Plain text identical, MIMEs identical, but format bytes differ —
+        // what rich-text TIRI looks like on the wire (line endings,
+        // charset declarations etc. normalised by the OS clipboard layer).
+        let ign_html = ClipboardFormat::from_text("text/html", "<p>v1\n</p>");
+        let curr_html = ClipboardFormat::from_text("text/html", "<p>v1\r\n</p>");
+        let ign = vec![ign_html];
+        let curr = vec![curr_html];
+        assert!(rich_eq_stable("hello", &ign, "hello", &curr));
+    }
+
+    #[test]
+    fn rich_eq_stable_distinguishes_different_text() {
+        let html = ClipboardFormat::from_text("text/html", "<p>x</p>");
+        let formats = vec![html];
+        assert!(!rich_eq_stable("hello", &formats, "world", &formats));
+    }
+
+    #[test]
+    fn rich_eq_stable_distinguishes_different_mime_set() {
+        let only_html = vec![ClipboardFormat::from_text("text/html", "<p>x</p>")];
+        let html_and_rtf = vec![
+            ClipboardFormat::from_text("text/html", "<p>x</p>"),
+            ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}"),
+        ];
+        assert!(!rich_eq_stable("hello", &only_html, "hello", &html_and_rtf));
+    }
+
+    #[test]
+    fn rich_eq_stable_ignores_mime_order() {
+        // Sender side may emit formats in any order; receiver may store in
+        // a different order. Stable compare must not care.
+        let order_a = vec![
+            ClipboardFormat::from_text("text/html", "<p>x</p>"),
+            ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}"),
+        ];
+        let order_b = vec![
+            ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}"),
+            ClipboardFormat::from_text("text/html", "<p>x</p>"),
+        ];
+        assert!(rich_eq_stable("hello", &order_a, "hello", &order_b));
     }
 }

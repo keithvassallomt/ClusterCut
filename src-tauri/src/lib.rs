@@ -3189,6 +3189,16 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
 
                             // BLOB HANDLING (image clipboard data)
                             if let Some(blob) = payload_obj.blob.clone() {
+                                tracing::info!(
+                                    "Received clipboard image from {}: mime={}, decoded={} bytes{}",
+                                    sender,
+                                    blob.mime_type,
+                                    blob.decoded_len(),
+                                    match (blob.width, blob.height) {
+                                        (Some(w), Some(h)) => format!(", {}x{}", w, h),
+                                        _ => String::new(),
+                                    }
+                                );
                                 let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
                                 if auto_receiver {
                                     clipboard::set_clipboard_image(&listener_handle, blob);
@@ -3219,6 +3229,12 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 .cloned();
 
                             if let Some(formats) = rich_formats {
+                                tracing::info!(
+                                    "Received clipboard rich from {}: text={} chars, formats=[{}]",
+                                    sender,
+                                    text.len(),
+                                    formats.iter().map(|f| f.mime_type.as_str()).collect::<Vec<_>>().join(", ")
+                                );
                                 let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
                                 if auto_receiver {
                                     clipboard::set_clipboard_rich(&listener_handle, text.clone(), formats);
@@ -3238,6 +3254,11 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 }
                             } else if !text.is_empty() {
                                 // TEXT HANDLING — plain text only, no rich formats present.
+                                tracing::info!(
+                                    "Received clipboard text from {}: {} chars",
+                                    sender,
+                                    text.len()
+                                );
                                 let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
                                 if auto_receiver {
                                     clipboard::set_clipboard(&listener_handle, text.clone());
