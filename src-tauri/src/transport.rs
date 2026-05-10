@@ -4,14 +4,16 @@ use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 pub type FingerprintResolver = Arc<dyn Fn(SocketAddr) -> Option<Vec<u8>> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Transport {
     pub endpoint: Endpoint,
-    skip_verify_transport_config: ClientConfig,
-    skip_verify_file_config: ClientConfig,
+    no_fp_transport_config: ClientConfig,
+    no_fp_file_config: ClientConfig,
     local_cert_der: Vec<u8>,
     fingerprint_resolver: Arc<Mutex<Option<FingerprintResolver>>>,
 }
@@ -22,21 +24,23 @@ impl Transport {
     pub fn new(port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<Self, Box<dyn Error>> {
         let server_config = configure_server(cert_der.clone(), key_der)?;
 
-        // These are used (a) before a resolver is installed and (b) for the
-        // pairing handshake itself — connections where the peer's fingerprint
-        // is genuinely unknown. Once a resolver is installed, normal traffic
-        // pins to the looked-up fingerprint.
-        let skip_verify_transport_config = configure_client(vec![b"clustercut-transport".to_vec()], None)?;
-        let skip_verify_file_config = configure_client(vec![b"clustercut-file".to_vec()], None)?;
+        // Fallback configs used only for legacy peers paired before cert
+        // pinning landed (their `known_peers.json` entry has no fingerprint).
+        // Phase 2 of the security redesign removes this branch entirely —
+        // peers without a pinned fingerprint will be unreachable and must
+        // re-pair. Pairing itself never goes through QUIC anymore (it runs
+        // on a dedicated plaintext-TCP channel; see `start_pairing_listener`).
+        let no_fp_transport_config = configure_client(vec![b"clustercut-transport".to_vec()], None)?;
+        let no_fp_file_config = configure_client(vec![b"clustercut-file".to_vec()], None)?;
 
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         let mut endpoint = Endpoint::server(server_config, addr)?;
-        endpoint.set_default_client_config(skip_verify_transport_config.clone());
+        endpoint.set_default_client_config(no_fp_transport_config.clone());
 
         Ok(Self {
             endpoint,
-            skip_verify_transport_config,
-            skip_verify_file_config,
+            no_fp_transport_config,
+            no_fp_file_config,
             local_cert_der: cert_der,
             fingerprint_resolver: Arc::new(Mutex::new(None)),
         })
@@ -66,7 +70,7 @@ impl Transport {
         match self.resolve_fingerprint(addr) {
             Some(fp) => configure_client(vec![b"clustercut-transport".to_vec()], Some(fp))
                 .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() }),
-            None => Ok(self.skip_verify_transport_config.clone()),
+            None => Ok(self.no_fp_transport_config.clone()),
         }
     }
 
@@ -74,7 +78,7 @@ impl Transport {
         match self.resolve_fingerprint(addr) {
             Some(fp) => configure_client(vec![b"clustercut-file".to_vec()], Some(fp))
                 .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() }),
-            None => Ok(self.skip_verify_file_config.clone()),
+            None => Ok(self.no_fp_file_config.clone()),
         }
     }
 
@@ -85,19 +89,6 @@ impl Transport {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let config = self.transport_config_for(addr)?;
         self.send_message_with_config(addr, data, config).await
-    }
-
-    /// Pairing-flow send: bypasses fingerprint pinning because we don't yet
-    /// know the peer's fingerprint. The SPAKE2 + PIN handshake authenticates
-    /// the session at the application layer; cert pinning takes over for all
-    /// subsequent connections (see issue #9).
-    pub async fn send_message_unauthenticated(
-        &self,
-        addr: SocketAddr,
-        data: &[u8],
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.send_message_with_config(addr, data, self.skip_verify_transport_config.clone())
-            .await
     }
 
     async fn send_message_with_config(
@@ -456,4 +447,100 @@ fn hex_short(bytes: &[u8]) -> String {
         .take(8)
         .map(|b| format!("{:02x}", b))
         .collect::<String>()
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Plaintext-TCP pairing channel
+//
+// Pairing runs over TCP on the same numeric port as the QUIC endpoint (UDP
+// and TCP cohabit on a single port number). SPAKE2 doesn't need transport
+// confidentiality — wrapping it in unauthenticated TLS adds complexity
+// without security. Once both sides exchange cert fingerprints, all further
+// traffic moves to the QUIC endpoint with cert pinning enforced.
+//
+// Wire framing: 4-byte big-endian length prefix followed by JSON-serialised
+// `PairingMessage`. The cap is generous enough for a Welcome carrying a
+// hundred peers but bounded so a misbehaving peer can't OOM us.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Maximum size of one pairing frame on the wire. Welcome is the largest
+/// payload (cluster identity + known_peers + fingerprint), and even a
+/// pathological cluster sits well under this bound.
+pub const PAIRING_FRAME_CAP: usize = 256 * 1024;
+
+pub async fn read_pairing_frame(
+    stream: &mut TcpStream,
+) -> Result<crate::protocol::PairingMessage, Box<dyn Error + Send + Sync>> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > PAIRING_FRAME_CAP {
+        return Err(format!("pairing frame too large: {} > {}", len, PAIRING_FRAME_CAP).into());
+    }
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    let msg = serde_json::from_slice::<crate::protocol::PairingMessage>(&buf)?;
+    Ok(msg)
+}
+
+pub async fn write_pairing_frame(
+    stream: &mut TcpStream,
+    msg: &crate::protocol::PairingMessage,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let body = serde_json::to_vec(msg)?;
+    if body.len() > PAIRING_FRAME_CAP {
+        return Err(format!("pairing frame too large: {} > {}", body.len(), PAIRING_FRAME_CAP).into());
+    }
+    let len = (body.len() as u32).to_be_bytes();
+    stream.write_all(&len).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Open an outbound pairing connection. Caller drives the request/response
+/// flow on the returned stream and closes when done.
+pub async fn pairing_connect(
+    addr: SocketAddr,
+) -> Result<TcpStream, Box<dyn Error + Send + Sync>> {
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| "pairing connect timeout")??;
+    Ok(stream)
+}
+
+/// Bind a TCP pairing listener on `[::]:port` and spawn an accept loop that
+/// hands each accepted connection to `handler`. The listener runs for the
+/// process lifetime — there is no shutdown signal in Phase 1.
+pub fn start_pairing_listener<F>(
+    port: u16,
+    handler: F,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    F: Fn(TcpStream, SocketAddr) + Send + Sync + Clone + 'static,
+{
+    let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let std_listener = std::net::TcpListener::bind(bind_addr)?;
+    std_listener.set_nonblocking(true)?;
+    let listener = TcpListener::from_std(std_listener)?;
+    tracing::info!("Pairing TCP listener bound on {}", bind_addr);
+
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer_addr)) => {
+                    tracing::debug!("Pairing TCP accept from {}", peer_addr);
+                    handler.clone()(stream, peer_addr);
+                }
+                Err(e) => {
+                    tracing::warn!("Pairing TCP accept error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+    Ok(())
 }
