@@ -1786,7 +1786,7 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
   };
 
   return (
-    <div className="space-y-5">
+    <div className="flex h-full flex-col gap-4 overflow-y-auto pb-4">
       <Card className="p-5">
         <SectionHeader
           icon={<Copy className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />}
