@@ -381,38 +381,79 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
 "#, target_view, title, body, actions_xml);
 
         if let Ok(doc) = XmlDocument::new() {
-             if let Ok(_) = doc.LoadXml(&HSTRING::from(&xml)) {
-                 if let Ok(toast) = ToastNotification::CreateToastNotification(&doc) {
-                     // Set Expiration Time (5 seconds from now)
-                     let now = std::time::SystemTime::now();
-                     let unix_epoch = std::time::UNIX_EPOCH;
-                     if let Ok(duration) = now.duration_since(unix_epoch) {
-                         // Windows Epoch (1601-01-01) is 11,644,473,600 seconds before Unix Epoch
-                         // Ticks are 100ns intervals
-                         let unix_secs = duration.as_secs();
-                         let unix_nanos = duration.subsec_nanos() as u64;
-                         
-                         let windows_ticks = (unix_secs + 11_644_473_600) * 10_000_000 + (unix_nanos / 100);
-                         
-                         // Add 5 seconds
-                         let expire_ticks = windows_ticks + (5 * 10_000_000);
-                         
-                         let expiry = windows::Foundation::DateTime { UniversalTime: expire_ticks as i64 };
-                         
-                         // Fix for E0277: SetExpirationTime requires IReference<DateTime>
-                         // We use PropertyValue to box the DateTime into an IInspectable/IReference
-                         if let Ok(inspectable) = windows::Foundation::PropertyValue::CreateDateTime(expiry) {
-                             if let Ok(expiry_ref) = inspectable.cast::<windows::Foundation::IReference<windows::Foundation::DateTime>>() {
-                                  if let Err(e) = toast.SetExpirationTime(&expiry_ref) {
-                                      tracing::warn!("Failed to set notification expiration: {}", e);
-                                  }
+             match doc.LoadXml(&HSTRING::from(&xml)) {
+                 Ok(_) => match ToastNotification::CreateToastNotification(&doc) {
+                     Ok(toast) => {
+                         // Set Expiration Time. This is when Windows removes the
+                         // notification from Action Center *and* the cutoff for
+                         // when the banner can still display — if the OS hasn't
+                         // gotten around to rendering the toast by this time
+                         // (e.g. because a big file transfer is occupying the
+                         // system), Windows silently drops it.
+                         //
+                         // The previous 5 s window was catastrophic: any
+                         // notification that fired during peer setup or a file
+                         // receive (the times users most want to be told) hit
+                         // the queue late, expired, and dropped. 10 minutes is
+                         // well past any queueing delay, short enough that
+                         // Action Center stays tidy.
+                         let now = std::time::SystemTime::now();
+                         if let Ok(duration) = now.duration_since(std::time::UNIX_EPOCH) {
+                             // Windows Epoch (1601-01-01) is 11,644,473,600 s before Unix Epoch.
+                             // Ticks are 100ns intervals.
+                             let unix_secs = duration.as_secs();
+                             let unix_nanos = duration.subsec_nanos() as u64;
+                             let windows_ticks = (unix_secs + 11_644_473_600) * 10_000_000
+                                 + (unix_nanos / 100);
+                             let expire_ticks = windows_ticks + (10 * 60 * 10_000_000);
+
+                             let expiry = windows::Foundation::DateTime {
+                                 UniversalTime: expire_ticks as i64,
+                             };
+                             if let Ok(inspectable) =
+                                 windows::Foundation::PropertyValue::CreateDateTime(expiry)
+                             {
+                                 if let Ok(expiry_ref) = inspectable.cast::<windows::Foundation::IReference<windows::Foundation::DateTime>>() {
+                                     if let Err(e) = toast.SetExpirationTime(&expiry_ref) {
+                                         tracing::warn!("[Notification] SetExpirationTime failed: {}", e);
+                                     }
+                                 }
+                             }
+                         }
+
+                         match ToastNotificationManager::CreateToastNotifierWithId(
+                             &HSTRING::from(aumid),
+                         ) {
+                             Ok(notifier) => {
+                                 if let Err(e) = notifier.Show(&toast) {
+                                     // Surface the failure instead of swallowing
+                                     // it — if AUMID isn't registered (dev mode
+                                     // without the MSI), this is the place we'll
+                                     // see it.
+                                     tracing::warn!(
+                                         "[Notification] ToastNotifier.Show failed: {}",
+                                         e
+                                     );
+                                 }
+                             }
+                             Err(e) => {
+                                 tracing::warn!(
+                                     "[Notification] CreateToastNotifierWithId(\"{}\") failed: {} — AUMID likely not registered (only registered when installed via MSI)",
+                                     aumid,
+                                     e
+                                 );
                              }
                          }
                      }
-
-                     if let Ok(notifier) = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(aumid)) {
-                         let _ = notifier.Show(&toast);
+                     Err(e) => {
+                         tracing::warn!(
+                             "[Notification] CreateToastNotification failed: {}",
+                             e
+                         );
                      }
+                 },
+                 Err(e) => {
+                     tracing::warn!("[Notification] LoadXml failed: {}", e);
                  }
              }
         }
