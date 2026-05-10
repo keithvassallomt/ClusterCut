@@ -32,6 +32,12 @@ const IMAGE_MIME_PRIORITY: &[&str] = &[
     "image/gif",
 ];
 
+/// Vector image MIMEs — checked *before* the raster `IMAGE_MIME_PRIORITY` so
+/// when a source app offers both (e.g. Inkscape: image/svg+xml + a rasterised
+/// image/png fallback), we pick the higher-fidelity vector representation.
+/// Bytes pass through verbatim; receivers re-stock under the same MIME.
+const VECTOR_IMAGE_MIME_PRIORITY: &[&str] = &["image/svg+xml"];
+
 /// Rich-text MIME types we relay verbatim alongside the plain text. These
 /// carry formatted content (HTML/RTF) that destination apps can pick up
 /// instead of the plain text — the difference between pasting from Word
@@ -111,15 +117,68 @@ fn read_clipboard_files() -> Option<Vec<String>> {
     }
 }
 
-/// Read an image from the clipboard if one is offered, decode it, and re-encode
-/// to PNG so peers receive a uniform wire format. Returns None if no image MIME
-/// is offered, the data couldn't be decoded, or the encoded blob exceeds the
-/// wire-size cap.
+/// Probe for vector image formats (SVG) and pass the bytes through verbatim
+/// without raster decode. Called from `read_clipboard_image` before the raster
+/// MIME loop, so vector representations win over rasterised companions when
+/// both are offered.
+fn read_clipboard_vector_image(
+    offered: &std::collections::HashSet<String>,
+) -> Option<ClipboardBlob> {
+    let mime = VECTOR_IMAGE_MIME_PRIORITY
+        .iter()
+        .copied()
+        .find(|m| offered.contains(*m))?;
+
+    let mut pipe = match get_contents(
+        ClipboardType::Regular,
+        Seat::Unspecified,
+        PasteMimeType::Specific(mime),
+    ) {
+        Ok((p, _)) => p,
+        Err(e) => {
+            tracing::debug!("clipboard vector image read failed for {}: {}", mime, e);
+            return None;
+        }
+    };
+
+    let mut buf = Vec::new();
+    if (&mut pipe)
+        .take(MAX_CLIPBOARD_IMAGE_READ_BYTES + 1)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return None;
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    if buf.len() as u64 > MAX_CLIPBOARD_IMAGE_READ_BYTES {
+        tracing::warn!(
+            "Clipboard {} exceeds {} byte read cap; skipping.",
+            mime,
+            MAX_CLIPBOARD_IMAGE_READ_BYTES
+        );
+        return None;
+    }
+
+    common::build_image_blob(buf, mime)
+}
+
+/// Read an image from the clipboard if one is offered. Vector MIMEs (SVG)
+/// pass through verbatim; raster MIMEs are decoded and re-encoded to PNG so
+/// peers receive a uniform wire format for raster images. Returns None if no
+/// image MIME is offered, the data couldn't be decoded, or the encoded blob
+/// exceeds the wire-size cap.
 fn read_clipboard_image() -> Option<ClipboardBlob> {
     let offered = match get_mime_types(ClipboardType::Regular, Seat::Unspecified) {
         Ok(set) => set,
         Err(_) => return None,
     };
+
+    // Prefer vector representations when available — verbatim pass-through.
+    if let Some(blob) = read_clipboard_vector_image(&offered) {
+        return Some(blob);
+    }
 
     let mime = IMAGE_MIME_PRIORITY
         .iter()

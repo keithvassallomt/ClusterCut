@@ -370,7 +370,7 @@ pub fn start_monitor(
                 next = blob_stream.next() => match next {
                     Some(msg) => match msg.body().deserialize::<(String, Vec<u8>)>() {
                         Ok((mime, data)) if !data.is_empty() => {
-                            common::normalize_image_blob_from_bytes(data, &mime)
+                            common::build_image_blob(data, &mime)
                                 .map(ClipboardContent::Image)
                         }
                         _ => None,

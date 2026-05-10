@@ -127,7 +127,16 @@ fn read_clipboard_image_arboard(arboard: &mut arboard::Clipboard) -> Option<Clip
 /// thread — required on Windows, where competing `OpenClipboard` calls from a
 /// different thread were surfacing as ERROR_CLIPBOARD_NOT_OPEN (os error 1418)
 /// inside arboard's `SetClipboardData`.
+///
+/// Vector MIMEs (currently SVG) bypass the arboard path entirely and write
+/// bytes verbatim under the source MIME via OS-direct calls in `rich.rs` —
+/// arboard's API is RGBA-only and would lose the vector representation.
 fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Result<(), String> {
+    if super::common::is_vector_image_mime(&blob.mime_type) {
+        let bytes = blob.raw_bytes()?;
+        return rich::write_clipboard_vector_image(&blob.mime_type, &bytes);
+    }
+
     let format = match blob.mime_type.as_str() {
         "image/png" => image::ImageFormat::Png,
         "image/jpeg" => image::ImageFormat::Jpeg,
@@ -256,9 +265,20 @@ fn read_clipboard(
         Err(_) => {}
     }
 
-    // Image probe sits between files and text so the canonical "Copy Image"
-    // browser case is caught (no uri-list, no useful text), while the
-    // existing "Copy a file" flow that does emit uri-list still wins above.
+    // Vector-image probe — sits *before* arboard's RGBA path so a source
+    // that offers both an SVG and a rasterised PNG fallback gives the
+    // higher-fidelity vector representation. arboard's `get_image()` is
+    // RGBA-only and would lose the vector. X11 returns None unconditionally.
+    if let Some((mime, bytes)) = rich::read_clipboard_vector_image() {
+        return ClipboardContent::Image(ClipboardBlob::from_bytes(
+            mime, &bytes, None, None,
+        ));
+    }
+
+    // Raster image probe sits between files and text so the canonical
+    // "Copy Image" browser case is caught (no uri-list, no useful text),
+    // while the existing "Copy a file" flow that does emit uri-list still
+    // wins above.
     if let Some(arb) = arboard_opt {
         if let Some(blob) = read_clipboard_image_arboard(arb) {
             return ClipboardContent::Image(blob);

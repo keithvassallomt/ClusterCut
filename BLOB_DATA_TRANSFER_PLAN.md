@@ -1,216 +1,91 @@
 # Clipboard Rich-Data Transfer
 
-> **Status**: 0.3.0 will ship image clipboard sync (implemented) **plus** rich-text format sync (HTML / RTF — in progress). The GNOME extension changes for both ride in a single v4.0 release so EGO only has to verify one submission. This doc has the retrospective for the image work and the roadmap for the rich-text work.
-
-## Part 1 — Image clipboard transfer (implemented, 0.3.0)
-
-### What you can do now
-
-Copy an image — for example with right-click → "Copy Image" in a browser, or from a screenshot tool, or out of an image editor — and it appears on your peers' clipboards, ready to paste into Word, Preview, GIMP, Paint, etc. Works on every clipboard backend: X11, Wayland (KDE/Sway/Hyprland), Wayland GNOME (via the ClusterCut extension), Windows, and macOS. The History view shows a thumbnail with dimensions and size.
-
-### Wire format
-
-`ClipboardPayload` gained an optional `blob` field; everything else is unchanged.
-
-```rust
-pub struct ClipboardPayload {
-    pub id: String,
-    pub text: String,
-    #[serde(default)] pub files: Option<Vec<FileMetadata>>,
-    #[serde(default)] pub blob: Option<ClipboardBlob>,   // ← new in 0.3.0
-    pub timestamp: u64,
-    pub sender: String,
-    pub sender_id: String,
-}
-
-pub struct ClipboardBlob {
-    pub mime_type: String,            // always "image/png" today; the field exists so other MIMEs can join later
-    pub data: String,                 // base64-encoded bytes — see "lessons" below
-    #[serde(default)] pub width: Option<u32>,
-    #[serde(default)] pub height: Option<u32>,
-}
-```
-
-`#[serde(default)]` keeps things forward-compatible: an older 0.2.x peer that doesn't know the field just deserialises it as `None` and ignores it.
-
-The sender always **normalises to `image/png`** before broadcasting — re-encoding from whatever source format the OS clipboard offers (RGBA from arboard, JPEG from a browser, etc.). Receivers see one canonical wire format and don't need a translation matrix between every source MIME and every receiver platform.
-
-A 10 MB cap on the encoded PNG protects against huge clipboard images saturating the cluster; over that, the sender silently drops the broadcast.
-
-### Per-backend implementation
-
-| Backend | Source / sink | How |
-|---|---|---|
-| **X11 / Windows / macOS** | `tauri-plugin-clipboard` (text + files) **plus** `arboard` (images) | `tauri-plugin-clipboard` doesn't expose non-text MIMEs, so we run `arboard` as a parallel image-only shim in the same monitor thread. Reads via `arboard::Clipboard::get_image()` (RGBA), encoded to PNG. Writes via `arboard::Clipboard::set_image()` which puts CF_DIBV5 + CF_DIB on Windows, NSPasteboardTypePNG + TIFF on macOS, image/png on X11 |
-| **Wayland wlroots** (KDE / Sway / Hyprland) | `wl-clipboard-rs` directly | Already supports arbitrary MIMEs. We enumerate via `paste::get_mime_types`, pick the first match from a priority list (PNG → JPEG → WebP → BMP → TIFF → GIF), read with `paste::get_contents`, decode/re-encode to PNG via the `image` crate. Writes use `Source::Bytes(data)` with `MimeType::Specific("image/png")` |
-| **Wayland GNOME** | ClusterCut GNOME extension over D-Bus (existing `Clipboard2` interface) | Extension v4.0 added three methods (`GetMimetypes`, `ReadBlob`, `WriteBlob`) and a `BlobChanged` signal — additive on `Clipboard2`, fully backwards compatible. JS uses `St.Clipboard.get_content(mime, callback)` and `St.Clipboard.set_content(mime, GLib.Bytes)`. Old apps + new extension and new apps + old extension both keep working — only image clipboard requires both ends to be on 4.0 |
-
-The dispatch order in every backend is **files → image → text**: a `text/uri-list` paste (file copy from a file manager) wins over an image probe so the file-transfer flow we spent so long getting right is unaffected.
-
-### Frontend / UX
-
-History items render an `<img>` thumbnail (max 12 rem tall, contained) with a caption: `Image • W×H • size`. The bytes ride inside the `clipboard-change` event; on the JS side we `atob()` once at receive time and turn the result into a `URL.createObjectURL`, which the `<img>` references. URLs are revoked on history-delete and on the slice eviction past 50 items.
-
-`ManualSyncModal` (the FAB-driven manual-receive flow) shows the same thumbnail in its Receive column when a pending image is queued.
-
-### Lessons learned during real-world testing
-
-A handful of subtle bugs only surfaced once two real machines were sharing images. Each fix is captured by a test or a comment, but they're worth remembering because they're easy to fall back into:
-
-1. **Don't let `serde_json` encode `Vec<u8>` as a JSON integer array.** Default behaviour is `[123,45,67,…]` — about 3.5 chars per byte. A 5 MB blob becomes ~18 MB on the wire, and that's *before* the encrypted ciphertext is wrapped in `Message::Clipboard(Vec<u8>)` and serialised again. Solution: `ClipboardBlob.data` is a base64 `String`, not `Vec<u8>`. Caps the bloat at 1.33×.
-2. **The transport's `read_to_end` had a 10 MB cap** that was fine for text but immediately rejected even modest images. Bumped to 64 MB.
-3. **`SendStream::stopped()` is the right way to wait for delivery, not a fixed sleep.** `send_message` used to `sleep(500ms)` after `finish()`, which raced multi-MB images: the function returned and the connection was torn down while bytes were still in flight, surfacing as "connection lost" on the receiver. `stopped()` resolves once the peer ACKs all stream data, with a fallback drain sleep if that future doesn't yield.
-4. **Windows' `arboard::set_image` makes multiple `SetClipboardData` calls in sequence** and any one of them can fail with `ERROR_CLIPBOARD_NOT_OPEN` (1418) if another clipboard-aware process — most likely `tauri-plugin-clipboard`'s own monitor — grabs the lock between calls. Wrapped the whole `Clipboard::new + set_image` in a 6-attempt retry with 50→400 ms exponential backoff. The RGBA buffer is borrowed via `Cow::Borrowed` between attempts so we don't re-clone multi-megabyte pixel data per try.
-5. **The receiver's loop-dedup signature has to match the sender's.** Originally the receiver computed its `content_signature` as `FILES:…` for files, otherwise `text.clone()` — for a blob-only payload (`text=""`, `files=None`) that collapsed to an empty string, which matched the empty initial `last_clipboard_content`, and the handler returned early before the BLOB HANDLING block ever ran. Symptom: bytes arrive, no errors, image silently drops on the floor. Fix: extracted a single `payload_signature()` helper used by both sender's broadcast dedup and receiver's loop guard, so they can't drift again.
-6. **Don't hold the entire clipboard data path on a single PartialEq comparison of multi-megabyte blobs.** Dedup uses a fingerprint (mime + base64 length + first/last 16 bytes hex), not raw byte equality.
-
----
-
-## Part 2 — Rich-text formats (HTML, RTF) — also 0.3.0
-
-### Why this matters: what happens when you copy from Word
-
-Right now ClusterCut only carries `text/plain`. If you copy `Hello **bold** world` from Microsoft Word and paste it into Word on a peer, you get `Hello bold world` — the formatting is gone. To understand why, look at what the OS clipboard actually contains when you copy from Word:
-
-- `text/plain` — `Hello bold world`
-- `text/html` (or Windows' `CF_HTML`) — a fragment of HTML with `<strong>` / `<span style=…>` plus a lot of Office-specific metadata
-- `text/rtf` (or `CF_RTF`) — a full RTF document `{\rtf1 \ansi … {\b bold} …}`
-- (sometimes) `image/png` — a screenshot of the rendered text, for apps that can only paste images
-
-When the user pastes, **the destination app picks** which of those formats to consume. Word picks RTF or HTML, gets full formatting. Notepad picks plain text, drops formatting. Firefox's address bar picks plain text. Pages on macOS picks RTF. The clipboard is a multi-format buffet, and ClusterCut is currently only carrying the plain bread.
-
-To fix this, ClusterCut needs to carry **multiple representations of the same copy event** and re-stock them all on the receiver, so the destination app sees the same buffet the source did.
-
-### Wire-format change
-
-The minimal, backwards-compatible extension is to add a list of additional formats to `ClipboardPayload`, each a `(mime, encoding, bytes)` triple:
-
-```rust
-pub struct ClipboardPayload {
-    pub id: String,
-    pub text: String,                         // text/plain — primary, always present, unchanged semantics
-    #[serde(default)] pub files: Option<Vec<FileMetadata>>,
-    #[serde(default)] pub blob: Option<ClipboardBlob>,
-    #[serde(default)] pub formats: Option<Vec<ClipboardFormat>>,   // ← new
-    pub timestamp: u64,
-    pub sender: String,
-    pub sender_id: String,
-}
-
-pub struct ClipboardFormat {
-    pub mime_type: String,            // "text/html", "text/rtf", "application/x-vnd.oasis.opendocument…", etc.
-    pub data: String,                 // UTF-8 (text/*) or base64 (binary), based on `binary` flag
-    pub binary: bool,                 // true → data is base64-encoded bytes
-}
-```
-
-Key properties:
-
-- `text` is still the primary. A 0.3.0 peer that ignores the new `formats` field still gets a usable plain-text paste from a 0.4.0 sender. Older peers fall back to `text/plain` semantics — exactly the same regression as today, no worse.
-- The list can hold any MIME, not just HTML/RTF. Once the multi-format channel exists, future formats (SVG, ODF chunks, etc.) are additive.
-- The image case (`blob`) stays its own field rather than being merged into `formats` — image-only copies (no text alongside) have a clean shape, and the receiver's image-write retry loop already exists. We *could* merge it later but there's no urgency.
-
-A short hand-rolled signature in `payload_signature()` already exists for blobs; for `formats` it'd be `FORMATS:<mime1>:<len1>;<mime2>:<len2>;…` — same idea, deterministic and small.
-
-### Per-platform format mapping
-
-The MIME types each OS exposes don't agree, so ClusterCut needs a translation layer. Based on the pattern already used for files (`text/uri-list` ↔ `x-special/gnome-copied-files`) the rules are:
-
-| Logical format | Linux (X11 / Wayland) | Windows | macOS |
-|---|---|---|---|
-| Plain text | `text/plain;charset=utf-8` (or `UTF8_STRING`) | `CF_UNICODETEXT` | `public.utf8-plain-text` |
-| HTML | `text/html` | **`CF_HTML`** — wraps the HTML fragment in a Microsoft-specific header with `Version:`, `StartHTML:`, `EndHTML:`, `StartFragment:`, `EndFragment:` byte offsets | `public.html` |
-| RTF | `text/rtf` | `CF_RTF` (or `Rich Text Format`) | `public.rtf` |
-
-The asymmetric one is Windows' `CF_HTML`. Linux and macOS use raw HTML bytes; Windows expects (and produces) a header like:
-
-```
-Version:0.9
-StartHTML:00000099
-EndHTML:00000299
-StartFragment:00000131
-EndFragment:00000260
-<html>
-<body>
-<!--StartFragment-->Hello <strong>bold</strong> world<!--EndFragment-->
-</body>
-</html>
-```
-
-Going Linux → Windows we have to compute and prepend that header before writing. Going Windows → Linux we have to strip it. The byte offsets are recomputed because they reference into the same buffer; can't be left as-is. **Two helpers** — `wrap_cf_html(html: &str) -> Vec<u8>` and `strip_cf_html(bytes: &[u8]) -> Option<String>` — handle the round-trip; both sides of any cross-platform sync hit one of them.
-
-RTF is uniform: same bytes everywhere, no wrapping required.
-
-### Per-backend implementation sketch
-
-The four backends, with the additions:
-
-| Backend | Read | Write |
-|---|---|---|
-| **Windows / macOS** | Add MIME-aware reads to the existing arboard-shim thread. arboard 3.x doesn't expose `get_html` or arbitrary MIMEs, so this is direct calls into `clipboard-win` (Windows) and `objc2`/`NSPasteboard` (macOS) — both small, well-documented APIs | Same wrappers, `set_html` / `set_rtf`. Windows write needs `wrap_cf_html` (compute the `Version:`/`StartHTML:`/`EndHTML:`/`StartFragment:`/`EndFragment:` byte-offset header). macOS just sets `public.html` / `public.rtf` |
-| **X11** | **Out of scope** for rich-text. Plain-text + files + images keep working unchanged via tauri-plugin-clipboard + the arboard image shim — no regression. X11 selection ownership requires a persistent owner thread responding to `SelectionRequest` events, and arboard's API doesn't let you add MIME targets to its existing owner; layering a third selection-owner alongside `tauri-plugin-clipboard` and `arboard` is high-risk. X11 is also a declining platform, so the cost/benefit doesn't justify the work | **Out of scope** as above. **Documentation reminder**: when user-facing docs are written, explicitly note that rich-text (HTML/RTF) clipboard sync is not supported on X11 — plain text, files, and images sync as normal |
-| **Wayland wlroots** | `wl_clipboard_rs::paste::get_mime_types` already used; add `text/html` and `text/rtf` to the priority probe, alongside the image MIMEs | `copy::Source::Bytes` with multiple `MimeSource` entries (already do this for `text/uri-list` + `x-special/gnome-copied-files`); add `text/html` and `text/rtf` rows |
-| **GNOME extension** | Add a generic `ReadAllFormats(in as mimes, out a(say) blobs)` D-Bus method, or extend the existing `BlobChanged` to carry a list. Folded into the **v4.0** release alongside the image blob methods so EGO only verifies once — v4.0 isn't shipped/submitted until both feature sets are in | Generic `WriteAllFormats(in a(say))` — JS calls `clipboard.set_content(type, mime, bytes)` for each. Echo prevention reuses the existing `_ignoreUntil` window |
-
-### Smart capture rules
-
-Some apps put **eight or more representations** on the clipboard. Most are redundant or actively useless to sync. A small allowlist keeps the wire payload sane:
-
-- Always: `text/plain` (the existing path)
-- Add when present: `text/html`, `text/rtf`, `text/uri-list` (existing files path), one image MIME (existing blob path)
-- **Skip**: vendor-specific blobs like `application/x-qt-windows-mime;value="Native"`, `chromium/x-renderer-taint`, `org.chromium.web-custom-data`, screenshot duplicates, `text/_moz_htmlcontext`, etc. They're either 1) entirely OS-internal, 2) huge metadata Word attaches that doesn't help paste behaviour, or 3) duplicate of the plain-text version
-
-### History UI implications
-
-A history entry that carries `text` + `text/html` shouldn't show two cards — it's one copy event with multiple representations. Render decisions:
-
-- If `formats` includes `text/html`, render the HTML in a sandboxed `<div>` (with content-security cleanup) for preview, instead of showing `text` plain.
-- A small "rich" badge next to the size, hover for "plain text, HTML, RTF" tooltip.
-- Plain-only clipboard items continue to render as today.
-
-### Suggested phasing
-
-1. Wire-format plumbing: `ClipboardFormat` struct, `formats` field on `ClipboardPayload`, signature update, round-trip tests. No backend wiring yet — same shape as Phase 1 of the image rollout.
-2. Wayland wlroots backend — easiest, reuses the existing MIME probe path. Validate with a Word document copied via Wayland-GNOME → KDE.
-3. Windows + macOS backend — direct calls into `clipboard-win` and `NSPasteboard` for HTML/RTF reads and writes, plus the `wrap_cf_html`/`strip_cf_html` helpers for Windows' Microsoft-specific HTML wrapper. **X11 is intentionally out of scope** for rich-text — see the per-backend table above for why. X11 keeps text/files/images via the existing paths, no regression.
-4. GNOME extension — add the rich-text format methods to the **same v4.0** D-Bus interface that already carries the image blob methods. EGO submission for v4.0 is held until this lands so the extension goes through verification once for the whole 0.3.0 cycle.
-5. Frontend — render rich previews, distinguish plain-vs-rich items.
-6. Smart-capture allowlist + edge-case polish — Word, Apple Mail, Outlook, Notion, VS Code (each puts wildly different things on the clipboard).
-
----
-
 ## Part 3 — Other deferred work
 
 These are smaller and lower-priority than rich-text. Listed roughly in expected order.
 
 ### 3.1 Multi-format simultaneous preservation
 
-Closely related to rich-text and somewhat solved by the design above: once `formats` exists, "preserve all the things the source had" is a question of how aggressive the smart-capture allowlist is. v1 sticks to text/html + text/rtf + the existing image/files paths; v2 could expand to e.g. `image/svg+xml` alongside a rasterised `image/png` so vector-aware apps get the SVG and others get the bitmap.
+Closely related to rich-text and somewhat solved by the design above: once `formats` exists, "preserve all the things the source had" is a question of how aggressive the smart-capture allowlist is. v1 sticks to text/html + text/rtf + the existing image/files paths; v2 could expand the allowlist to include other formats the source actually puts on the clipboard — `image/svg+xml`, `application/x-vnd.oasis.opendocument…`, etc.
+
+**ClusterCut's role is faithful relay, not synthesis.** We pass through whatever formats the source clipboard had, with the existing skip-list suppressing vendor-internal junk (Word's `Native` blob, Chromium's `x-renderer-taint`, etc.). We do *not* synthesise new representations from existing ones — e.g. no auto-rasterising SVG to a PNG companion, no rendering RTF to HTML to bridge format gaps. If a source app only emits SVG, the receiver gets SVG; whether the destination app paints it is the destination app's problem, same as it would be if the user copied locally without ClusterCut in the loop.
+
+#### Implementation outline (SVG specifically — most likely first v2 addition)
+
+SVG is text-shaped UTF-8 XML, so the architectural fit is awkward — image content conceptually but transports like rich text. Two paths considered:
+
+- **Option A — `ClipboardBlob` with `mime_type = "image/svg+xml"`** (recommended): same shape as the existing PNG path, just verbatim bytes. Sender bypasses PNG normalisation when source MIME is `image/svg+xml` and stores the SVG bytes (base64-encoded since `ClipboardBlob.data` is a `String`). Receiver writes bytes verbatim under `image/svg+xml` via the OS-direct path. Keeps the mental model clean: `blob` = single primary image with a MIME label, `formats` = alternate text representations alongside plain text. ~30 lines per backend.
+- **Option B — add `image/svg+xml` to the `formats[]` allowlist**: ~5 lines per backend, almost no diff. Semantically wrong — `formats[]` assumes "alongside plain text", and an SVG-only copy has no plain-text companion. Reject.
+
+Per-backend work for Option A:
+- **Wayland wlroots**: extend [common.rs::normalize_image_blob_from_bytes](src-tauri/src/clipboard/common.rs) with a SVG fast path — detect mime, skip `image::load_from_memory_with_format`, base64-encode the original bytes into `ClipboardBlob.data`. Receiver write: `wl_clipboard_rs` already supports arbitrary MIMEs.
+- **GNOME extension**: add `image/svg+xml` to the `IMAGE_MIME_PRIORITY` in `extension.js` (or a separate vector list) and preserve the MIME through `_readAndEmitBlob`. Receiver via `St.Clipboard.set_content(CLIPBOARD, "image/svg+xml", bytes)`.
+- **Windows / macOS via arboard**: arboard's `get_image()` decodes to RGBA — for SVG we have to *bypass* arboard. Read `image/svg+xml` (Windows: registered format atom; macOS: `public.svg-image` UTI) directly via `clipboard-win::raw::get_vec` / `NSPasteboard::dataForType`, before falling through to the existing arboard probe. Receiver write: same MIME via direct OS calls.
 
 ### 3.2 Animated GIFs
 
-Currently, an `image/gif` source gets decoded to `RgbaImage` (frame 0 only) and re-encoded to PNG. Animation is lost. To keep animation, `ClipboardBlob.mime_type` would need to be allowed to stay `image/gif` and the data sent verbatim — skipping the decode/re-encode round-trip. The receiver would need to set `image/gif` on the local clipboard (Wayland and macOS handle this fine; Windows has no native GIF clipboard format and would need to fall back to a raster preview).
+Currently, an `image/gif` source gets decoded to `RgbaImage` (frame 0 only) and re-encoded to PNG. Animation is lost. To keep animation, `ClipboardBlob.mime_type` would need to be allowed to stay `image/gif` and the data sent verbatim — skipping the decode/re-encode round-trip.
 
-### 3.3 Audio / video clipboard blobs
+Receiver writes the bytes to the OS clipboard under `image/gif`:
+- **Wayland / macOS**: native MIME-based clipboards, the format is recognised directly.
+- **Windows**: no built-in `CF_GIF`, but a registered format atom (`RegisterClipboardFormat("image/gif")`) holds the bytes. Chromium-based / Electron apps read the registered format; classic Win32 apps that only know about `CF_BITMAP`/`CF_DIB` won't.
 
-These are rare but real (Audacity, video editors, some screen-recording tools). Mechanically the same as image blobs — bytes + MIME — with the catch that file sizes can be large enough that the inline-blob path doesn't make sense. See §3.5.
+**That's where ClusterCut's responsibility ends.** The bytes are on the clipboard with the correct MIME. Whether a given destination app picks them up, animates them, or ignores them in favour of a raster fallback is the destination app's concern — same as if the user copied the GIF locally without ClusterCut in the loop. Adding heuristics on our side (auto-rasterise alongside, FileGroupDescriptor fallbacks, etc.) is scope-creep that papers over destination-app limitations rather than ClusterCut limitations.
 
-### 3.4 Vector formats (SVG)
+Sources to be aware of: most desktop apps that "copy a GIF" actually rasterise to PNG locally before the clipboard ever sees GIF bytes (Slack, Discord, Firefox `Copy Image`, Chrome, etc.). So in practice we'll only see real `image/gif` bytes when the user copies from an app that genuinely preserves them — file managers (right-click → Copy on a `.gif` file uses the files path, not this), some image editors, and the GNOME extension if `St.Clipboard` is offering it.
 
-`image/svg+xml` is text-shaped (UTF-8 XML), so it just needs to be added to the format allowlist. The wire size is usually small. Receiver can either set `image/svg+xml` directly on the clipboard (if the destination app understands it) or rasterise to PNG as a fallback. Mostly trivial; held for v2 because few apps actually consume SVG from the clipboard.
+#### Implementation outline
 
-### 3.5 Streaming or deferred-download for very large blobs
+The current image path *normalises everything to PNG via an RGBA round-trip* — that's the part that has to grow a verbatim pass-through branch.
+
+- **Sender**:
+  - **Wayland wlroots**: in [common.rs::normalize_image_blob_from_bytes](src-tauri/src/clipboard/common.rs), add a fast path: if source MIME is `image/gif`, skip `image::load_from_memory_with_format` + PNG re-encode, take the bytes verbatim, set `blob.mime_type = "image/gif"`. ~10 lines.
+  - **GNOME extension**: `_readAndEmitBlob` currently sends whatever MIME it picked. Add `image/gif` to `IMAGE_MIME_PRIORITY`, preserve the MIME through the chain. ~5 lines JS.
+  - **Windows / macOS via arboard**: this is the hard one. `arboard::get_image()` returns RGBA — by the time we see the bytes, the original GIF stream is already gone. To preserve GIF we have to bypass arboard for the GIF probe and read `clipboard-win::raw::get_vec(register_format("image/gif"), …)` on Windows or `NSPasteboard::dataForType("com.compuserve.gif")` on macOS *before* falling through to arboard's RGBA path. ~50 lines per platform.
+- **Receiver** (all backends): in `set_clipboard_image`, branch on `blob.mime_type`. If `image/png`, existing arboard / wlroots / extension path. If `image/gif`, write bytes verbatim under that MIME via OS-direct calls (registered format atom on Windows, native MIME on Wayland/macOS). ~30 lines total across backends.
+
+**Total estimate**: ~150 lines + ~50 each for the Win/mac sender pre-arboard probe. Medium risk — the Win/mac side has new clipboard-format enumeration logic that needs platform testing (TIRI-style round-trip oddities possible).
+
+**Worth-it analysis**: most desktop apps rasterise GIFs at copy time anyway, so the user-visible payoff is narrow — animation only survives when both the source app *and* the destination app preserve `image/gif`. Lower priority than 3.1 / 3.4.
+
+### 3.3 Streaming or deferred-download for very large blobs
 
 The current 10 MB inline cap is plenty for screenshots and typical web images, but it cuts off:
 - large editor exports (e.g. a poster from Affinity Designer)
 - multi-second audio/video clips
 - huge formatted documents
 
-Path: when a payload exceeds the inline cap, route it through the existing **file transfer** channel (the `FileStreamHeader` / `clustercut-file` ALPN) with a synthetic filename like `clipboard-image-<timestamp>.png`. The receiver materialises a temp file, sets the OS clipboard to point at it (or, for image data, decodes and sets `set_image`). The plumbing exists; this is mainly a UX question — large copies become "downloads" rather than instantaneous.
+The fix reuses the **existing file-transfer channel** (`FileStreamHeader` / `clustercut-file` ALPN) and the **existing `max_auto_download_size` setting** (50 MB by default — already used to gate auto-download of files). Three tiers based on the encoded payload size:
 
-### 3.6 Format negotiation between peers
+#### Tier 1 — ≤ 10 MB: inline blob (no change)
 
-Today both ends just trust that the wire shape matches. With more formats in flight, having a tiny capability handshake — "I can write CF_HTML, I can write text/rtf, I cannot write image/svg+xml" — would let senders avoid shipping formats the receiver can't restock. mDNS or the existing pair handshake are both candidate places to advertise. Worth doing once the format list grows past three or four entries.
+Existing path. Sender broadcasts the bytes inside `ClipboardPayload.blob`, encrypted, in a single `Message::Clipboard` over the `clustercut-transport` ALPN. Receiver decrypts and immediately writes to the OS clipboard. Paste is instant. **Nothing changes for this tier — the threshold split is invisible to typical users.**
+
+#### Tier 2 — > 10 MB and ≤ `max_auto_download_size`: descriptor + auto-fetch
+
+Sender broadcasts a *descriptor* over the existing `Message::Clipboard` path — same encryption, same dedup signature shape — but with `ClipboardBlob` containing a `fetch_id`, `mime_type`, `width`, `height`, and `total_size` instead of the bytes themselves. `data` is empty. (`fetch_id` reuses or mirrors the existing `id` shape from `FileRequestPayload`.)
+
+Receiver, on seeing a fetch-style blob:
+1. Emits a `"Downloading data…"` notification + a placeholder history entry showing dimensions and size with a download progress bar (same UI vocabulary as large file transfers, but the destination is the clipboard rather than disk).
+2. Opens a `clustercut-file` ALPN stream to the sender, pulls the bytes (ALPN, not the inline transport — it's already engineered for multi-MB streaming with `stopped()`-based ACK and a 64 MB-per-message cap doesn't apply because file streams are uni and chunked).
+3. Once download completes, decodes/decrypts the bytes, writes to the OS clipboard via the existing `set_clipboard_image` path (the same one Tier 1 uses), and emits a `"Data available to paste"` notification.
+4. From then on, paste behaves identically to a Tier 1 image.
+
+UX requirement: the two notifications above are essential. Without them, users will hit Ctrl+V mid-download, paste the previous clipboard contents instead of the newly-arriving image, and conclude that sync is broken. The "Downloading data…" toast prevents that confusion.
+
+**Concurrency / race**: if the user copies something else (text, smaller image, etc.) on the *receiver* while a Tier 2 download is in flight, the newest copy wins — the receiver's clipboard monitor has already detected the local change, and the in-progress download (if it eventually completes) is discarded rather than overwriting the user's intent. Easy to encode: each download tracks the `id` it was started for; if `state.last_clipboard_content` no longer matches that id when the download finishes, drop the bytes.
+
+#### Tier 3 — > `max_auto_download_size`: file-transfer fallback (no clipboard restock)
+
+For genuinely huge clipboard payloads (40K wallpapers, raw camera dumps, multi-second uncompressed audio), the descriptor goes onto the wire as today's **large-file** notification, **not** as a clipboard event. The receiver gets the same notification + history entry it gets for any large file transfer, the user clicks "Accept" to download (or doesn't), and the result lands as a file in the configured download location.
+
+**Important UX shift**: Tier 3 is no longer a "clipboard sync" experience. The data ends up as a *file* the user can open or drag/copy into another app. It does **not** auto-restock the OS clipboard. This is the same model files already use today, and consistent with how big files arrive — but worth being explicit about, because the user copied something expecting it to be on the clipboard, and at this size that expectation isn't met. The notification text needs to be specific so the user understands: "Large clipboard image from {sender} ({size}) — too large to auto-paste. Click to download as a file."
+
+Future option (not in scope of this doc): a clipboard-side "restock" button on the Tier 3 history entry that, after the user has explicitly accepted the file, decodes it and pushes onto the OS clipboard. Trades manual click for the missing auto-paste. Reasonable v2.
+
+#### macOS optimisation (defer)
+
+NSPasteboard supports lazy/promise-based pasteboard owners (`NSPasteboardWriting` + `pasteboard:item:provideDataForType:`). On macOS specifically, the receiver could put a *promise* on the pasteboard immediately on Tier 2 descriptor receipt and only pull the bytes when an app actually pastes. That would make Ctrl+V "just work" with on-demand fetch and skip the awkward "wait for the toast to flip" UX for tier 2. Windows and X11/Wayland don't have an equivalent, so this is purely a macOS gloss layered on top of Model A above — out of scope until tier 2 itself ships.
 
 ---
 
@@ -230,15 +105,72 @@ Today both ends just trust that the wire shape matches. With more formats in fli
 
 | # | Phase | Status |
 |---|---|---|
-| 1 | Wire-format plumbing (`ClipboardFormat`, `formats` field, signature, round-trip tests) | ✅ complete |
+| 1 | Wire-format plumbing (`ClipboardFormat`, `formats` field, signature, round-trip tests) | ✅ complete |gdbus introspect --session --dest org.gnome.Shell --object-path /org/gnome/Shell/Extensions/ClusterCut | grep -E "WriteFormats|FormatsChanged"
+
 | 2 | Backend B — Wayland wlroots (extend MIME probe + multi-MimeSource write) | ✅ complete |
 | 3 | Backend A — Windows + macOS (HTML/RTF reads/writes; CF_HTML wrap/strip helpers). **X11 intentionally out of scope** — too costly for a declining platform | ✅ complete (needs verification on real Win/macOS builds) |
 | 4 | Backend C — GNOME extension v4.0 (add format methods to the same v4.0 release as image blobs) | ✅ complete |
-| 5 | Frontend — Rich-format badge in history + manual-sync modal (no inline HTML rendering — would need DOMPurify; current strict CSP keeps it conservative) | ✅ complete |
+| 5 | Frontend — Rich-format badge in history + manual-sync modal (no inlinessh -o ServerAliveInterval=15 mimir 'tail -F -n +1 /tmp/clustercut-mimir.log' > /tmp/clustercut-mimir.log
+ HTML rendering — would need DOMPurify; current strict CSP keeps it conservative) | ✅ complete |
 | 6 | Smart-capture allowlist + cross-app polish (`;charset=utf-8` MIME variants, 16 MB per-format cap on the GNOME extension to match other backends, explicit allowlist comments documenting which vendor blobs are intentionally skipped) | ✅ complete |
 
-### Release polish (after Parts 1 + 2 are both in)
+### Part 3 — deferred work
+
+| # | Item | Status |
+|---|---|---|
+| 3.1 | SVG (vector image) clipboard sync — verbatim pass-through | ✅ complete (test plan: T-3.1.x) |
+| 3.2 | Animated GIF preservation | ⬜ not started |
+| 3.3 | Streaming/deferred-download for large blobs | ⬜ not started |
+
+### Release polish (after Parts 1 + 2 + 3 are in)
 
 | # | Phase | Status |
 |---|---|---|
 | 7 | CHANGELOG, metainfo, **docs (note rich-text not supported on X11)**, end-to-end testing on Win/macOS/GNOME, EGO submission for extension v4.0 | ⏸ remaining |
+
+---
+
+## Part 3 — Test Plan
+
+Manual test cases for the Part 3 deferred-work features. Run these end-to-end on a multi-machine cluster (e.g. Linux + macOS + Windows) once Part 3 is fully implemented, before tagging 0.3.0. Each case includes the expected behaviour and a quick sanity check.
+
+### §3.1 — SVG (vector image) clipboard sync
+
+#### T-3.1.1 — SVG round-trip preserves vector data
+
+1. On a Linux/wlroots peer (KDE, Sway, Hyprland), open Inkscape, draw a simple shape, select it, **Edit → Copy**.
+2. On the receiving peer (any of: Linux/wlroots, Linux/GNOME, macOS, Windows), open an SVG-aware app — Inkscape itself, Affinity Designer, Boxy SVG, or a text editor.
+3. Paste into the SVG-aware app or text editor.
+
+Expected:
+- Receiving app pastes the original `<svg>…</svg>` XML verbatim, **not** a rasterised PNG. Pasting into a text editor should show readable XML; pasting into Inkscape should give an editable vector.
+- ClusterCut's history view shows an entry tagged `image/svg+xml` rather than `image/png`.
+- Sender-side log: `Received clipboard image from <peer>: mime=image/svg+xml, decoded=<N> bytes` on the receiver, with **no** dimensions reported (SVGs don't carry intrinsic raster dims).
+
+#### T-3.1.2 — SVG beats raster fallback when source offers both
+
+1. On a peer with a source that puts BOTH `image/svg+xml` and `image/png` on the clipboard at once (some browsers do this when "Copy Image" is used on an inline SVG), copy.
+2. Observe the receive event on the receiving peer.
+
+Expected:
+- Receive log shows `mime=image/svg+xml`, not `image/png`. ClusterCut prefers vector when available.
+- Pasting into a vector-aware app gives the SVG; pasting into a raster-only app falls back via the destination app's own format negotiation (or fails, depending on the destination).
+
+#### T-3.1.3 — SVG TIRI check (no image-rebroadcast bouncing)
+
+1. With dev logs streaming on both peers, copy an SVG on the sender.
+2. After the receiver picks it up, watch the receiver's log for ~5 seconds.
+
+Expected:
+- Receiver logs `Received clipboard image from <sender>: mime=image/svg+xml, …`.
+- **No** subsequent `Sent clipboard to <sender>` line appears within ~3 seconds. SVG bytes are UTF-8 stable across the OS clipboard layer, so `image_blob_eq_stable`'s byte-equality fallback (when `width`/`height` are `None`) suppresses the echo cleanly.
+
+#### T-3.1.4 — Cross-backend coverage
+
+Repeat T-3.1.1 with sender/receiver pairs across all four supported backend combinations:
+- Linux wlroots (KDE) → Linux GNOME (extension)
+- Linux GNOME → macOS (plugin/NSPasteboard)
+- macOS → Windows (plugin/clipboard-win)
+- Windows → Linux wlroots
+
+Expected: SVG arrives intact on all four. **X11 sender/receiver intentionally not in scope** — X11 falls back to the existing raster-PNG image path or no image at all.

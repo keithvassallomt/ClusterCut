@@ -12,6 +12,14 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
 
+/// MIME types that carry image content but are *not* raster — bytes pass
+/// through verbatim instead of being decoded/re-encoded to PNG. SVG is the
+/// only one v2 supports today; other vector-shaped image MIMEs would slot
+/// in here.
+pub fn is_vector_image_mime(mime: &str) -> bool {
+    matches!(mime, "image/svg+xml")
+}
+
 /// Compute a stable, cheap content fingerprint for a `ClipboardPayload` used
 /// by both the sender (broadcast dedup) and receiver (re-broadcast loop guard)
 /// against `state.last_clipboard_content`. Both ends must agree on the format
@@ -133,6 +141,34 @@ pub fn normalize_image_blob_from_bytes(
         Some(width),
         Some(height),
     ))
+}
+
+/// Build a `ClipboardBlob` from raw clipboard bytes, branching between vector
+/// (verbatim pass-through) and raster (PNG-normalise) paths based on the
+/// source MIME. Vector MIMEs ride the wire as-is — receivers re-stock them
+/// under the same MIME, so e.g. SVG copied from Inkscape pastes as SVG into
+/// a vector-aware destination on the receiving peer.
+///
+/// Vector blobs have `width = height = None` because vector formats don't
+/// carry intrinsic raster dimensions. The TIRI fix's `image_blob_eq_stable`
+/// falls back to byte-exact comparison when dims are absent — for vector
+/// content that's correct: the bytes are UTF-8 XML and round-trip stably
+/// through every OS clipboard layer, so byte-exact compare doesn't bounce.
+#[cfg(target_os = "linux")]
+pub fn build_image_blob(bytes: Vec<u8>, source_mime: &str) -> Option<ClipboardBlob> {
+    if is_vector_image_mime(source_mime) {
+        if bytes.len() > MAX_CLIPBOARD_IMAGE_WIRE_BYTES {
+            tracing::warn!(
+                "Clipboard {} ({} bytes) exceeds {} byte wire cap; skipping.",
+                source_mime,
+                bytes.len(),
+                MAX_CLIPBOARD_IMAGE_WIRE_BYTES
+            );
+            return None;
+        }
+        return Some(ClipboardBlob::from_bytes(source_mime, &bytes, None, None));
+    }
+    normalize_image_blob_from_bytes(bytes, source_mime)
 }
 
 #[derive(Debug, Clone, PartialEq)]

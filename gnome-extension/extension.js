@@ -119,11 +119,14 @@ function findOfferedMime(offered, prefix) {
     return null;
 }
 
-// Image MIME types we relay over D-Bus, in preference order. The Rust side
-// normalises everything to PNG before broadcasting, so all that matters here
-// is that we pick the first source format the clipboard offers that we can
-// pass through verbatim. PNG first because it's lossless and most common.
+// Image MIME types we relay over D-Bus, in preference order. Vector MIMEs
+// (SVG) are checked first so a source that offers both vector and raster
+// (e.g. Inkscape: image/svg+xml + a raster fallback) gives the receiving
+// peer the higher-fidelity vector representation. The Rust side normalises
+// raster sources to PNG before broadcasting; vector sources pass through
+// verbatim.
 const IMAGE_MIME_PRIORITY = [
+    'image/svg+xml',
     'image/png',
     'image/jpeg',
     'image/webp',

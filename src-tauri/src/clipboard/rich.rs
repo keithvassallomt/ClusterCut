@@ -2,6 +2,10 @@
 /// (X11/Windows/macOS). The wlroots Wayland and GNOME-extension backends
 /// have their own format-aware paths and don't use this module.
 ///
+/// Also covers vector-image (SVG) clipboard reads/writes for the same
+/// reason — arboard's `get_image()`/`set_image()` is RGBA-only so we can't
+/// preserve SVG bytes through it.
+///
 /// X11 is intentionally omitted — supporting rich-text on X11 would require
 /// a third selection-owner thread alongside `tauri-plugin-clipboard` and
 /// `arboard`, with all the lazy-paste / `SelectionRequest` complexity that
@@ -47,6 +51,45 @@ pub fn write_clipboard_rich(text: &str, formats: &[ClipboardFormat]) -> Result<(
     }
 }
 
+/// Read a vector image (currently SVG) from the OS clipboard if one is
+/// present. Returns `(mime, bytes)`. The plugin backend calls this *before*
+/// arboard's RGBA probe so vector representations beat raster fallbacks
+/// when sources offer both. arboard would otherwise lose the vector
+/// representation entirely (its API is RGBA-only).
+pub fn read_clipboard_vector_image() -> Option<(String, Vec<u8>)> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::read_vector_image()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::read_vector_image()
+    }
+    #[cfg(all(target_os = "linux", not(target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// Write a vector image to the OS clipboard verbatim under its source MIME.
+/// The plugin backend's set_clipboard_image branches on `blob.mime_type` and
+/// calls this for vector MIMEs; raster MIMEs continue through arboard.
+pub fn write_clipboard_vector_image(mime: &str, bytes: &[u8]) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::write_vector_image(mime, bytes)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::write_vector_image(mime, bytes)
+    }
+    #[cfg(all(target_os = "linux", not(target_os = "windows")))]
+    {
+        let _ = (mime, bytes);
+        Err("vector-image clipboard write not supported on X11".to_string())
+    }
+}
+
 // ── Windows ────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -72,6 +115,10 @@ mod windows {
 
     fn rtf_format_id() -> Option<u32> {
         raw::register_format("Rich Text Format").map(|f| f.get())
+    }
+
+    fn svg_format_id() -> Option<u32> {
+        raw::register_format("image/svg+xml").map(|f| f.get())
     }
 
     /// Read both HTML and RTF (if present) from a single clipboard open so
@@ -251,6 +298,90 @@ mod windows {
         let _: SysResult<()> = Ok(());
         Ok(())
     }
+
+    /// Read SVG bytes from the clipboard if `image/svg+xml` is registered
+    /// and present. Wrapped in the same `is_format_avail` precheck pattern
+    /// as the rich-text path so we don't open the clipboard on every poll
+    /// when no SVG is present (Windows clipboard contention is real).
+    pub fn read_vector_image() -> Option<(String, Vec<u8>)> {
+        let svg_id = svg_format_id()?;
+        if !raw::is_format_avail(svg_id) {
+            return None;
+        }
+        let _clip = match Clipboard::new_attempts(ATTEMPTS) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("clipboard-win open failed for SVG read: {}", e);
+                return None;
+            }
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        match RawData(svg_id).read_clipboard(&mut buf) {
+            Ok(_) if !buf.is_empty() => {
+                if buf.len() > MAX_RICH_TEXT_BYTES {
+                    tracing::warn!(
+                        "Clipboard SVG ({} bytes) exceeds {} byte cap; skipping.",
+                        buf.len(),
+                        MAX_RICH_TEXT_BYTES
+                    );
+                    return None;
+                }
+                Some(("image/svg+xml".to_string(), buf))
+            }
+            _ => None,
+        }
+    }
+
+    /// Write SVG (or other vector image) bytes to the clipboard verbatim
+    /// under a registered format atom matching the source MIME. Same retry
+    /// pattern as the rich-text writer for clipboard-manager contention.
+    pub fn write_vector_image(mime: &str, bytes: &[u8]) -> Result<(), String> {
+        const MAX_ATTEMPTS: u32 = 6;
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match try_write_vector(mime, bytes) {
+                Ok(()) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            "Clipboard vector-image write succeeded on attempt {}",
+                            attempt
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = Some(e.clone());
+                    if attempt < MAX_ATTEMPTS {
+                        let backoff_ms = 50_u64 * (1 << (attempt - 1)).min(8);
+                        tracing::warn!(
+                            "Clipboard vector-image write attempt {}/{} failed: {}. Retrying in {} ms",
+                            attempt,
+                            MAX_ATTEMPTS,
+                            e,
+                            backoff_ms
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "vector-image write failed for unknown reason".to_string()))
+    }
+
+    fn try_write_vector(mime: &str, bytes: &[u8]) -> Result<(), String> {
+        let id = match mime {
+            "image/svg+xml" => svg_format_id()
+                .ok_or_else(|| "couldn't register image/svg+xml format atom".to_string())?,
+            other => return Err(format!("unsupported vector MIME on Windows: {}", other)),
+        };
+        let _clip = Clipboard::new_attempts(ATTEMPTS)
+            .map_err(|e| format!("clipboard-win open: {}", e))?;
+        raw::empty().map_err(|e| format!("EmptyClipboard: {}", e))?;
+        RawData(id)
+            .write_clipboard(bytes)
+            .map_err(|e| format!("SetClipboardData({}): {}", mime, e))?;
+        Ok(())
+    }
 }
 
 // ── macOS ──────────────────────────────────────────────────────────────────
@@ -361,6 +492,65 @@ mod macos {
             }
         }
 
+        Ok(())
+    }
+
+    /// Map a wire MIME to the macOS UTI used on the pasteboard.
+    fn vector_image_uti(mime: &str) -> Option<&'static str> {
+        match mime {
+            // public.svg-image is the registered UTI for SVG; modern macOS
+            // (Big Sur+) handles it. Apps that look for the raw MIME instead
+            // would need a parallel `image/svg+xml` declaration — out of
+            // scope until a real-world app surfaces that limitation.
+            "image/svg+xml" => Some("public.svg-image"),
+            _ => None,
+        }
+    }
+
+    /// Read SVG from the pasteboard if available. macOS NSPasteboard exposes
+    /// SVG under the `public.svg-image` UTI; we read the bytes verbatim.
+    pub fn read_vector_image() -> Option<(String, Vec<u8>)> {
+        let pb = pasteboard();
+        let uti_ns = NSString::from_str("public.svg-image");
+        let data: Option<Retained<NSData>> = unsafe { pb.dataForType(&uti_ns) };
+        let data = data?;
+        let len = unsafe { data.length() };
+        if len == 0 {
+            return None;
+        }
+        if len > MAX_RICH_TEXT_BYTES {
+            tracing::warn!(
+                "Clipboard SVG ({} bytes) exceeds {} byte cap; skipping.",
+                len,
+                MAX_RICH_TEXT_BYTES
+            );
+            return None;
+        }
+        let bytes = unsafe {
+            let ptr = data.bytes();
+            std::slice::from_raw_parts(ptr.as_ptr() as *const u8, len).to_vec()
+        };
+        Some(("image/svg+xml".to_string(), bytes))
+    }
+
+    /// Write SVG (or other vector-image) bytes verbatim under the
+    /// appropriate macOS UTI. Atomic single-format publish via
+    /// `clearContents` + `declareTypes:owner:` + `setData:forType:`.
+    pub fn write_vector_image(mime: &str, bytes: &[u8]) -> Result<(), String> {
+        let uti = vector_image_uti(mime)
+            .ok_or_else(|| format!("unsupported vector MIME on macOS: {}", mime))?;
+        let pb = pasteboard();
+        let uti_ns = NSString::from_str(uti);
+        let types_array = NSArray::from_retained_slice(&[uti_ns.clone()]);
+        unsafe {
+            pb.clearContents();
+            pb.declareTypes_owner(&types_array, None);
+        }
+        let data = NSData::with_bytes(bytes);
+        let ok = pb.setData_forType(Some(&data), &uti_ns);
+        if !ok {
+            return Err("setData:forType: returned false for vector image".to_string());
+        }
         Ok(())
     }
 }
