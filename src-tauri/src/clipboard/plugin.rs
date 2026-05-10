@@ -30,6 +30,13 @@ enum WorkerCommand {
         width: usize,
         height: usize,
         rgba: Vec<u8>,
+        /// Windows-only dual-write companion: when `Some((mime, bytes))`, the
+        /// worker also appends a registered MIME atom (e.g. `image/jpeg`,
+        /// `image/gif`) alongside the CF_DIB / CF_BITMAP / "PNG" atom that
+        /// `arboard::set_image` writes. Used so JPEG/GIF received from peers
+        /// paste cleanly into both native Win32 apps (which read CF_DIB) and
+        /// modern apps that prefer the original-format MIME atom.
+        extra_atom: Option<(String, Vec<u8>)>,
         response: mpsc::Sender<Result<(), String>>,
     },
     /// Windows-only: write plain text via clipboard-win, calling
@@ -134,16 +141,37 @@ fn read_clipboard_image_arboard(arboard: &mut arboard::Clipboard) -> Option<Clip
 /// different thread were surfacing as ERROR_CLIPBOARD_NOT_OPEN (os error 1418)
 /// inside arboard's `SetClipboardData`.
 ///
-/// Vector MIMEs (currently SVG) bypass the arboard path entirely and write
-/// bytes verbatim under the source MIME via OS-direct calls in `rich.rs` —
-/// arboard's API is RGBA-only and would lose the vector representation.
+/// SVG bypasses arboard entirely and writes bytes verbatim under the source
+/// MIME via OS-direct calls in `rich.rs` — arboard's API is RGBA-only and
+/// would lose the vector representation.
+///
+/// JPEG/GIF on Windows specifically: dual-write. arboard writes CF_DIB +
+/// CF_BITMAP + "PNG" atom (so Paint/Word/Photos can paste); the worker then
+/// also appends the source `image/jpeg` (or `image/gif`) registered atom
+/// without emptying the clipboard, so apps that prefer the original-format
+/// MIME (Chromium / Electron / image editors) still see it. macOS and Linux
+/// keep pure passthrough — their native MIME-based clipboards handle JPEG /
+/// GIF cleanly without a raster companion.
 fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Result<(), String> {
-    if super::common::is_passthrough_image_mime(&blob.mime_type) {
-        let bytes = blob.raw_bytes()?;
-        return rich::write_clipboard_passthrough_image(&blob.mime_type, &bytes);
+    let bytes = blob.raw_bytes()?;
+    let mime = blob.mime_type.as_str();
+
+    // SVG: vector — no useful raster representation. Pure passthrough on
+    // every platform.
+    if mime == "image/svg+xml" {
+        return rich::write_clipboard_passthrough_image(mime, &bytes);
     }
 
-    let format = match blob.mime_type.as_str() {
+    // JPEG/GIF: pure passthrough on macOS + Linux; dual-write on Windows so
+    // native Win32 apps can paste it.
+    let needs_windows_dual_write = cfg!(target_os = "windows")
+        && (mime == "image/jpeg" || mime == "image/gif");
+
+    if super::common::is_passthrough_image_mime(mime) && !needs_windows_dual_write {
+        return rich::write_clipboard_passthrough_image(mime, &bytes);
+    }
+
+    let format = match mime {
         "image/png" => image::ImageFormat::Png,
         "image/jpeg" => image::ImageFormat::Jpeg,
         "image/webp" => image::ImageFormat::WebP,
@@ -153,13 +181,18 @@ fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Resu
         other => return Err(format!("unsupported clipboard image MIME: {}", other)),
     };
 
-    let bytes = blob.raw_bytes()?;
     let decoded = image::load_from_memory_with_format(&bytes, format)
         .map_err(|e| format!("decode clipboard image: {}", e))?;
     let rgba = decoded.into_rgba8();
     let width = rgba.width() as usize;
     let height = rgba.height() as usize;
     let raw = rgba.into_raw();
+
+    let extra_atom = if needs_windows_dual_write {
+        Some((mime.to_string(), bytes))
+    } else {
+        None
+    };
 
     let sender = WORKER_CMD_TX
         .get()
@@ -171,6 +204,7 @@ fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Resu
             width,
             height,
             rgba: raw,
+            extra_atom,
             response: tx,
         })
         .map_err(|_| "clipboard worker channel closed".to_string())?;
@@ -488,10 +522,40 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                     width,
                     height,
                     rgba,
+                    extra_atom,
                     response,
                 } => {
                     let result = match arboard_clip.as_mut() {
-                        Some(arb) => set_image_with_handle(arb, width, height, &rgba),
+                        Some(arb) => {
+                            let raster = set_image_with_handle(arb, width, height, &rgba);
+                            // On Windows, append the source-MIME atom alongside
+                            // the raster formats arboard just wrote. Failure
+                            // here is non-fatal: the DIB is on the clipboard,
+                            // so paste-into-Paint still works — we just lose
+                            // the original-format atom for modern apps.
+                            #[cfg(target_os = "windows")]
+                            let raster = match (raster, extra_atom) {
+                                (Ok(()), Some((mime, bytes))) => {
+                                    if let Err(e) =
+                                        rich::append_clipboard_passthrough_atom(&mime, &bytes)
+                                    {
+                                        tracing::warn!(
+                                            "Clipboard {} atom append failed (raster paste still works): {}",
+                                            mime,
+                                            e
+                                        );
+                                    }
+                                    Ok(())
+                                }
+                                (other, _) => other,
+                            };
+                            #[cfg(not(target_os = "windows"))]
+                            let raster = {
+                                let _ = extra_atom;
+                                raster
+                            };
+                            raster
+                        }
                         None => Err("arboard handle unavailable on worker".to_string()),
                     };
                     // Best-effort: if the caller already gave up (timeout),

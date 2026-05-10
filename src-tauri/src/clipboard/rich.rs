@@ -92,6 +92,17 @@ pub fn write_clipboard_passthrough_image(mime: &str, bytes: &[u8]) -> Result<(),
     }
 }
 
+/// Windows-only: append a passthrough-image registered format atom to the
+/// clipboard **without** emptying it first, so the atom lands alongside
+/// formats already written by `arboard::set_image` (CF_DIB / CF_BITMAP /
+/// "PNG" atom). Used by the plugin backend's worker thread to dual-write
+/// JPEG and GIF — raster compat for Paint / Word / Photos plus the original
+/// MIME atom for Chromium / Electron / image-editor apps that prefer it.
+#[cfg(target_os = "windows")]
+pub fn append_clipboard_passthrough_atom(mime: &str, bytes: &[u8]) -> Result<(), String> {
+    windows::append_passthrough_atom_no_empty(mime, bytes)
+}
+
 // ── Windows ────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -418,6 +429,35 @@ mod windows {
         let _clip = Clipboard::new_attempts(ATTEMPTS)
             .map_err(|e| format!("clipboard-win open: {}", e))?;
         raw::empty().map_err(|e| format!("EmptyClipboard: {}", e))?;
+        RawData(id)
+            .write_clipboard(&bytes)
+            .map_err(|e| format!("SetClipboardData({}): {}", mime, e))?;
+        Ok(())
+    }
+
+    /// Append a passthrough-image format atom to the clipboard **without**
+    /// calling `EmptyClipboard` first, so it lands alongside formats already
+    /// written by a previous open (typically `arboard::set_image`'s
+    /// CF_DIB / CF_BITMAP / "PNG" trio). Used for the JPEG / GIF dual-write
+    /// path on Windows: native Win32 apps (Paint, Word, Photos) read CF_DIB,
+    /// modern apps that prefer the original format read the registered
+    /// `image/jpeg` (or `image/gif`) atom. Without this, JPEGs received from
+    /// peers couldn't paste into Paint or Word — the bytes were on the
+    /// clipboard, just under a MIME atom those apps don't look at.
+    pub fn append_passthrough_atom_no_empty(mime: &str, bytes: &[u8]) -> Result<(), String> {
+        let id = match mime {
+            "image/svg+xml" => svg_format_id()
+                .ok_or_else(|| "couldn't register image/svg+xml format atom".to_string())?,
+            "image/gif" => gif_format_id()
+                .ok_or_else(|| "couldn't register image/gif format atom".to_string())?,
+            "image/jpeg" => jpeg_format_id()
+                .ok_or_else(|| "couldn't register image/jpeg format atom".to_string())?,
+            other => return Err(format!("unsupported passthrough atom MIME: {}", other)),
+        };
+        let _clip = Clipboard::new_attempts(ATTEMPTS)
+            .map_err(|e| format!("clipboard-win open: {}", e))?;
+        // Deliberately NO raw::empty() — caller has already populated the
+        // clipboard with raster formats (CF_DIB / CF_BITMAP / PNG atom).
         RawData(id)
             .write_clipboard(&bytes)
             .map_err(|e| format!("SetClipboardData({}): {}", mime, e))?;
