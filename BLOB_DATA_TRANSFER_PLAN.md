@@ -121,7 +121,7 @@ NSPasteboard supports lazy/promise-based pasteboard owners (`NSPasteboardWriting
 | 3.1 | SVG (vector image) clipboard sync — verbatim pass-through | ✅ complete (test plan: T-3.1.x) |
 | 3.2 | Animated GIF preservation — verbatim pass-through | ✅ complete (test plan: T-3.2.x) |
 | 3.2b | JPEG passthrough (avoids 5-30× PNG re-encode inflation for photos) | ✅ complete (test plan: T-3.2.6) |
-| 3.3 v1 | Inline cap raised to 60 MB + large-blob notification | ✅ complete (test plan: T-3.3.1–T-3.3.5) |
+| 3.3 v1 | Inline cap raised to a real **35 MB** + large-blob notification + base64 outer wrapping (was claimed 60 MB but actual usable was ~13 MB pre-fix because `Vec<u8>` JSON int-array inflated random encrypted bytes 3.57×; base64 brings outer inflation to 1.33×, total ~1.78× vs the 64 MB transport cap) | ✅ complete (test plan: T-3.3.1–T-3.3.5) |
 | 3.3 v2 | Descriptor + auto-fetch over `clustercut-file` ALPN, race protection, Tier 3 file-fallback | ⏸ deferred (test plan: T-3.3.6) |
 | TIRI-stale | IGNORED guard auto-expires after 10 s if echo never arrives — fixes stuck `Image(svg+xml)` driving spurious "variant differs" broadcasts on every later clipboard event | ✅ complete (test plan: T-TIRI-stale) |
 
@@ -270,7 +270,7 @@ Expected:
 
 Expected:
 - Sender log: `send_message: connecting … for <N> byte payload` where N is roughly 1.04× the encoded size.
-- Receiver log: `Received clipboard image from <peer>: mime=image/png, decoded=<size> bytes, WxH`.
+- Receiver log: `Received clipboard image from <peer>: mime=image/png, decoded=<size> bytes, WxH`.n
 - A "Large Image Received" notification fires on the receiver with the size in MB.
 - Paste produces the original image. No truncation, no corruption.
 

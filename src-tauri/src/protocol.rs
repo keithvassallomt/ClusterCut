@@ -1,6 +1,26 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+/// serde adapter: serialise/deserialise `Vec<u8>` as a base64 JSON string
+/// instead of the default `[1,2,3,…]` integer array. Used for the encrypted
+/// `Message::Clipboard` payload, which can be tens of MB; the int-array
+/// form inflates random-byte content by ~3.57× (measured), pushing
+/// large blobs over the receiver's 64 MB transport cap. Base64 inflates
+/// at ~1.33×, comfortably under the cap.
+mod b64_bytes {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&BASE64.encode(v))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        BASE64.decode(s.as_bytes()).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileMetadata {
     pub name: String,
@@ -178,7 +198,14 @@ pub struct PairFingerprintPayload {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
-    Clipboard(Vec<u8>), // Encrypted ClipboardPayload
+    /// Encrypted `ClipboardPayload`. Field is base64-encoded on the wire
+    /// (see `b64_bytes` above) — at multi-MB blob sizes the default
+    /// `Vec<u8>` JSON int-array encoding (3.57×) exceeds the receiver's
+    /// 64 MB transport cap; base64 stays at 1.33× and fits comfortably.
+    /// **Wire-format break**: peers running pre-§3.x versions deserialise
+    /// this as a JSON int-array and reject the base64 string, surfacing
+    /// as a deserialisation error on the receive side.
+    Clipboard(#[serde(with = "b64_bytes")] Vec<u8>),
     PairRequest {
         msg: Vec<u8>,
         device_id: String,
@@ -386,6 +413,45 @@ mod tests {
         let recovered: ClipboardPayload = serde_json::from_slice(&plain).unwrap();
         let formats = recovered.formats.expect("formats survive crypto");
         assert_eq!(formats, vec![html, rtf]);
+    }
+
+    #[test]
+    fn measure_clipboard_message_wire_inflation() {
+        // Regression guard: the Message::Clipboard variant must use the
+        // base64 serde adapter, not the default Vec<u8> JSON int-array,
+        // or large-blob clipboard sync will silently break against the
+        // 64 MB transport cap.
+        let cipher: Vec<u8> = (0..10_000).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let msg = Message::Clipboard(cipher.clone());
+        let json = serde_json::to_vec(&msg).unwrap();
+        let ratio = json.len() as f64 / cipher.len() as f64;
+        println!(
+            "Message::Clipboard({} cipher bytes) -> JSON {} bytes (ratio {:.2}x)",
+            cipher.len(),
+            json.len(),
+            ratio
+        );
+        // Base64 inflation is ~1.34× plus `{"Clipboard":"..."}` overhead.
+        // Anything over 1.5× is a clear regression to int-array shape.
+        assert!(
+            ratio < 1.5,
+            "Message::Clipboard wire inflation regressed to {:.2}x — base64 adapter likely missing",
+            ratio
+        );
+    }
+
+    #[test]
+    fn clipboard_message_round_trips_through_base64_adapter() {
+        let cipher: Vec<u8> = vec![0u8, 1, 2, 254, 255, 128, 64, 32];
+        let msg = Message::Clipboard(cipher.clone());
+        let json = serde_json::to_vec(&msg).unwrap();
+        let parsed: Message = serde_json::from_slice(&json).unwrap();
+        match parsed {
+            Message::Clipboard(round_tripped) => {
+                assert_eq!(round_tripped, cipher);
+            }
+            other => panic!("expected Clipboard variant, got {:?}", other),
+        }
     }
 
     #[test]

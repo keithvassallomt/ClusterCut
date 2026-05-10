@@ -8,20 +8,28 @@ use tauri::{AppHandle, Emitter};
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
 
-/// Wire-format size cap for clipboard image blobs (encoded). Sender drops
-/// anything over.
+/// Wire-format size cap for clipboard image blobs (raw / encoded bytes).
+/// Sender drops anything over.
 ///
-/// Raised from the original 10 MB to 60 MB as a v1 take on §3.3 large-blob
-/// support: the per-message transport cap is 64 MB (`MESSAGE_BYTE_CAP` in
-/// `transport.rs`), and empirical wire-vs-raw inflation is ≈1.04× (base64
-/// + JSON + ChaCha20Poly1305 + serde_json wrapping), so 60 MB raw lands at
-/// ~62 MB on the wire — comfortably under the cap.
+/// Math: the per-message transport cap is 64 MB (`MESSAGE_BYTE_CAP` in
+/// `transport.rs`). Total inflation from raw image bytes to wire is ~1.78×:
+/// inner `ClipboardBlob.data` is base64 (1.33×), gets encrypted (no
+/// expansion), and the encrypted ciphertext is then base64-encoded again
+/// at the `Message::Clipboard` wrapper layer (1.33×) so it survives JSON
+/// serialisation without the random-byte int-array bloat that hit ~3.57×.
+/// 1.33² ≈ 1.78. So 35 MB raw → ~62 MB wire, comfortably under the
+/// 64 MB transport cap.
 ///
-/// **Future work** (descriptor + auto-fetch over `clustercut-file` ALPN with
-/// race protection and Tier 3 file-fallback) is documented in
-/// `BLOB_DATA_TRANSFER_PLAN.md` §3.3 — not yet implemented. This v1 trades
-/// off the descriptor's nicer UX for a much smaller diff.
-pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 60 * 1024 * 1024;
+/// (An earlier 60 MB cap was set under the assumption of a ~1.04× wire
+/// inflation, which turned out to be a misreading — actual inflation
+/// pre-fix was ~4.75× because of `Vec<u8>` JSON int-array, so blobs
+/// over ~13 MB were already silently dropping at the receiver. The 35 MB
+/// cap here matches the post-fix wire shape.)
+///
+/// **Future work** (descriptor + auto-fetch over `clustercut-file` ALPN
+/// with race protection and Tier 3 file-fallback) is documented in
+/// `BLOB_DATA_TRANSFER_PLAN.md` §3.3 v2 — not yet implemented.
+pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 35 * 1024 * 1024;
 
 /// Threshold above which a "Receiving large clipboard…" notification fires on
 /// the receiver side. A multi-MB inline transfer takes a perceptible amount
