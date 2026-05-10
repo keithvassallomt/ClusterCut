@@ -1,5 +1,8 @@
 pub mod common;
 mod plugin;
+mod rich;
+
+use crate::protocol::{ClipboardBlob, ClipboardFormat};
 
 #[cfg(target_os = "linux")]
 mod wayland;
@@ -136,6 +139,64 @@ pub fn set_clipboard_paths(app: &AppHandle, paths: Vec<String>) {
             ClipboardBackend::Degraded => {
                 tracing::warn!(
                     "Clipboard file write attempted in degraded mode — no backend available"
+                );
+            }
+        }
+    }
+}
+
+/// Write plain text plus alternate format representations (text/html, text/rtf,
+/// …) onto the local clipboard so the destination app can pick whichever
+/// format it understands best. Wayland wlroots, GNOME-extension, and the
+/// Plugin backend (Windows / macOS) carry the rich formats end-to-end. X11
+/// (also Plugin) is intentionally out of scope — its set_clipboard_rich falls
+/// back to plain text via tauri-plugin-clipboard.
+pub fn set_clipboard_rich(app: &AppHandle, text: String, formats: Vec<ClipboardFormat>) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        plugin::set_clipboard_rich(app, text, formats);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match get_backend() {
+            ClipboardBackend::WlrDataControl => wayland::set_clipboard_rich(app, text, formats),
+            ClipboardBackend::Plugin => {
+                // On X11 the rich module returns Err and the plugin path
+                // gracefully falls back to writing plain text.
+                plugin::set_clipboard_rich(app, text, formats);
+            }
+            ClipboardBackend::GnomeExtension => {
+                dbus_clipboard::set_clipboard_rich(app, text, formats);
+            }
+            ClipboardBackend::Degraded => {
+                tracing::warn!(
+                    "Clipboard rich write attempted in degraded mode — no backend available"
+                );
+            }
+        }
+    }
+}
+
+/// Place an image blob (typically `image/png`) on the local clipboard so the
+/// user can paste it in any app. Wired up across all four backends; the GNOME
+/// extension path requires extension v4.0 or newer — older extensions return
+/// UnknownMethod and the write fails gracefully.
+pub fn set_clipboard_image(app: &AppHandle, blob: ClipboardBlob) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        plugin::set_clipboard_image(app, blob);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match get_backend() {
+            ClipboardBackend::Plugin => plugin::set_clipboard_image(app, blob),
+            ClipboardBackend::WlrDataControl => wayland::set_clipboard_image(app, blob),
+            ClipboardBackend::GnomeExtension => dbus_clipboard::set_clipboard_image(app, blob),
+            ClipboardBackend::Degraded => {
+                tracing::warn!(
+                    "Clipboard image write attempted in degraded mode — no backend available"
                 );
             }
         }

@@ -381,38 +381,79 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
 "#, target_view, title, body, actions_xml);
 
         if let Ok(doc) = XmlDocument::new() {
-             if let Ok(_) = doc.LoadXml(&HSTRING::from(&xml)) {
-                 if let Ok(toast) = ToastNotification::CreateToastNotification(&doc) {
-                     // Set Expiration Time (5 seconds from now)
-                     let now = std::time::SystemTime::now();
-                     let unix_epoch = std::time::UNIX_EPOCH;
-                     if let Ok(duration) = now.duration_since(unix_epoch) {
-                         // Windows Epoch (1601-01-01) is 11,644,473,600 seconds before Unix Epoch
-                         // Ticks are 100ns intervals
-                         let unix_secs = duration.as_secs();
-                         let unix_nanos = duration.subsec_nanos() as u64;
-                         
-                         let windows_ticks = (unix_secs + 11_644_473_600) * 10_000_000 + (unix_nanos / 100);
-                         
-                         // Add 5 seconds
-                         let expire_ticks = windows_ticks + (5 * 10_000_000);
-                         
-                         let expiry = windows::Foundation::DateTime { UniversalTime: expire_ticks as i64 };
-                         
-                         // Fix for E0277: SetExpirationTime requires IReference<DateTime>
-                         // We use PropertyValue to box the DateTime into an IInspectable/IReference
-                         if let Ok(inspectable) = windows::Foundation::PropertyValue::CreateDateTime(expiry) {
-                             if let Ok(expiry_ref) = inspectable.cast::<windows::Foundation::IReference<windows::Foundation::DateTime>>() {
-                                  if let Err(e) = toast.SetExpirationTime(&expiry_ref) {
-                                      tracing::warn!("Failed to set notification expiration: {}", e);
-                                  }
+             match doc.LoadXml(&HSTRING::from(&xml)) {
+                 Ok(_) => match ToastNotification::CreateToastNotification(&doc) {
+                     Ok(toast) => {
+                         // Set Expiration Time. This is when Windows removes the
+                         // notification from Action Center *and* the cutoff for
+                         // when the banner can still display — if the OS hasn't
+                         // gotten around to rendering the toast by this time
+                         // (e.g. because a big file transfer is occupying the
+                         // system), Windows silently drops it.
+                         //
+                         // The previous 5 s window was catastrophic: any
+                         // notification that fired during peer setup or a file
+                         // receive (the times users most want to be told) hit
+                         // the queue late, expired, and dropped. 10 minutes is
+                         // well past any queueing delay, short enough that
+                         // Action Center stays tidy.
+                         let now = std::time::SystemTime::now();
+                         if let Ok(duration) = now.duration_since(std::time::UNIX_EPOCH) {
+                             // Windows Epoch (1601-01-01) is 11,644,473,600 s before Unix Epoch.
+                             // Ticks are 100ns intervals.
+                             let unix_secs = duration.as_secs();
+                             let unix_nanos = duration.subsec_nanos() as u64;
+                             let windows_ticks = (unix_secs + 11_644_473_600) * 10_000_000
+                                 + (unix_nanos / 100);
+                             let expire_ticks = windows_ticks + (10 * 60 * 10_000_000);
+
+                             let expiry = windows::Foundation::DateTime {
+                                 UniversalTime: expire_ticks as i64,
+                             };
+                             if let Ok(inspectable) =
+                                 windows::Foundation::PropertyValue::CreateDateTime(expiry)
+                             {
+                                 if let Ok(expiry_ref) = inspectable.cast::<windows::Foundation::IReference<windows::Foundation::DateTime>>() {
+                                     if let Err(e) = toast.SetExpirationTime(&expiry_ref) {
+                                         tracing::warn!("[Notification] SetExpirationTime failed: {}", e);
+                                     }
+                                 }
+                             }
+                         }
+
+                         match ToastNotificationManager::CreateToastNotifierWithId(
+                             &HSTRING::from(aumid),
+                         ) {
+                             Ok(notifier) => {
+                                 if let Err(e) = notifier.Show(&toast) {
+                                     // Surface the failure instead of swallowing
+                                     // it — if AUMID isn't registered (dev mode
+                                     // without the MSI), this is the place we'll
+                                     // see it.
+                                     tracing::warn!(
+                                         "[Notification] ToastNotifier.Show failed: {}",
+                                         e
+                                     );
+                                 }
+                             }
+                             Err(e) => {
+                                 tracing::warn!(
+                                     "[Notification] CreateToastNotifierWithId(\"{}\") failed: {} — AUMID likely not registered (only registered when installed via MSI)",
+                                     aumid,
+                                     e
+                                 );
                              }
                          }
                      }
-
-                     if let Ok(notifier) = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(aumid)) {
-                         let _ = notifier.Show(&toast);
+                     Err(e) => {
+                         tracing::warn!(
+                             "[Notification] CreateToastNotification failed: {}",
+                             e
+                         );
                      }
+                 },
+                 Err(e) => {
+                     tracing::warn!("[Notification] LoadXml failed: {}", e);
                  }
              }
         }
@@ -422,6 +463,36 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
     #[cfg(target_os = "macos")]
     {
         let _ = increment_badge;
+
+        // Dev-mode fallback: when the binary isn't running inside an
+        // `.app` bundle, user-notify silently swallows everything via its
+        // `NotificationManagerMock` (no UNUserNotificationCenter access
+        // outside a bundle). Detect that and shell out to `osascript`
+        // instead — actions aren't supported but the user at least sees
+        // the notification banner. The bundle-check log fires at startup
+        // (see `init_logging`).
+        let in_bundle = std::env::current_exe()
+            .map(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+            .unwrap_or(false);
+        if !in_bundle {
+            tracing::info!("[Notification] macOS dev mode — falling back to osascript (no bundle).");
+            let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+            let script = format!(
+                "display notification \"{}\" with title \"{}\"",
+                escape(body),
+                escape(title)
+            );
+            std::thread::spawn(move || {
+                if let Err(e) = std::process::Command::new("osascript")
+                    .args(["-e", &script])
+                    .output()
+                {
+                    tracing::warn!("[Notification] osascript fallback failed: {}", e);
+                }
+            });
+            return;
+        }
+
         tracing::info!("[Notification] macOS detected. Using user-notify...");
 
         // Update last notification time
@@ -1709,6 +1780,8 @@ async fn send_clipboard(
         sender: hostname,
         sender_id: local_id,
         files: None,
+        blob: None,
+        formats: None,
     };
 
     // Emit local event so history updates
@@ -1847,15 +1920,69 @@ async fn confirm_pending_clipboard(
 
     if let Some(payload) = pending_opt {
         tracing::info!("Confirming pending clipboard from {}", payload.sender);
-        clipboard::set_clipboard(&app_handle, payload.text.clone());
-        
+
+        // §3.3 descriptor: bytes weren't carried inline. Trigger a
+        // FileRequest fetch over the `clustercut-file` ALPN; the stream
+        // listener will land them on the OS clipboard once they arrive.
+        if let Some(blob) = payload.blob.as_ref() {
+            if blob.is_descriptor() {
+                tracing::info!(
+                    "[ClipboardBlob] Confirming descriptor fetch (id={}, total={:?})",
+                    payload.id,
+                    blob.total_size
+                );
+                {
+                    let mut slot = state.in_flight_clipboard_fetch.lock().unwrap();
+                    *slot = Some(payload.id.clone());
+                }
+                let mb = blob.total_size.unwrap_or(0) as f64 / (1024.0 * 1024.0);
+                let notifications = state.settings.lock().unwrap().notifications.clone();
+                if notifications.data_received {
+                    send_notification(
+                        &app_handle,
+                        "Receiving Clipboard Image",
+                        &format!("Receiving {:.1} MB image from {}…", mb, payload.sender),
+                        false,
+                        Some(2),
+                        "history",
+                        NotificationPayload::None,
+                    );
+                }
+                return request_clipboard_blob_internal(&state, payload.id.clone(), payload.sender_id.clone()).await;
+            }
+        }
+
+        if let Some(blob) = payload.blob.clone() {
+            clipboard::set_clipboard_image(&app_handle, blob);
+        } else if let Some(formats) = payload
+            .formats
+            .as_ref()
+            .filter(|fs| !fs.is_empty())
+            .cloned()
+        {
+            clipboard::set_clipboard_rich(&app_handle, payload.text.clone(), formats);
+        } else {
+            clipboard::set_clipboard(&app_handle, payload.text.clone());
+        }
+
         // Emit change event so history updates
         let _ = app_handle.emit("clipboard-change", &payload);
-        
+
         Ok(())
     } else {
         Err("No pending clipboard content".to_string())
     }
+}
+
+/// Send a `FileRequest` to the descriptor's source peer to begin fetching a
+/// large clipboard blob. Used by the manual-confirm path (§3.3 Tier B2 and
+/// auto-receive=off Tier B1).
+pub async fn request_clipboard_blob_internal(
+    state: &AppState,
+    msg_id: String,
+    peer_id: String,
+) -> Result<(), String> {
+    request_file_internal(state, msg_id, 0, peer_id).await
 }
 
 #[cfg(target_os = "linux")]
@@ -2765,18 +2892,215 @@ async fn set_local_clipboard_files(app: tauri::AppHandle, paths: Vec<String>) ->
     Ok(())
 }
 
+/// Read a §3.3 clipboard-blob stream into memory and land it on the OS
+/// clipboard. The header has already been parsed and confirmed to carry
+/// `DeliveryTarget::Clipboard{…}`. Auth-token verification mirrors the file
+/// path. Race protection: if `state.in_flight_clipboard_fetch` no longer
+/// holds this id by the time bytes finish arriving, a newer clipboard event
+/// has superseded this one — we still drain the stream to keep QUIC happy
+/// but skip writing to the OS clipboard.
+async fn handle_incoming_clipboard_blob_stream(
+    mut reader: BufReader<quinn::RecvStream>,
+    header: crate::protocol::FileStreamHeader,
+    mime_type: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    addr: std::net::SocketAddr,
+    state: AppState,
+    app: tauri::AppHandle,
+) {
+    tracing::info!(
+        "Receiving Clipboard Blob: mime={}, {} bytes, id={}, from={}",
+        mime_type, header.file_size, header.id, addr
+    );
+
+    // Verify Auth Token — same shape as the file stream path.
+    let mut session_key = [0u8; 32];
+    {
+        let ck_lock = state.cluster_key.lock().unwrap();
+        if let Some(key) = ck_lock.as_ref() {
+            if key.len() == 32 {
+                session_key.copy_from_slice(key);
+            } else {
+                tracing::error!("Cluster Key invalid length!");
+                return;
+            }
+        } else {
+            tracing::error!("Cluster Key missing!");
+            return;
+        }
+    }
+    match BASE64.decode(&header.auth_token) {
+        Ok(token_cipher) => match crypto::decrypt(&session_key, &token_cipher) {
+            Ok(plaintext) if plaintext.len() == 8 => {}
+            Ok(_) => {
+                tracing::error!("Invalid clipboard-blob auth token length");
+                return;
+            }
+            Err(e) => {
+                tracing::error!("Clipboard-blob auth token decryption failed: {}", e);
+                return;
+            }
+        },
+        Err(e) => {
+            tracing::error!("Invalid clipboard-blob auth token base64: {}", e);
+            return;
+        }
+    }
+
+    // Drain the stream into memory. Cap defensively at MAX_CLIPBOARD_IMAGE_BYTES
+    // so a malformed sender can't OOM the receiver.
+    let cap = clipboard::common::MAX_CLIPBOARD_IMAGE_BYTES;
+    let mut accum: Vec<u8> = Vec::with_capacity(header.file_size.min(cap as u64) as usize);
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut last_emit = std::time::Instant::now();
+    let start_time = std::time::Instant::now();
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if accum.len() + n > cap {
+                    tracing::error!(
+                        "Clipboard-blob stream exceeds {} byte cap (got {}); dropping.",
+                        cap,
+                        accum.len() + n
+                    );
+                    // Drain remainder of stream to keep QUIC happy, but stop accumulating.
+                    let mut sink = vec![0u8; 1024 * 1024];
+                    while let Ok(n2) = reader.read(&mut sink).await {
+                        if n2 == 0 { break; }
+                    }
+                    return;
+                }
+                accum.extend_from_slice(&buf[..n]);
+                if last_emit.elapsed().as_millis() > 200 {
+                    let _ = app.emit("file-progress", serde_json::json!({
+                        "id": header.id,
+                        "fileName": format!("Clipboard image ({})", mime_type),
+                        "total": header.file_size,
+                        "transferred": accum.len() as u64,
+                    }));
+                    last_emit = std::time::Instant::now();
+                }
+            }
+            Err(e) => {
+                tracing::error!("Clipboard-blob stream read error: {}", e);
+                return;
+            }
+        }
+    }
+    let total_time = start_time.elapsed();
+    tracing::info!(
+        "Clipboard-blob stream complete: {} bytes in {:?} (mime={})",
+        accum.len(),
+        total_time,
+        mime_type
+    );
+
+    if accum.len() as u64 != header.file_size {
+        tracing::warn!(
+            "Clipboard-blob size mismatch: header says {} bytes, got {} bytes — dropping.",
+            header.file_size,
+            accum.len()
+        );
+        return;
+    }
+
+    // Race protection: only land on clipboard if this id is still the in-flight one.
+    let still_current = {
+        let mut slot = state.in_flight_clipboard_fetch.lock().unwrap();
+        match slot.as_ref() {
+            Some(s) if *s == header.id => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
+    };
+    if !still_current {
+        tracing::info!(
+            "[ClipboardBlob] Discarding fetched bytes for id={} — superseded by a newer clipboard event",
+            header.id
+        );
+        return;
+    }
+
+    // Reconstruct a ClipboardBlob and drive it onto the OS clipboard via the
+    // same `set_clipboard_image` that the inline path uses.
+    let blob = crate::protocol::ClipboardBlob::from_bytes(
+        mime_type.clone(),
+        &accum,
+        width,
+        height,
+    );
+
+    let auto_recv = { state.settings.lock().unwrap().auto_receive };
+    if auto_recv {
+        clipboard::set_clipboard_image(&app, blob.clone());
+    } else {
+        // Manual mode — stash the now-fully-fetched blob in pending_clipboard
+        // so the user can confirm via the existing UI.
+        let payload = crate::protocol::ClipboardPayload {
+            id: header.id.clone(),
+            text: String::new(),
+            files: None,
+            blob: Some(blob.clone()),
+            formats: None,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            sender: format!("{}", addr),
+            sender_id: String::new(),
+        };
+        let mut pending = state.pending_clipboard.lock().unwrap();
+        *pending = Some(payload);
+    }
+
+    // Surface to the history view as a normal clipboard-change event (so
+    // the entry shows up in history with a thumbnail / size).
+    let payload_event = crate::protocol::ClipboardPayload {
+        id: header.id.clone(),
+        text: String::new(),
+        files: None,
+        blob: Some(blob),
+        formats: None,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        sender: format!("{}", addr),
+        sender_id: String::new(),
+    };
+    let _ = app.emit("clipboard-change", &payload_event);
+
+    let notifications = state.settings.lock().unwrap().notifications.clone();
+    if notifications.data_received {
+        let mb = accum.len() as f64 / (1024.0 * 1024.0);
+        send_notification(
+            &app,
+            "Image Available to Paste",
+            &format!("{:.1} MB image is now on the clipboard.", mb),
+            false,
+            Some(3),
+            "history",
+            NotificationPayload::None,
+        );
+    }
+}
+
 async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::SocketAddr, state: AppState, app: tauri::AppHandle) {
     tracing::info!("Starting File Stream Handler for {}", addr);
-    
+
     let mut reader = BufReader::new(recv);
     let mut header_line = String::new();
-    
+
     // 1. Read Header (JSON + Newline)
     if let Err(e) = reader.read_line(&mut header_line).await {
         tracing::error!("Failed to read file stream header from {}: {}", addr, e);
         return;
     }
-    
+
     let header: crate::protocol::FileStreamHeader = match serde_json::from_str(&header_line) {
         Ok(h) => h,
         Err(e) => {
@@ -2784,9 +3108,18 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
             return;
         }
     };
-    
+
+    // §3.3 routing: clipboard-blob streams accumulate bytes in memory and
+    // land on the OS clipboard. File streams keep the existing temp-download
+    // path. The two share auth-token verification and the QUIC drain dance,
+    // but everything past the header is structurally different.
+    if let crate::protocol::DeliveryTarget::Clipboard { mime_type, width, height } = header.delivery_target.clone() {
+        handle_incoming_clipboard_blob_stream(reader, header, mime_type, width, height, addr, state, app).await;
+        return;
+    }
+
     tracing::info!("Receiving File: {} ({} bytes) [ID: {}]", header.file_name, header.file_size, header.id);
-    
+
     // 2. Prepare Output File
     // Use Cache Directory -> temp_downloads
     let root_cache_dir = match app.path().app_cache_dir() {
@@ -3022,6 +3355,8 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                             sender: "Unknown (Legacy)".to_string(),
                                             sender_id: "unknown".to_string(),
                                             files: None,
+                                            blob: None,
+                                            formats: None,
                                         }
                                     )
                             } else {
@@ -3055,21 +3390,12 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 }
                             }
 
-                            // Loop/Dedupe Check
-                            let content_signature = if let Some(files) = &payload.files {
-                                if !files.is_empty() {
-                                    let mut sig = String::from("FILES:");
-                                    for f in files {
-                                        use std::fmt::Write;
-                                        let _ = write!(sig, "{}:{};", f.name, f.size);
-                                    }
-                                    sig
-                                } else {
-                                    text.clone()
-                                }
-                            } else {
-                                text.clone()
-                            };
+                            // Loop/Dedupe Check — must match the sender-side
+                            // signature in clipboard::common::payload_signature
+                            // so a blob received from a peer correctly suppresses
+                            // an immediate re-broadcast back to the cluster.
+                            let content_signature =
+                                crate::clipboard::common::payload_signature(&payload);
 
                             {
                                 let mut last = listener_state.last_clipboard_content.lock().unwrap();
@@ -3109,6 +3435,8 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 id: id.clone(),
                                 text: text.clone(),
                                 files: payload.files.clone(),
+                                blob: payload.blob.clone(),
+                                formats: payload.formats.clone(),
                                 timestamp: ts,
                                 sender: sender.clone(),
                                 sender_id: payload.sender_id.clone(),
@@ -3179,8 +3507,239 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 } // End if !files.is_empty()
                             } // End if let Some(files)
 
-                            // TEXT HANDLING
-                            if !text.is_empty() {
+                            // BLOB HANDLING (image clipboard data)
+                            // Race protection: any fresh clipboard event from
+                            // a peer supersedes an older in-flight clipboard-
+                            // blob fetch. Cleared here unconditionally; the
+                            // descriptor-fetch branch below overwrites with
+                            // its own id immediately. Bytes from the older
+                            // fetch still drain off the wire (so QUIC stays
+                            // happy) but are discarded by the file-stream
+                            // listener's id check.
+                            {
+                                let mut slot = listener_state.in_flight_clipboard_fetch.lock().unwrap();
+                                *slot = None;
+                            }
+                            if let Some(blob) = payload_obj.blob.clone() {
+                                if blob.is_descriptor() {
+                                    // §3.3 large-blob descriptor path. Bytes
+                                    // ride the `clustercut-file` ALPN, not
+                                    // inline. Decide auto-fetch vs. user-
+                                    // confirm based on `max_auto_download_size`.
+                                    let total_size = blob.total_size.unwrap_or(0);
+                                    let mb = total_size as f64 / (1024.0 * 1024.0);
+                                    let (auto_recv, enable_ft, size_limit) = {
+                                        let s = listener_state.settings.lock().unwrap();
+                                        (s.auto_receive, s.enable_file_transfer, s.max_auto_download_size)
+                                    };
+                                    tracing::info!(
+                                        "Received clipboard image descriptor from {}: mime={}, total={} bytes{} fetch_id={}",
+                                        sender,
+                                        blob.mime_type,
+                                        total_size,
+                                        match (blob.width, blob.height) {
+                                            (Some(w), Some(h)) => format!(", {}x{},", w, h),
+                                            _ => String::new(),
+                                        },
+                                        blob.fetch_id.as_deref().unwrap_or("?")
+                                    );
+
+                                    if !enable_ft {
+                                        tracing::info!("File transfer disabled in settings. Ignoring large clipboard descriptor.");
+                                    } else if !auto_recv {
+                                        // Manual mode — stash for confirm-via-UI.
+                                        tracing::info!("[Clipboard] Auto-receive OFF. Storing pending clipboard descriptor from {}", sender);
+                                        {
+                                            let mut pending = listener_state.pending_clipboard.lock().unwrap();
+                                            *pending = Some(payload_obj.clone());
+                                        }
+                                        let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+
+                                        // Notification is the primary cue that an
+                                        // accept is waiting — gate on
+                                        // `notify_large_files` (defaults true) so
+                                        // it fires even when `data_received` is
+                                        // off, mirroring the file-transfer accept
+                                        // notification.
+                                        let notify_large = listener_state.settings.lock().unwrap().notify_large_files;
+                                        if notify_large {
+                                            send_notification(
+                                                &listener_handle,
+                                                "Large Clipboard Image",
+                                                &format!("{:.1} MB image from {} — accept to receive.", mb, sender),
+                                                true,
+                                                Some(3),
+                                                "history",
+                                                NotificationPayload::None,
+                                            );
+                                        }
+                                    } else if total_size > size_limit {
+                                        // Tier B2 — over auto-download threshold. Stash and notify with Accept.
+                                        tracing::info!(
+                                            "[ClipboardBlob] Descriptor {} bytes exceeds auto-download limit {} bytes — awaiting accept",
+                                            total_size,
+                                            size_limit
+                                        );
+                                        {
+                                            let mut pending = listener_state.pending_clipboard.lock().unwrap();
+                                            *pending = Some(payload_obj.clone());
+                                        }
+                                        let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+
+                                        let notify_large = listener_state.settings.lock().unwrap().notify_large_files;
+                                        if notify_large {
+                                            send_notification(
+                                                &listener_handle,
+                                                "Large Clipboard Image",
+                                                &format!("{:.1} MB image from {} — accept to receive.", mb, sender),
+                                                true,
+                                                Some(3),
+                                                "history",
+                                                NotificationPayload::None,
+                                            );
+                                        }
+                                    } else {
+                                        // Tier B1 — auto-fetch via file-transfer ALPN.
+                                        tracing::info!(
+                                            "[ClipboardBlob] Auto-fetching descriptor ({} bytes, mime={})",
+                                            total_size,
+                                            blob.mime_type
+                                        );
+                                        // Race protection: mark this fetch as the in-flight one.
+                                        // A newer event arriving mid-stream will overwrite the slot
+                                        // and the older payload's bytes will still drain off the
+                                        // wire but won't land on the OS clipboard.
+                                        {
+                                            let mut slot = listener_state.in_flight_clipboard_fetch.lock().unwrap();
+                                            *slot = Some(id.clone());
+                                        }
+
+                                        let _ = listener_handle.emit("clipboard-blob-fetching", &payload_obj);
+
+                                        let notifications = listener_state.settings.lock().unwrap().notifications.clone();
+                                        if notifications.data_received {
+                                            send_notification(
+                                                &listener_handle,
+                                                "Receiving Clipboard Image",
+                                                &format!("Receiving {:.1} MB image from {}…", mb, sender),
+                                                false,
+                                                Some(2),
+                                                "history",
+                                                NotificationPayload::None,
+                                            );
+                                        }
+
+                                        let req_payload = crate::protocol::FileRequestPayload {
+                                            id: id.clone(),
+                                            file_index: 0,
+                                            offset: 0,
+                                        };
+                                        if let Ok(req_json) = serde_json::to_vec(&req_payload) {
+                                            if let Ok(req_cipher) = crypto::encrypt(&key_arr, &req_json) {
+                                                let msg = Message::FileRequest(req_cipher);
+                                                if let Ok(data) = serde_json::to_vec(&msg) {
+                                                    let transport_clone = transport_inside.clone();
+                                                    let sender_addr = addr;
+                                                    tauri::async_runtime::spawn(async move {
+                                                        if let Err(e) = transport_clone.send_message(sender_addr, &data).await {
+                                                            tracing::error!("Failed to send clipboard FileRequest to {}: {}", sender_addr, e);
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let blob_size = blob.decoded_len();
+                                    tracing::info!(
+                                        "Received clipboard image from {}: mime={}, decoded={} bytes{}",
+                                        sender,
+                                        blob.mime_type,
+                                        blob_size,
+                                        match (blob.width, blob.height) {
+                                            (Some(w), Some(h)) => format!(", {}x{}", w, h),
+                                            _ => String::new(),
+                                        }
+                                    );
+                                    let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
+                                    if auto_receiver {
+                                        clipboard::set_clipboard_image(&listener_handle, blob);
+                                        let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                    } else {
+                                        tracing::info!("[Clipboard] Auto-receive OFF. Storing pending blob from {}", sender);
+                                        {
+                                            let mut pending = listener_state.pending_clipboard.lock().unwrap();
+                                            *pending = Some(payload_obj.clone());
+                                        }
+                                        let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                    }
+
+                                    let notifications = listener_state.settings.lock().unwrap().notifications.clone();
+                                    if notifications.data_received {
+                                        // Large blobs (§3.3 v1) get a more specific
+                                        // notification with the size, so users know
+                                        // the (potentially many MB) image is now
+                                        // available to paste even if there was a
+                                        // perceptible transfer delay.
+                                        if blob_size > clipboard::common::LARGE_CLIPBOARD_BLOB_NOTIFY_THRESHOLD {
+                                            let mb = blob_size as f64 / (1024.0 * 1024.0);
+                                            send_notification(
+                                                &listener_handle,
+                                                "Large Image Received",
+                                                &format!("{:.1} MB image from {} is now on the clipboard.", mb, sender),
+                                                false,
+                                                Some(3),
+                                                "history",
+                                                NotificationPayload::None,
+                                            );
+                                        } else {
+                                            send_notification(&listener_handle, "Image Received", "Image copied to clipboard", false, Some(2), "history", NotificationPayload::None);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // RICH HANDLING (text + alternate formats like text/html, text/rtf).
+                            // Takes precedence over plain TEXT HANDLING so destination apps see
+                            // the multi-MIME buffet the source had. Backends that can't yet write
+                            // multi-format fall back to plain text inside set_clipboard_rich.
+                            let rich_formats = payload_obj
+                                .formats
+                                .as_ref()
+                                .filter(|fs| !fs.is_empty())
+                                .cloned();
+
+                            if let Some(formats) = rich_formats {
+                                tracing::info!(
+                                    "Received clipboard rich from {}: text={} chars, formats=[{}]",
+                                    sender,
+                                    text.len(),
+                                    formats.iter().map(|f| f.mime_type.as_str()).collect::<Vec<_>>().join(", ")
+                                );
+                                let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
+                                if auto_receiver {
+                                    clipboard::set_clipboard_rich(&listener_handle, text.clone(), formats);
+                                    let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                } else {
+                                    tracing::info!("[Clipboard] Auto-receive OFF. Storing pending rich clipboard from {}", sender);
+                                    {
+                                        let mut pending = listener_state.pending_clipboard.lock().unwrap();
+                                        *pending = Some(payload_obj.clone());
+                                    }
+                                    let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                }
+
+                                let notifications = listener_state.settings.lock().unwrap().notifications.clone();
+                                if notifications.data_received {
+                                    send_notification(&listener_handle, "Clipboard Received", "Formatted content copied to clipboard", false, Some(2), "history", NotificationPayload::None);
+                                }
+                            } else if !text.is_empty() {
+                                // TEXT HANDLING — plain text only, no rich formats present.
+                                tracing::info!(
+                                    "Received clipboard text from {}: {} chars",
+                                    sender,
+                                    text.len()
+                                );
                                 let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
                                 if auto_receiver {
                                     clipboard::set_clipboard(&listener_handle, text.clone());
@@ -3194,7 +3753,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                     }
                                     let _ = listener_handle.emit("clipboard-pending", &payload_obj);
                                 }
-                                
+
                                 let notifications = listener_state.settings.lock().unwrap().notifications.clone();
                                 if notifications.data_received {
                                     send_notification(&listener_handle, "Clipboard Received", "Content copied to clipboard", false, Some(2), "history", NotificationPayload::None);
@@ -3709,8 +4268,120 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                          Ok(plaintext) => {
                              if let Ok(req) = serde_json::from_slice::<crate::protocol::FileRequestPayload>(&plaintext) {
                                  tracing::info!("Processing File Request: ID={}, Index={}", req.id, req.file_index);
-                                 
-                                 // 2. Find File Path
+
+                                 // 2a. Clipboard-blob serve (§3.3): if `req.id`
+                                 // matches a registered large clipboard blob,
+                                 // serve it with `delivery_target = Clipboard{…}`
+                                 // so the receiver lands the bytes on its OS
+                                 // clipboard. The temp file lives in
+                                 // `temp_downloads/<id>.<ext>` (cleaned by the
+                                 // existing startup `clear_cache`).
+                                 let clipboard_blob_meta = {
+                                     let map = listener_state.local_clipboard_blobs.lock().unwrap();
+                                     map.get(&req.id).cloned()
+                                 };
+
+                                 if let Some(meta) = clipboard_blob_meta {
+                                      let file_path = meta.path.clone();
+                                      let mime_type = meta.mime_type.clone();
+                                      let width = meta.width;
+                                      let height = meta.height;
+                                      let req_id = req.id.clone();
+                                      let req_file_index = req.file_index;
+                                      tauri::async_runtime::spawn(async move {
+                                          let mut file = match File::open(&file_path).await {
+                                              Ok(f) => f,
+                                              Err(e) => {
+                                                  tracing::error!(
+                                                      "Failed to open clipboard-blob temp file {:?}: {}",
+                                                      file_path, e
+                                                  );
+                                                  return;
+                                              }
+                                          };
+                                          let file_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                                          let file_name = file_path
+                                              .file_name()
+                                              .unwrap_or_default()
+                                              .to_string_lossy()
+                                              .to_string();
+                                          tracing::info!(
+                                              "Opening QUIC Stream to {} for clipboard-blob '{}' ({} bytes, mime={})",
+                                              addr, file_name, file_size, mime_type
+                                          );
+                                          match transport_inside.send_file_stream(addr).await {
+                                              Ok((_connection, mut stream)) => {
+                                                  let timestamp = std::time::SystemTime::now()
+                                                      .duration_since(std::time::UNIX_EPOCH)
+                                                      .unwrap_or_default()
+                                                      .as_secs();
+                                                  let auth_payload = timestamp.to_le_bytes();
+                                                  let auth_token = match crypto::encrypt(&key_arr, &auth_payload) {
+                                                      Ok(c) => BASE64.encode(c),
+                                                      Err(e) => {
+                                                          tracing::error!("Failed to generate auth token: {}", e);
+                                                          return;
+                                                      }
+                                                  };
+                                                  let header = crate::protocol::FileStreamHeader {
+                                                      id: req_id,
+                                                      file_index: req_file_index,
+                                                      file_name,
+                                                      file_size,
+                                                      auth_token,
+                                                      compressed: false, // never compress already-compressed image bytes
+                                                      delivery_target: crate::protocol::DeliveryTarget::Clipboard {
+                                                          mime_type,
+                                                          width,
+                                                          height,
+                                                      },
+                                                  };
+                                                  if let Ok(h_json) = serde_json::to_string(&header) {
+                                                      if let Err(e) = stream.write_all(h_json.as_bytes()).await {
+                                                          tracing::error!("Header Write Error: {}", e);
+                                                          return;
+                                                      }
+                                                      if let Err(e) = stream.write_all(b"\n").await {
+                                                          tracing::error!("Header Newline Error: {}", e);
+                                                          return;
+                                                      }
+                                                  }
+                                                  let mut buf = vec![0u8; 1024 * 1024];
+                                                  let start_time = std::time::Instant::now();
+                                                  let mut chunks_sent = 0;
+                                                  loop {
+                                                      match file.read(&mut buf).await {
+                                                          Ok(0) => break,
+                                                          Ok(n) => {
+                                                              if let Err(e) = stream.write_all(&buf[0..n]).await {
+                                                                  tracing::error!("Clipboard-blob stream write error: {}", e);
+                                                                  break;
+                                                              }
+                                                              chunks_sent += 1;
+                                                          }
+                                                          Err(e) => { tracing::error!("Clipboard-blob file read error: {}", e); break; }
+                                                      }
+                                                  }
+                                                  let total_time = start_time.elapsed();
+                                                  tracing::info!(
+                                                      "[Sender] Clipboard-blob stream finished in {:?}. Chunks: {}",
+                                                      total_time, chunks_sent
+                                                  );
+                                                  let _ = stream.finish();
+                                                  drop(stream);
+                                                  let _ = tokio::time::timeout(
+                                                      std::time::Duration::from_secs(300),
+                                                      _connection.closed(),
+                                                  ).await;
+                                                  tracing::info!("Clipboard-blob sent successfully: {:?}", file_path);
+                                              }
+                                              Err(e) => tracing::error!("Failed to open clipboard-blob stream: {}", e),
+                                          }
+                                      });
+                                      return;
+                                 }
+
+                                 // 2b. Find File Path (existing files path)
                                  let path = {
                                      let map = listener_state.local_files.lock().unwrap();
                                      if let Some(paths) = map.get(&req.id) {
@@ -3719,7 +4390,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                          } else { None }
                                      } else { None }
                                  };
-                                 
+
                                  if let Some(p_str) = path {
                                       let file_path = PathBuf::from(p_str.clone());
                                       let compress_enabled = listener_state.settings.lock().unwrap().compress_file_transfers;
@@ -3764,6 +4435,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                        file_size,
                                                        auth_token,
                                                        compressed,
+                                                       delivery_target: crate::protocol::DeliveryTarget::Disk,
                                                    };
 
                                                    if let Ok(h_json) = serde_json::to_string(&header) {
@@ -4020,6 +4692,8 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
                                 sender: hostname,
                                 sender_id: local_id,
                                 files: None,
+                                blob: None,
+                                formats: None,
                             };
                         
                         // Emit local event
@@ -4070,11 +4744,38 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
            if parsed == *shortcut {
                 tracing::info!("Global Receive Shortcut Triggered!");
                 // Manual Receive Logic
-                let mut guard = state.pending_clipboard.lock().unwrap();
-                if let Some(payload) = guard.take() { // take() removes it from pending
-                    // Apply to System Clipboard
-                    // Using clipboard plugin
-                    if let Err(e) = clipboard::write_text_direct(app_handle, payload.text) {
+                let payload_opt = {
+                    let mut guard = state.pending_clipboard.lock().unwrap();
+                    guard.take()
+                };
+                if let Some(payload) = payload_opt {
+                    // §3.3 descriptor: trigger an async fetch instead of
+                    // pushing empty bytes onto the OS clipboard.
+                    let is_descriptor = payload
+                        .blob
+                        .as_ref()
+                        .map(|b| b.is_descriptor())
+                        .unwrap_or(false);
+                    if is_descriptor {
+                        let app = app_handle.clone();
+                        let state_clone = (*state).clone();
+                        let id = payload.id.clone();
+                        let peer_id = payload.sender_id.clone();
+                        {
+                            let mut slot = state_clone.in_flight_clipboard_fetch.lock().unwrap();
+                            *slot = Some(id.clone());
+                        }
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = request_clipboard_blob_internal(&state_clone, id, peer_id).await {
+                                tracing::error!("Failed to fetch clipboard blob via shortcut: {}", e);
+                            }
+                        });
+                        send_notification(&app, "Receiving Clipboard Image", "Fetching pending image…", false, Some(2), "history", NotificationPayload::None);
+                    } else if let Some(blob) = payload.blob.clone() {
+                        clipboard::set_clipboard_image(app_handle, blob);
+                        tracing::info!("Confirmed pending clipboard image via shortcut.");
+                        send_notification(app_handle, "Image Received", "Pending image applied.", false, Some(2), "history", NotificationPayload::None);
+                    } else if let Err(e) = clipboard::write_text_direct(app_handle, payload.text) {
                         tracing::error!("Failed to write pending clipboard to system: {}", e);
                     } else {
                         tracing::info!("Confirmed pending clipboard content via shortcut.");

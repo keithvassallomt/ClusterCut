@@ -50,6 +50,33 @@ type NearbyNetwork = {
   devices: { id: string; hostname?: string; status: "online" | "offline" }[];
 };
 
+type ClipboardBlobPreview = {
+  mime_type: string;
+  width?: number;
+  height?: number;
+  size: number;        // byte length, for "12 KB" display
+  // Set on inline blobs that we decoded ourselves; absent for §3.3 descriptor
+  // blobs whose bytes haven't been fetched yet (no thumbnail to show until the
+  // user accepts and the file-transfer ALPN delivers the bytes).
+  object_url?: string;
+  // §3.3 descriptor — when true, `size` is the *total* expected size and
+  // `object_url` is undefined. The user must accept (via the sync modal) to
+  // trigger the file-transfer fetch; bytes then land on the OS clipboard
+  // directly without a UI thumbnail.
+  descriptor?: boolean;
+};
+
+// Lightweight summary of an alternate clipboard format (text/html, text/rtf, …)
+// used purely for the history badge. We deliberately don't carry the actual
+// bytes through the React state — they ride on the underlying ClipboardPayload
+// and get re-stocked on the OS clipboard by the backend; the UI just signals
+// to the user that the item has rich formatting available.
+type ClipboardFormatPreview = {
+  mime_type: string;
+  binary: boolean;
+  size: number; // length of the wire `data` string (base64 if binary, UTF-8 otherwise)
+};
+
 type HistoryItem = {
   id: string;
   origin: "local" | "remote";
@@ -57,8 +84,87 @@ type HistoryItem = {
   ts: number; // Unix timestamp in seconds
   text: string;
   files?: { name: string; size: number; }[];
+  blob?: ClipboardBlobPreview;
+  formats?: ClipboardFormatPreview[];
   sender_id?: string;
 };
+
+// The backend ships ClipboardBlob.data as a base64 string (chosen over the
+// default Vec<u8>→JSON-int-array encoding to keep wire size manageable —
+// see protocol.rs). Decode once at receive time and stash an object URL so
+// the thumbnail can render straight from memory. Caller is responsible for
+// revoking the URL when the item is dropped.
+function blobFromPayload(payloadBlob: any): ClipboardBlobPreview | undefined {
+  if (!payloadBlob) return undefined;
+
+  // §3.3 descriptor — bytes ride the file-transfer ALPN, not inline. Surface
+  // a preview without thumbnail so the pending UI / history list can render
+  // "Large image (X.Y MB) — accept to receive". User accept triggers the fetch
+  // through `confirm_pending_clipboard`, which the backend routes to a
+  // `Message::FileRequest`.
+  if (typeof payloadBlob.fetch_id === "string" && payloadBlob.fetch_id.length > 0) {
+    return {
+      mime_type: payloadBlob.mime_type || "image/png",
+      width: typeof payloadBlob.width === "number" ? payloadBlob.width : undefined,
+      height: typeof payloadBlob.height === "number" ? payloadBlob.height : undefined,
+      size: typeof payloadBlob.total_size === "number" ? payloadBlob.total_size : 0,
+      descriptor: true,
+    };
+  }
+
+  if (typeof payloadBlob.data !== "string" || payloadBlob.data.length === 0) {
+    return undefined;
+  }
+  let bytes: Uint8Array;
+  try {
+    const binString = atob(payloadBlob.data);
+    bytes = Uint8Array.from(binString, c => c.charCodeAt(0));
+  } catch (e) {
+    console.warn("Failed to decode clipboard blob base64:", e);
+    return undefined;
+  }
+  if (bytes.length === 0) return undefined;
+  const url = URL.createObjectURL(new Blob([bytes], { type: payloadBlob.mime_type || "image/png" }));
+  return {
+    mime_type: payloadBlob.mime_type || "image/png",
+    width: typeof payloadBlob.width === "number" ? payloadBlob.width : undefined,
+    height: typeof payloadBlob.height === "number" ? payloadBlob.height : undefined,
+    size: bytes.length,
+    object_url: url,
+  };
+}
+
+// Build the lightweight format summary used by the history "Rich text" badge.
+// We don't decode or render the format bytes in the WebView — that would need
+// HTML sanitization (no DOMPurify in deps) and runs counter to the strict CSP
+// added in the security pass. The bytes stay on the underlying ClipboardPayload
+// and get re-stocked onto the OS clipboard by the backend; the UI just
+// surfaces "this item carries formatted content" to the user.
+function formatsFromPayload(payloadFormats: any): ClipboardFormatPreview[] | undefined {
+  if (!Array.isArray(payloadFormats) || payloadFormats.length === 0) return undefined;
+  const list: ClipboardFormatPreview[] = [];
+  for (const f of payloadFormats) {
+    if (!f || typeof f.mime_type !== "string" || typeof f.data !== "string") continue;
+    list.push({
+      mime_type: f.mime_type,
+      binary: !!f.binary,
+      size: f.data.length,
+    });
+  }
+  return list.length > 0 ? list : undefined;
+}
+
+// Short label per MIME for the badge — falls back to the raw MIME for anything
+// not in the curated list. New rich-text formats added in future would just
+// show their MIME until added here.
+function shortRichLabel(mime: string): string {
+  switch (mime) {
+    case "text/html": return "HTML";
+    case "text/rtf": return "RTF";
+    case "image/svg+xml": return "SVG";
+    default: return mime;
+  }
+}
 
 // Simple Time Ago Helper
 function timeAgo(ts: number): string {
@@ -356,7 +462,7 @@ export default function App() {
   // Manual Sync State
   // Manual Sync State
   const [manualSyncOpen, setManualSyncOpen] = useState(false);
-  const [pendingReceive, setPendingReceive] = useState<{ text: string, sender: string, timestamp: number } | null>(null);
+  const [pendingReceive, setPendingReceive] = useState<{ text: string, sender: string, timestamp: number, blob?: ClipboardBlobPreview, formats?: ClipboardFormatPreview[] } | null>(null);
   const [localClipboard, setLocalClipboard] = useState(""); // Current local
   const [lastSentClipboard, setLastSentClipboard] = useState(""); // Last successfully sent
   const [lastReceivedClipboard, setLastReceivedClipboard] = useState(""); // Last received from cluster
@@ -373,8 +479,12 @@ export default function App() {
     && localClipboard.length > 0;
 
   // Rule 3: If pending receive matches local (already have it or I sent it), not a candidate.
+  // Image-only payloads have empty text; treat them as pending if a blob is present.
   const hasPendingReceive = !!pendingReceive
-    && pendingReceive.text !== localClipboard;
+    && (
+      (pendingReceive.text !== "" && pendingReceive.text !== localClipboard)
+      || !!pendingReceive.blob
+    );
 
   const toggleNetwork = (name: string) => {
     setExpandedNetworks(prev => {
@@ -672,7 +782,9 @@ export default function App() {
         sender_id: p.sender_id,
         ts: p.timestamp,
         text: p.text || "",
-        files: p.files
+        files: p.files,
+        blob: blobFromPayload(p.blob),
+        formats: formatsFromPayload(p.formats),
       };
 
       // Update Local State but NOT 'lastSentClipboard'
@@ -698,7 +810,9 @@ export default function App() {
         sender_id: p.sender_id,
         ts: p.timestamp,
         text: p.text || "",
-        files: p.files
+        files: p.files,
+        blob: blobFromPayload(p.blob),
+        formats: formatsFromPayload(p.formats),
       };
 
       // Update Local Clipboard State
@@ -717,21 +831,43 @@ export default function App() {
 
       // Update History
       setClipboardHistory((prev) => {
-        // Dedupe by ID
-        if (prev.find(i => i.id === newItem.id)) return prev;
-        return [newItem, ...prev].slice(0, 50);
+        // Dedupe by ID — discard the freshly-allocated blob URL to avoid leak.
+        if (prev.find(i => i.id === newItem.id)) {
+          if (newItem.blob?.object_url) URL.revokeObjectURL(newItem.blob.object_url);
+          return prev;
+        }
+        const next = [newItem, ...prev];
+        if (next.length > 50) {
+          next.slice(50).forEach(item => {
+            if (item.blob?.object_url) URL.revokeObjectURL(item.blob.object_url);
+          });
+        }
+        return next.slice(0, 50);
       });
     });
 
-    const unlistenPending = listen<{ id: string, text: string, timestamp: number, sender: string }>("clipboard-pending", (event) => {
-      setPendingReceive(event.payload);
-      // Maybe open modal automatically? Or just show FAB?
-      // User requested FAB.
+    const unlistenPending = listen<any>("clipboard-pending", (event) => {
+      const p = event.payload;
+      // Replacing an existing pending entry — revoke its blob URL first if any.
+      setPendingReceive(prev => {
+        if (prev?.blob?.object_url) URL.revokeObjectURL(prev.blob.object_url);
+        return {
+          text: p.text || "",
+          sender: p.sender,
+          timestamp: p.timestamp,
+          blob: blobFromPayload(p.blob),
+          formats: formatsFromPayload(p.formats),
+        };
+      });
     });
 
     const unlistenDelete = listen<string>("history-delete", (event) => {
       const idToDelete = event.payload;
-      setClipboardHistory((prev) => prev.filter(i => i.id !== idToDelete));
+      setClipboardHistory((prev) => {
+        const dropped = prev.find(i => i.id === idToDelete);
+        if (dropped?.blob?.object_url) URL.revokeObjectURL(dropped.blob.object_url);
+        return prev.filter(i => i.id !== idToDelete);
+      });
     });
 
     const unlistenRemove = listen<string>("peer-remove", (event) => {
@@ -1685,8 +1821,37 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
                         )}
                       </Badge>
                       <span className="text-xs text-zinc-500 dark:text-zinc-400">{timeAgo(it.ts)}</span>
+                      {it.formats && it.formats.length > 0 && (
+                        <span
+                          className="inline-flex items-center rounded-md bg-violet-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-700 dark:bg-violet-500/15 dark:text-violet-200"
+                          title={`Rich formats: ${it.formats.map(f => f.mime_type).join(", ")}`}
+                        >
+                          Rich · {it.formats.map(f => shortRichLabel(f.mime_type)).join(", ")}
+                        </span>
+                      )}
                     </div>
                     {it.text && <div className="mt-2 line-clamp-3 whitespace-pre-wrap text-sm text-zinc-900 dark:text-zinc-50">{it.text}</div>}
+
+                    {it.blob && (
+                      <div className="mt-2 flex flex-col gap-1 rounded-lg bg-zinc-50 p-2 dark:bg-zinc-800">
+                        {it.blob.object_url ? (
+                          <img
+                            src={it.blob.object_url}
+                            alt="Clipboard image"
+                            className="max-h-48 max-w-full rounded-md object-contain"
+                          />
+                        ) : (
+                          <div className="flex h-24 w-full items-center justify-center rounded-md bg-zinc-200 text-3xl text-zinc-500 dark:bg-zinc-700">
+                            🖼️
+                          </div>
+                        )}
+                        <div className="text-[11px] text-zinc-500">
+                          {it.blob.descriptor ? "Large image (not yet fetched)" : "Image"}
+                          {it.blob.width && it.blob.height ? ` • ${it.blob.width}×${it.blob.height}` : ""}
+                          {` • ${formatBytes(it.blob.size)}`}
+                        </div>
+                      </div>
+                    )}
 
                     {it.files && it.files.length > 0 && (
                       <div className="mt-2 space-y-1">
@@ -2356,7 +2521,7 @@ function ManualSyncModal({
   open: boolean;
   onClose: () => void;
   localContent: string;
-  remoteContent: { text: string, sender: string, timestamp: number } | null;
+  remoteContent: { text: string, sender: string, timestamp: number, blob?: ClipboardBlobPreview, formats?: ClipboardFormatPreview[] } | null;
   onSend: () => void;
   onReceive: () => void;
 }) {
@@ -2396,7 +2561,40 @@ function ManualSyncModal({
             <div className="flex-1 rounded-xl bg-white/5 p-4 text-sm font-mono text-zinc-300 h-32 overflow-y-auto whitespace-pre-wrap border border-white/5 relative">
               {remoteContent ? (
                 <>
-                  {remoteContent.text}
+                  {remoteContent.blob ? (
+                    <div className="flex items-start gap-3 font-sans">
+                      {remoteContent.blob.object_url ? (
+                        <img
+                          src={remoteContent.blob.object_url}
+                          alt="Pending image"
+                          className="max-h-24 max-w-[40%] rounded object-contain"
+                        />
+                      ) : (
+                        <div className="flex h-24 w-24 items-center justify-center rounded bg-white/5 text-2xl text-zinc-500">
+                          🖼️
+                        </div>
+                      )}
+                      <div className="text-xs text-zinc-300">
+                        {remoteContent.blob.descriptor ? "Large image (not yet fetched)" : "Image"}
+                        {remoteContent.blob.width && remoteContent.blob.height
+                          ? ` (${remoteContent.blob.width}×${remoteContent.blob.height})`
+                          : ""}
+                        <div className="text-zinc-500">{formatBytes(remoteContent.blob.size)}</div>
+                        {remoteContent.blob.descriptor && (
+                          <div className="mt-1 text-amber-400">Click "Apply to Clipboard" to download.</div>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      {remoteContent.formats && remoteContent.formats.length > 0 && (
+                        <div className="mb-2 inline-flex items-center rounded-md bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-200 font-sans">
+                          Rich · {remoteContent.formats.map(f => shortRichLabel(f.mime_type)).join(", ")}
+                        </div>
+                      )}
+                      {remoteContent.text}
+                    </>
+                  )}
                   <div className="absolute bottom-2 right-2 flex gap-2">
                     <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded text-zinc-400">
                       From: {remoteContent.sender}

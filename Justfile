@@ -43,6 +43,10 @@ bump-version:
 build:
     npm run tauri build
 
+# Build a release binary, skipping installer bundles (deb/rpm/dmg/exe/AppImage). Output: src-tauri/target/release/clustercut
+build-no-bundle:
+    npm run tauri build -- --no-bundle
+
 # Linux dev setup: install tray icon + GNOME extension into user share dirs (tauri dev only; packaging installs these automatically).
 dev-setup:
     #!/usr/bin/env bash

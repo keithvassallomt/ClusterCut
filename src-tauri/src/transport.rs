@@ -106,17 +106,66 @@ impl Transport {
         data: &[u8],
         config: ClientConfig,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let len = data.len();
+        let large = len > 256 * 1024;
+        if large {
+            tracing::info!("send_message: connecting to {} for {} byte payload", addr, len);
+        }
+
         let connection = self
             .endpoint
             .connect_with(config, addr, "clustercut")?
             .await?;
+        if large {
+            tracing::info!("send_message: connection established to {}", addr);
+        }
+
         let (mut send, _recv) = connection.open_bi().await?;
+        if large {
+            tracing::info!("send_message: bi stream opened to {}", addr);
+        }
 
         send.write_all(data).await?;
-        send.finish()?;
+        if large {
+            tracing::info!("send_message: write_all done ({} bytes) to {}", len, addr);
+        }
 
-        // Give the stream a moment to flush/be accepted before dropping the connection
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        send.finish()?;
+        if large {
+            tracing::info!("send_message: finish() called on stream to {}", addr);
+        }
+
+        // Wait until the peer has acknowledged all stream data before letting
+        // the connection drop. The previous fixed 500 ms sleep was fine for
+        // text payloads but raced multi-MB clipboard images — the function
+        // returned and the connection torn down while bytes were still in
+        // flight, surfacing as "connection lost" on the receiver mid-read.
+        // 30 s upper bound covers slow links without hanging forever if the
+        // peer dies. Fall back to a data-size-proportional sleep if stopped()
+        // doesn't yield a clean ACK, so a quirky stopped() implementation
+        // can't strand the data either.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            send.stopped(),
+        )
+        .await
+        {
+            Ok(Ok(None)) => {
+                if large {
+                    tracing::info!("send_message: peer ACKed all data ({} bytes) to {}", len, addr);
+                }
+            }
+            other => {
+                let fallback_ms = ((len as u64 / 1024).max(500)).min(15_000);
+                tracing::warn!(
+                    "send_message: stopped() didn't yield clean ACK to {} ({:?}); falling back to {} ms drain wait",
+                    addr,
+                    other,
+                    fallback_ms
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(fallback_ms)).await;
+            }
+        }
 
         Ok(())
     }
@@ -201,19 +250,33 @@ impl Transport {
                                 loop {
                                     match conn.accept_bi().await {
                                         Ok((_, mut recv)) => {
-                                            // tracing::debug!("Accepted message stream from {}", remote_addr);
-                                            // Limit 10MB
-                                            if let Ok(buf) =
-                                                recv.read_to_end(1024 * 1024 * 10).await
-                                            {
-                                                if !buf.is_empty() {
-                                                    on_receive_message(buf, remote_addr);
+                                            // Cap each message at 64 MB. Sized to fit a 10 MB raw
+                                            // clipboard image after the wire-format expansion:
+                                            // base64 (1.33×) inside ClipboardPayload JSON, then the
+                                            // encrypted ciphertext re-wrapped in
+                                            // Message::Clipboard(Vec<u8>) which serde_json emits
+                                            // as an integer array (~3.5×). Net ~50 MB worst case.
+                                            const MESSAGE_BYTE_CAP: usize = 1024 * 1024 * 64;
+                                            match recv.read_to_end(MESSAGE_BYTE_CAP).await {
+                                                Ok(buf) => {
+                                                    if !buf.is_empty() {
+                                                        on_receive_message(buf, remote_addr);
+                                                    }
                                                 }
-                                            } else {
-                                                tracing::error!(
-                                                    "Failed to read from stream from {}",
-                                                    remote_addr
-                                                );
+                                                Err(quinn::ReadToEndError::TooLong) => {
+                                                    tracing::error!(
+                                                        "Stream from {} exceeded {} byte cap; dropping. Likely a clipboard image larger than the supported wire size.",
+                                                        remote_addr,
+                                                        MESSAGE_BYTE_CAP
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Failed to read from stream from {}: {}",
+                                                        remote_addr,
+                                                        e
+                                                    );
+                                                }
                                             }
                                         }
                                         Err(_e) => {
