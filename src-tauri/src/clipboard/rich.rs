@@ -552,9 +552,9 @@ mod macos {
         let pb = pasteboard();
         for (mime, uti) in PASSTHROUGH_IMAGE_PROBE {
             let uti_ns = NSString::from_str(uti);
-            let data: Option<Retained<NSData>> = unsafe { pb.dataForType(&uti_ns) };
+            let data: Option<Retained<NSData>> = pb.dataForType(&uti_ns);
             let Some(data) = data else { continue };
-            let len = unsafe { data.length() };
+            let len = data.length();
             if len == 0 {
                 continue;
             }
@@ -567,10 +567,7 @@ mod macos {
                 );
                 continue;
             }
-            let bytes = unsafe {
-                let ptr = data.bytes();
-                std::slice::from_raw_parts(ptr.as_ptr() as *const u8, len).to_vec()
-            };
+            let bytes = data.to_vec();
             return Some((mime.to_string(), bytes));
         }
         None
