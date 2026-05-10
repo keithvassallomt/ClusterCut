@@ -3240,38 +3240,15 @@ pub fn run() {
                 let mut discovery = state.discovery.lock().unwrap();
                 *discovery = None; // Explicitly drop to trigger unregister
 
-                // Broadcast Goodbye
-                let local_id = state.local_device_id.lock().unwrap().clone();
-                let msg = crate::protocol::Message::PeerRemoval(local_id);
-                if let Ok(data) = serde_json::to_vec(&msg) {
-                    let peers = state.get_peers();
-                    tracing::info!("Broadcasting Goodbye to {} peers...", peers.len());
-                    
-                    // Best effort send (blocking/sync context or fire-and-forget)
-                    // Since we are exiting, async runtime might be shutting down.
-                    // We can try to spawn on the handle if it's still valid, or just hope.
-                    // Actually, 'app_handle' is valid.
-                    
-                    for p in peers.values() {
-                         let addr = std::net::SocketAddr::new(p.ip, p.port);
-                         let data_vec = data.clone();
-                         // We create a new transport instance or use existing? 
-                         // Existing transport is in state, but we need to use it.
-                         // Quickest way: spawn and give it a few millis.
-                         let t_state = (*state).clone();
-                         tauri::async_runtime::spawn(async move {
-                             let transport_opt = {
-                                 let lock = t_state.transport.lock().unwrap();
-                                 lock.clone()
-                             };
-                             if let Some(transport) = transport_opt {
-                                 let _ = transport.send_message(addr, &data_vec).await;
-                             }
-                         });
-                    }
-                    // Give a brief moment for packets to fly
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                }
+                // No "Goodbye" broadcast. We used to send Message::PeerRemoval(local_id)
+                // here so peers' UIs would mark us offline immediately, but the
+                // receiver's PeerRemoval handler (lib.rs ~4217) treats that as
+                // "this peer is gone, drop them" and *removes the pinned
+                // fingerprint from known_peers*. After both sides shut down,
+                // whichever was still alive when the other quit lost its pin
+                // and could not reconnect without re-pairing. mDNS
+                // service-remove + QUIC keepalive already surface offline
+                // status within seconds, so this broadcast was net-negative.
             }
             _ => {}
         }

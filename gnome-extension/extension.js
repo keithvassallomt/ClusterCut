@@ -137,6 +137,70 @@ const IMAGE_MIME_PRIORITY = [
     'image/tiff',
 ];
 
+// Plain-text MIME aliases. St.Clipboard's pick_mimetype probes these in order
+// when a consumer calls get_text; we offer all of them off the same bytes so
+// every consumer path finds the plain-text representation alongside any rich
+// formats we install in the same source.
+const TEXT_MIME_ALIASES = [
+    'text/plain;charset=utf-8',
+    'UTF8_STRING',
+    'text/plain',
+    'STRING',
+];
+
+// MetaSelectionSource subclass that advertises an arbitrary set of MIME types
+// from a single owner. mutter's stock MetaSelectionSourceMemory is single-MIME,
+// and St.Clipboard.set_content / set_text each install a fresh owner — so a
+// sequence of those calls collapses to the MIMEs from the last call. To put
+// plain text + text/html (or text/uri-list + x-special/gnome-copied-files) on
+// the clipboard simultaneously we have to build our own multi-MIME source and
+// call meta_selection_set_owner ourselves.
+const MultiMimeSource = GObject.registerClass(
+class ClusterCutMultiMimeSource extends Meta.SelectionSource {
+    _init() {
+        super._init();
+        this._formats = new Map();
+        // GTask → GInputStream; used to thread the per-call stream from
+        // read_async to the matching read_finish. Weak so completed tasks
+        // can be collected normally.
+        this._pending = new WeakMap();
+    }
+
+    add(mime, data) {
+        if (!data || data.length === 0) return;
+        this._formats.set(mime, data instanceof Uint8Array ? data : new Uint8Array(data));
+    }
+
+    vfunc_get_mimetypes() {
+        return Array.from(this._formats.keys());
+    }
+
+    vfunc_read_async(mimetype, cancellable, callback) {
+        const task = Gio.Task.new(this, cancellable, callback, null);
+        const data = this._formats.get(mimetype);
+        if (!data) {
+            task.return_error(new GLib.Error(
+                Gio.io_error_quark(),
+                Gio.IOErrorEnum.NOT_SUPPORTED,
+                `mimetype not in source: ${mimetype}`
+            ));
+            return;
+        }
+        const stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(data));
+        this._pending.set(task, stream);
+        task.return_boolean(true);
+    }
+
+    vfunc_read_finish(result) {
+        if (!result.propagate_boolean()) {
+            return null;
+        }
+        const stream = this._pending.get(result);
+        this._pending.delete(result);
+        return stream;
+    }
+});
+
 let ClipboardBridgeIface = null;
 
 const ClusterCutIndicator = GObject.registerClass(
@@ -345,8 +409,10 @@ export default class ClusterCutExtension extends Extension {
         this._lastFilesKey = '';
         this._lastBlobKey = '';
         this._lastFormatsKey = '';
-        // GLib monotonic-time deadline. A one-shot bool doesn't work here because
-        // a WriteFiles call writes two MIMEs and fires owner-changed more than once.
+        // GLib monotonic-time deadline. Time-based rather than a one-shot bool
+        // so it absorbs the brief gap between set_owner and the owner-changed
+        // signal we're trying to suppress without races against unrelated
+        // clipboard activity.
         this._ignoreUntil = 0;
 
         this._clipboardDbusId = Gio.DBus.session.register_object(
@@ -649,19 +715,20 @@ export default class ClusterCutExtension extends Extension {
         this._lastFilesKey = uris.join('\n');
         this._lastClipboardText = '';
 
-        const clipboard = St.Clipboard.get_default();
-
-        // Write both MIMEs: Nautilus/GTK file managers key on
-        // x-special/gnome-copied-files to decide "paste file" vs "paste text".
-        const uriListText = uris.join('\n') + '\n';
-        const gnomeCopiedText = 'copy\n' + uris.join('\n');
-
+        // Both MIMEs go on the wire from one owner: Nautilus/GTK file managers
+        // key on x-special/gnome-copied-files to decide "paste file" vs
+        // "paste text", while GTK4 file targets and other consumers want
+        // text/uri-list. Two sequential set_content calls would have left
+        // only the last MIME on offer.
         const encoder = new TextEncoder();
-        const uriListBytes = GLib.Bytes.new(encoder.encode(uriListText));
-        const gnomeCopiedBytes = GLib.Bytes.new(encoder.encode(gnomeCopiedText));
+        const source = new MultiMimeSource();
+        source.add('text/uri-list', encoder.encode(uris.join('\n') + '\n'));
+        source.add('x-special/gnome-copied-files', encoder.encode('copy\n' + uris.join('\n')));
 
-        clipboard.set_content(St.ClipboardType.CLIPBOARD, 'text/uri-list', uriListBytes);
-        clipboard.set_content(St.ClipboardType.CLIPBOARD, 'x-special/gnome-copied-files', gnomeCopiedBytes);
+        global.display.get_selection().set_owner(
+            Meta.SelectionType.SELECTION_CLIPBOARD,
+            source
+        );
     }
 
     _writeBlob(mime, data) {
@@ -680,11 +747,12 @@ export default class ClusterCutExtension extends Extension {
     }
 
     // Atomically restock the clipboard with plain text plus alternate
-    // representations (text/html, text/rtf, …). Single _suppressNextChanges
-    // covers the whole batch — owner-changed fires once per set call but we
-    // only want to skip our own writes, not real user activity. St.Clipboard
-    // accumulates MIMEs across set_content/set_text calls (see _writeFiles
-    // for the same pattern with text/uri-list + x-special/gnome-copied-files).
+    // representations (text/html, text/rtf, …) as a single multi-MIME owner.
+    // St.Clipboard.set_content / set_text each *replace* the selection owner,
+    // so calling them in sequence leaves only the last MIME advertised — that
+    // collapsed text/html + plain text down to text/html alone for receivers
+    // and broke pasting into plain-text apps. MultiMimeSource advertises
+    // every MIME from one source and one set_owner call.
     _writeFormats(text, formats) {
         if (!Array.isArray(formats)) {
             return;
@@ -696,17 +764,23 @@ export default class ClusterCutExtension extends Extension {
         this._lastFilesKey = '';
         this._lastBlobKey = '';
 
-        const clipboard = St.Clipboard.get_default();
+        const source = new MultiMimeSource();
+
         if (text) {
-            clipboard.set_text(St.ClipboardType.CLIPBOARD, text);
-        }
-        for (const [mime, data] of formats) {
-            if (!data || data.length === 0) {
-                continue;
+            const textBytes = new TextEncoder().encode(text);
+            for (const mime of TEXT_MIME_ALIASES) {
+                source.add(mime, textBytes);
             }
-            const glibBytes = GLib.Bytes.new(data);
-            clipboard.set_content(St.ClipboardType.CLIPBOARD, mime, glibBytes);
         }
+
+        for (const [mime, data] of formats) {
+            source.add(mime, data);
+        }
+
+        global.display.get_selection().set_owner(
+            Meta.SelectionType.SELECTION_CLIPBOARD,
+            source
+        );
     }
 
     _handleClipboardMethod(methodName, parameters, invocation) {
