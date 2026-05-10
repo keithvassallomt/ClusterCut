@@ -1465,9 +1465,11 @@ async fn probe_ip(
 /// Description sentinel embedded in the netsh rule. Bumped whenever the rule
 /// shape changes so existing too-narrow rules from older versions get
 /// force-replaced via UAC on first launch instead of silently passing the
-/// "looks correct" check. v0.3 widens to include explicit outbound + scope.
+/// "looks correct" check. v0.3 widens to include explicit outbound + scope;
+/// v0.3.1 adds TCP/4654 inbound + outbound for the new plaintext-TCP
+/// pairing channel that runs alongside QUIC on the same port.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-const FIREWALL_RULE_SENTINEL: &str = "ClusterCut UDP sync v0.3";
+const FIREWALL_RULE_SENTINEL: &str = "ClusterCut sync v0.3.1 (UDP+TCP pair)";
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn configure_windows_firewall() {
@@ -1486,6 +1488,7 @@ fn configure_windows_firewall() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if output.status.success()
                 && stdout.contains("UDP")
+                && stdout.contains("TCP")
                 && stdout.contains("4654")
                 && stdout.contains(FIREWALL_RULE_SENTINEL)
             {
@@ -1505,23 +1508,30 @@ fn configure_windows_firewall() {
         }
     }
 
-    // Three netsh calls in one elevated session:
+    // Five netsh calls in one elevated session:
     //   1. Delete any existing "ClusterCut" rules so we don't end up with
     //      duplicate / stale rules layered on top of each other.
-    //   2. Add inbound UDP/4654 (any source IP, edge traversal allowed).
+    //   2. Add inbound UDP/4654 (any source IP, edge traversal allowed) —
+    //      QUIC steady-state traffic.
     //   3. Add outbound UDP/4654. Windows defaults to "allow outbound" but
     //      Defender / enterprise / "Block all" private-profile configs do
     //      override that — without an explicit allow rule, QUIC handshake
     //      ACKs from this machine get dropped, which surfaces as "Linux
     //      can't reach Windows but Windows can reach Linux" (the Linux
     //      side sees its initial-Initial succeed but never the response).
+    //   4. Add inbound TCP/4654 — the plaintext-TCP pairing channel
+    //      (same numeric port, different protocol). Without this the
+    //      initiator's pairing connect times out silently on Windows.
+    //   5. Add outbound TCP/4654 for symmetry with the UDP outbound rule.
     //
     // The description on every rule is the FIREWALL_RULE_SENTINEL so the
     // pre-flight check above can detect it.
     let cmd = format!(
         "netsh advfirewall firewall delete rule name=\\\"ClusterCut\\\" 2>$null; \
          netsh advfirewall firewall add rule name=\\\"ClusterCut\\\" dir=in action=allow protocol=UDP localport=4654 remoteip=any profile=any edge=yes description=\\\"{sentinel}\\\"; \
-         netsh advfirewall firewall add rule name=\\\"ClusterCut\\\" dir=out action=allow protocol=UDP localport=4654 remoteip=any profile=any description=\\\"{sentinel}\\\"",
+         netsh advfirewall firewall add rule name=\\\"ClusterCut\\\" dir=out action=allow protocol=UDP localport=4654 remoteip=any profile=any description=\\\"{sentinel}\\\"; \
+         netsh advfirewall firewall add rule name=\\\"ClusterCut\\\" dir=in action=allow protocol=TCP localport=4654 remoteip=any profile=any edge=yes description=\\\"{sentinel}\\\"; \
+         netsh advfirewall firewall add rule name=\\\"ClusterCut\\\" dir=out action=allow protocol=TCP localport=4654 remoteip=any profile=any description=\\\"{sentinel}\\\"",
         sentinel = FIREWALL_RULE_SENTINEL
     );
 
