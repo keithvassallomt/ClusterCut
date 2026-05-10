@@ -22,11 +22,12 @@ const MAX_CLIPBOARD_IMAGE_READ_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Raster image MIME types we know how to decode, in preference order.
 /// PNG first because it's lossless and the most commonly offered by browsers.
-/// `image/gif` is intentionally absent — animated GIFs go through the
-/// passthrough path below to preserve animation.
+/// `image/gif` and `image/jpeg` are intentionally absent — both go through
+/// the passthrough path below (GIF to preserve animation, JPEG to avoid
+/// the 5-30× wire-size inflation that PNG re-encoding of photo content
+/// causes).
 const IMAGE_MIME_PRIORITY: &[&str] = &[
     "image/png",
-    "image/jpeg",
     "image/webp",
     "image/bmp",
     "image/x-bmp",
@@ -38,7 +39,8 @@ const IMAGE_MIME_PRIORITY: &[&str] = &[
 /// (e.g. Inkscape: image/svg+xml + a rasterised image/png fallback) gives
 /// the higher-fidelity passthrough representation. Bytes go on the wire
 /// verbatim; receivers re-stock under the same MIME.
-const PASSTHROUGH_IMAGE_MIME_PRIORITY: &[&str] = &["image/svg+xml", "image/gif"];
+const PASSTHROUGH_IMAGE_MIME_PRIORITY: &[&str] =
+    &["image/svg+xml", "image/gif", "image/jpeg"];
 
 /// Rich-text MIME types we relay verbatim alongside the plain text. These
 /// carry formatted content (HTML/RTF) that destination apps can pick up

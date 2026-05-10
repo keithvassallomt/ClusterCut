@@ -127,13 +127,19 @@ mod windows {
         raw::register_format("image/gif").map(|f| f.get())
     }
 
+    fn jpeg_format_id() -> Option<u32> {
+        raw::register_format("image/jpeg").map(|f| f.get())
+    }
+
     /// Probe order for passthrough-image MIMEs on Windows. Each entry
-    /// returns `(mime_label, format_id_resolver)`. SVG first since when both
-    /// are offered, vector beats animated.
-    fn passthrough_image_atoms() -> [(&'static str, fn() -> Option<u32>); 2] {
+    /// returns `(mime_label, format_id_resolver)`. SVG first since vector
+    /// beats raster; GIF before JPEG so an animated GIF that also has a
+    /// JPEG fallback (rare in the wild) keeps animation.
+    fn passthrough_image_atoms() -> [(&'static str, fn() -> Option<u32>); 3] {
         [
             ("image/svg+xml", svg_format_id),
             ("image/gif", gif_format_id),
+            ("image/jpeg", jpeg_format_id),
         ]
     }
 
@@ -400,6 +406,8 @@ mod windows {
                 .ok_or_else(|| "couldn't register image/svg+xml format atom".to_string())?,
             "image/gif" => gif_format_id()
                 .ok_or_else(|| "couldn't register image/gif format atom".to_string())?,
+            "image/jpeg" => jpeg_format_id()
+                .ok_or_else(|| "couldn't register image/jpeg format atom".to_string())?,
             other => return Err(format!("unsupported passthrough MIME on Windows: {}", other)),
         };
         let _clip = Clipboard::new_attempts(ATTEMPTS)
@@ -535,15 +543,20 @@ mod macos {
             // Most apps that handle animated GIFs on the pasteboard look
             // for this UTI.
             "image/gif" => Some("com.compuserve.gif"),
+            // public.jpeg: standard UTI for JPEG. Universally supported on
+            // macOS since the dawn of time.
+            "image/jpeg" => Some("public.jpeg"),
             _ => None,
         }
     }
 
-    /// Probe order for passthrough-image MIMEs on macOS. SVG first since
-    /// when both are offered, vector beats animated.
+    /// Probe order for passthrough-image MIMEs on macOS. SVG before raster
+    /// (vector beats raster); GIF before JPEG so an animated GIF that also
+    /// has a JPEG fallback keeps animation.
     const PASSTHROUGH_IMAGE_PROBE: &[(&str, &str)] = &[
         ("image/svg+xml", "public.svg-image"),
         ("image/gif", "com.compuserve.gif"),
+        ("image/jpeg", "public.jpeg"),
     ];
 
     /// Read passthrough-image bytes (SVG / GIF) from the pasteboard. Probes

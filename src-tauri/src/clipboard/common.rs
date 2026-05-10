@@ -29,19 +29,25 @@ pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 60 * 1024 * 1024;
 pub const LARGE_CLIPBOARD_BLOB_NOTIFY_THRESHOLD: usize = 10 * 1024 * 1024;
 
 /// MIME types whose bytes pass through verbatim instead of being decoded
-/// and re-encoded to PNG. Two reasons to preserve a source MIME:
+/// and re-encoded to PNG. Three reasons to preserve a source MIME:
 ///
 /// - **Vector**: SVG (`image/svg+xml`). PNG-normalising loses the vector
 ///   representation entirely and gives downstream apps a flattened raster
 ///   instead of an editable shape.
 /// - **Animated**: GIF (`image/gif`). PNG-normalising loses the animation
 ///   (only frame 0 survives the RGBA round-trip).
+/// - **Wire-size sane for photos**: JPEG (`image/jpeg`). PNG-normalising a
+///   30 MB JPEG photo decodes RGBA and re-encodes lossless PNG, ballooning
+///   to ~150 MB which exceeds the 60 MB wire cap and silently drops the
+///   sync. Keeping JPEG verbatim preserves the source's compression
+///   choice and never inflates.
 ///
 /// Bytes ride the wire under the source MIME and the receiver writes them
 /// verbatim under that same MIME. Whether a destination app *paints* the
-/// SVG or *animates* the GIF is the destination's concern — see §3.1 / §3.2.
+/// SVG, *animates* the GIF, or *renders* the JPEG is the destination's
+/// concern.
 pub fn is_passthrough_image_mime(mime: &str) -> bool {
-    matches!(mime, "image/svg+xml" | "image/gif")
+    matches!(mime, "image/svg+xml" | "image/gif" | "image/jpeg")
 }
 
 /// Compute a stable, cheap content fingerprint for a `ClipboardPayload` used
@@ -217,6 +223,49 @@ pub enum ClipboardContent {
 pub static IGNORED_CONTENT: Lazy<Arc<Mutex<ClipboardContent>>> =
     Lazy::new(|| Arc::new(Mutex::new(ClipboardContent::None)));
 
+/// Wall-clock timestamp of the most recent `IGNORED_CONTENT` set. Combined
+/// with `IGNORED_TTL`, this auto-expires a stale echo guard if the expected
+/// echo never arrives — for example, if our `set_clipboard_image` write
+/// failed silently, or the user copied something different on the local
+/// clipboard before our intended echo could bounce back through the
+/// monitor poll.
+///
+/// Without this, a stuck IGNORED would generate "variant differs" /
+/// "mime differs" misses on every subsequent clipboard event indefinitely,
+/// each one looping the content back to peers. Observed in the wild after
+/// an SVG paste followed by unrelated copies — the SVG IGNORED stayed
+/// referenced for the entire session.
+pub static IGNORED_SET_AT: Lazy<Arc<Mutex<Option<std::time::Instant>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(None)));
+
+/// How long an IGNORED guard remains valid after being set. Generous enough
+/// for the slowest legitimate echo (Windows `arboard::set_image` with full
+/// retry budget can take ~1.6 s; 10 s leaves comfortable headroom on slow
+/// disks / clipboard managers / etc). Shorter than the timescales at which
+/// stale state is likely to drive observable bugs.
+pub const IGNORED_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Set both the IGNORED content and its timestamp atomically. All
+/// `set_clipboard_*_with_ignore` helpers funnel through this so the two
+/// halves can never drift.
+fn set_ignored(content: ClipboardContent) {
+    {
+        let mut ignored = IGNORED_CONTENT.lock().unwrap();
+        *ignored = content;
+    }
+    {
+        let mut at = IGNORED_SET_AT.lock().unwrap();
+        *at = Some(std::time::Instant::now());
+    }
+}
+
+/// Clear the IGNORED guard and its timestamp atomically.
+fn clear_ignored(ignored: &mut ClipboardContent) {
+    *ignored = ClipboardContent::None;
+    let mut at = IGNORED_SET_AT.lock().unwrap();
+    *at = None;
+}
+
 /// One-line summary of a `ClipboardContent` for log lines. Keep it compact
 /// so an event chain (`Set IGNORED → Check → MATCH/MISS → Broadcast?`) reads
 /// inline without wrapping.
@@ -327,6 +376,31 @@ pub fn should_process_content(
     if *current_content == ClipboardContent::None {
         return EchoVerdict::NoChange;
     }
+
+    // Expire stale IGNORED guard before the check. If the timestamp is
+    // older than IGNORED_TTL, the expected echo never bounced — most likely
+    // because the user copied something else locally before the OS clipboard
+    // round-trip completed. Keeping the stale guard would manufacture
+    // spurious "variant differs" misses for every subsequent clipboard
+    // event indefinitely (the bug that surfaced after an SVG paste).
+    {
+        let mut at = IGNORED_SET_AT.lock().unwrap();
+        if let Some(t) = *at {
+            if t.elapsed() > IGNORED_TTL {
+                let mut ignored = IGNORED_CONTENT.lock().unwrap();
+                if !matches!(*ignored, ClipboardContent::None) {
+                    tracing::info!(
+                        "[Echo] IGNORED guard expired after {:?} — clearing stale {} guard",
+                        t.elapsed(),
+                        describe_content(&ignored)
+                    );
+                }
+                *ignored = ClipboardContent::None;
+                *at = None;
+            }
+        }
+    }
+
     let mut verdict = EchoVerdict::NoChange;
     {
         let mut ignored = IGNORED_CONTENT.lock().unwrap();
@@ -342,7 +416,7 @@ pub fn should_process_content(
                 if let ClipboardContent::Text(curr_text) = current_content {
                     if curr_text == ign_text {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
-                        *ignored = ClipboardContent::None;
+                        clear_ignored(&mut ignored);
                         verdict = EchoVerdict::Echo;
                     } else if current_content != last_content {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=text_differs)", ign_desc, cur_desc);
@@ -357,7 +431,7 @@ pub fn should_process_content(
                 if let ClipboardContent::Files(curr_files) = current_content {
                     if curr_files == ign_files {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
-                        *ignored = ClipboardContent::None;
+                        clear_ignored(&mut ignored);
                         verdict = EchoVerdict::Echo;
                     } else if current_content != last_content {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=files_differ)", ign_desc, cur_desc);
@@ -372,7 +446,7 @@ pub fn should_process_content(
                 if let ClipboardContent::Image(curr_blob) = current_content {
                     if image_blob_eq_stable(curr_blob, ign_blob) {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
-                        *ignored = ClipboardContent::None;
+                        clear_ignored(&mut ignored);
                         verdict = EchoVerdict::Echo;
                     } else if current_content != last_content {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=mime_differs)", ign_desc, cur_desc);
@@ -390,7 +464,7 @@ pub fn should_process_content(
                 if let ClipboardContent::Rich { text, formats } = current_content {
                     if rich_eq_stable(ign_text, ign_formats, text, formats) {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
-                        *ignored = ClipboardContent::None;
+                        clear_ignored(&mut ignored);
                         verdict = EchoVerdict::Echo;
                     } else if current_content != last_content {
                         tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=rich_differs)", ign_desc, cur_desc);
@@ -717,11 +791,9 @@ pub fn set_clipboard_with_ignore(app: &AppHandle, text: String, write_fn: fn(&Ap
     let text_clone = text.clone();
 
     thread::spawn(move || {
-        {
-            let mut ignored = IGNORED_CONTENT.lock().unwrap();
-            *ignored = ClipboardContent::Text(text_clone.clone());
-            tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&ignored));
-        }
+        let content = ClipboardContent::Text(text_clone.clone());
+        tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&content));
+        set_ignored(content);
 
         if let Err(e) = write_fn(&app_handle, text_clone) {
             tracing::error!("Failed to set clipboard text: {}", e);
@@ -737,11 +809,9 @@ pub fn set_clipboard_paths_with_ignore(app: &AppHandle, paths: Vec<String>, writ
     let paths_clone = paths.clone();
 
     thread::spawn(move || {
-        {
-            let mut ignored = IGNORED_CONTENT.lock().unwrap();
-            *ignored = ClipboardContent::Files(paths_clone.clone());
-            tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&ignored));
-        }
+        let content = ClipboardContent::Files(paths_clone.clone());
+        tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&content));
+        set_ignored(content);
 
         if let Err(e) = write_fn(&app_handle, paths_clone) {
             tracing::error!("Failed to set clipboard files: {}", e);
@@ -765,14 +835,12 @@ pub fn set_clipboard_rich_with_ignore(
     let formats_clone = formats.clone();
 
     thread::spawn(move || {
-        {
-            let mut ignored = IGNORED_CONTENT.lock().unwrap();
-            *ignored = ClipboardContent::Rich {
-                text: text_clone.clone(),
-                formats: formats_clone.clone(),
-            };
-            tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&ignored));
-        }
+        let content = ClipboardContent::Rich {
+            text: text_clone.clone(),
+            formats: formats_clone.clone(),
+        };
+        tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&content));
+        set_ignored(content);
 
         if let Err(e) = write_fn(&app_handle, &text_clone, &formats_clone) {
             tracing::error!("Failed to set clipboard rich content: {}", e);
@@ -798,11 +866,9 @@ pub fn set_clipboard_blob_with_ignore(
     let blob_clone = blob.clone();
 
     thread::spawn(move || {
-        {
-            let mut ignored = IGNORED_CONTENT.lock().unwrap();
-            *ignored = ClipboardContent::Image(blob_clone.clone());
-            tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&ignored));
-        }
+        let content = ClipboardContent::Image(blob_clone.clone());
+        tracing::info!("[Echo] Set IGNORED guard -> {}", describe_content(&content));
+        set_ignored(content);
 
         if let Err(e) = write_fn(&app_handle, &blob_clone) {
             tracing::error!("Failed to set clipboard blob: {}", e);

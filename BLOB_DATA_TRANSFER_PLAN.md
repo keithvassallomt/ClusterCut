@@ -120,8 +120,10 @@ NSPasteboard supports lazy/promise-based pasteboard owners (`NSPasteboardWriting
 |---|---|---|
 | 3.1 | SVG (vector image) clipboard sync — verbatim pass-through | ✅ complete (test plan: T-3.1.x) |
 | 3.2 | Animated GIF preservation — verbatim pass-through | ✅ complete (test plan: T-3.2.x) |
+| 3.2b | JPEG passthrough (avoids 5-30× PNG re-encode inflation for photos) | ✅ complete (test plan: T-3.2.6) |
 | 3.3 v1 | Inline cap raised to 60 MB + large-blob notification | ✅ complete (test plan: T-3.3.1–T-3.3.5) |
 | 3.3 v2 | Descriptor + auto-fetch over `clustercut-file` ALPN, race protection, Tier 3 file-fallback | ⏸ deferred (test plan: T-3.3.6) |
+| TIRI-stale | IGNORED guard auto-expires after 10 s if echo never arrives — fixes stuck `Image(svg+xml)` driving spurious "variant differs" broadcasts on every later clipboard event | ✅ complete (test plan: T-TIRI-stale) |
 
 ### Release polish (after Parts 1 + 2 + 3 are in)
 
@@ -139,14 +141,25 @@ Manual test cases for the Part 3 deferred-work features. Run these end-to-end on
 
 #### T-3.1.1 — SVG round-trip preserves vector data
 
-1. On a Linux/wlroots peer (KDE, Sway, Hyprland), open Inkscape, draw a simple shape, select it, **Edit → Copy**.
-2. On the receiving peer (any of: Linux/wlroots, Linux/GNOME, macOS, Windows), open an SVG-aware app — Inkscape itself, Affinity Designer, Boxy SVG, or a text editor.
-3. Paste into the SVG-aware app or text editor.
+> **Source-app caveat**: Most desktop SVG editors **rasterise on Copy**. Inkscape's `Edit → Copy` puts `image/png` on the public clipboard (it uses a proprietary `image/x-inkscape-svg` MIME for in-app round-trips, *not* the canonical `image/svg+xml`). Affinity Designer and most browser "Copy SVG" actions also rasterise. **Use the methods below** to put real `image/svg+xml` bytes on the clipboard for testing — they exercise the actual passthrough path.
+
+1. On a Linux/wlroots peer, put canonical SVG bytes on the clipboard:
+   - **Wayland (KDE/Sway/Hyprland)**: `wl-copy --type image/svg+xml < /path/to/test.svg`
+   - **X11**: `xclip -selection clipboard -t image/svg+xml -i /path/to/test.svg`
+
+   (Any small `.svg` file works — even a one-line `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="red"/></svg>` saved to a file.)
+2. On the receiving peer, paste into a text editor (the simplest verification — the raw XML should appear) or into Boxy SVG / a vector-aware app for visual confirmation.
 
 Expected:
-- Receiving app pastes the original `<svg>…</svg>` XML verbatim, **not** a rasterised PNG. Pasting into a text editor should show readable XML; pasting into Inkscape should give an editable vector.
-- ClusterCut's history view shows an entry tagged `image/svg+xml` rather than `image/png`.
-- Sender-side log: `Received clipboard image from <peer>: mime=image/svg+xml, decoded=<N> bytes` on the receiver, with **no** dimensions reported (SVGs don't carry intrinsic raster dims).
+- Receiver log: `Received clipboard image from <peer>: mime=image/svg+xml, decoded=<N> bytes` (no dimensions — SVG has no intrinsic raster dims).
+- Pasting into a text editor produces the original `<svg>…</svg>` XML verbatim, **not** rasterised bytes.
+- ClusterCut's history view shows the entry tagged `image/svg+xml` rather than `image/png`.
+
+**Real-world sources that *do* put `image/svg+xml` on the clipboard** (worth a follow-up test if any are installed):
+- Boxy SVG
+- Krita with the SVG-aware copy mode
+- Some GIMP versions when a path is selected and copied
+- Firefox when copying a `<svg>` element selected via the inspector (hit-or-miss)
 
 #### T-3.1.2 — SVG beats raster fallback when source offers both
 
@@ -216,6 +229,20 @@ Expected:
 
 Repeat T-3.2.1 with the same backend pairs as T-3.1.4. Expected: GIF arrives intact on all combinations, animation preserved when the destination app supports `image/gif` paste, plain-bytes fallback otherwise. **X11 not in scope.**
 
+#### T-3.2.6 — JPEG passthrough (avoids PNG inflation on photos)
+
+1. Find a JPEG photo around 20–40 MB on disk (a high-resolution camera shot works well).
+2. On a Wayland/wlroots peer:
+   ```bash
+   wl-copy --type image/jpeg < /path/to/photo.jpg
+   ```
+3. Watch the sender log.
+
+Expected:
+- Receiver log: `Received clipboard image from <peer>: mime=image/jpeg, decoded=<N> bytes` (no dimensions — JPEG passthrough doesn't populate them).
+- **No** `Clipboard image PNG (… bytes) exceeds … byte wire cap; skipping.` warning. Pre-fix, a 30 MB JPEG decoded → re-encoded as PNG would balloon to ~143 MB and silently drop. Post-fix, the JPEG bytes ride the wire as `image/jpeg` (≈30 MB), well under the cap.
+- Pasting on the receiver into a JPEG-aware app (Photos, Preview, browsers, image editors) shows the original photo.
+
 #### T-3.2.5 — Common-case regression check (Slack/Discord/Firefox copy-image)
 
 1. From Firefox/Chrome on Linux, right-click a regular *static* PNG image on a webpage → **Copy Image**.
@@ -284,6 +311,33 @@ Expected:
 
 Expected:
 - No errors. ChaCha20Poly1305 handles 50 MB without trouble; QUIC stream `read_to_end` cap is 64 MB so 50 MB raw + ~28 byte AEAD overhead + JSON wrapping (≈1.04× = ~52 MB) fits cleanly.
+
+### T-TIRI-stale — IGNORED guard auto-expires after 10 s
+
+This validates the fix for the stuck-IGNORED bug surfaced during §3.1 testing: a Sender that received an SVG paste held `IGNORED_CONTENT = Image(svg+xml)` indefinitely, so every subsequent unrelated clipboard event (text, files, image of a different MIME) hit the "variant differs" branch and broadcast unnecessarily.
+
+#### T-TIRI-stale.1 — Stale guard expires
+
+1. With dev logs streaming, copy any image on the sender (e.g. `wl-copy --type image/svg+xml < some.svg`). Verify `[Echo] Set IGNORED guard -> Image(...)` appears in the log.
+2. Wait at least 10 seconds.
+3. Copy something completely different on the sender — e.g. a plain text snippet (`echo hello | wl-copy`).
+
+Expected:
+- Sender log shows `[Echo] IGNORED guard expired after <≈10s> — clearing stale Image(...) guard` immediately before processing the new copy.
+- The new copy hits the `IGNORED is None` branch (no spurious "variant differs" miss) and broadcasts cleanly.
+- No follow-up bouncing for that text on subsequent unrelated copies.
+
+#### T-TIRI-stale.2 — Fast unrelated copies don't accidentally clear a still-valid guard
+
+1. Copy an image on the sender.
+2. Within ~2 seconds (before TTL expires), copy unrelated text on the sender.
+3. Watch the receiver.
+
+Expected:
+- The IMAGE echo from step 1 is still suppressed (IGNORED was set, the bytes round-trip back through the monitor poll, MATCH fires, IGNORED clears via the normal MATCH path).
+- The TEXT copy from step 2 broadcasts as a fresh event.
+- Both peers end up with the text on their clipboards (the image was the sender's transient state).
+- No infinite bouncing.
 
 #### T-3.3.6 (v2 — deferred) — Descriptor + auto-fetch path
 
