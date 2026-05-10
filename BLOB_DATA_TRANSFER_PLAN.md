@@ -48,44 +48,104 @@ The current image path *normalises everything to PNG via an RGBA round-trip* —
 
 **Worth-it analysis**: most desktop apps rasterise GIFs at copy time anyway, so the user-visible payoff is narrow — animation only survives when both the source app *and* the destination app preserve `image/gif`. Lower priority than 3.1 / 3.4.
 
-### 3.3 Streaming or deferred-download for very large blobs
+### 3.3 Large clipboard blobs ride the existing file-transfer path
 
-The current 10 MB inline cap is plenty for screenshots and typical web images, but it cuts off:
-- large editor exports (e.g. a poster from Affinity Designer)
-- multi-second audio/video clips
-- huge formatted documents
+After multiple iterations chasing wire-format inflation and ALPN streaming complexity, the cleaner answer is to **reuse the file-transfer machinery** and just add a one-bit hint that says "this transfer should land as a clipboard blob, not as a file on disk." All the hard streaming/chunking/timeout/ack work already exists for files; we just need to teach both ends what to do at the destination.
 
-The fix reuses the **existing file-transfer channel** (`FileStreamHeader` / `clustercut-file` ALPN) and the **existing `max_auto_download_size` setting** (50 MB by default — already used to gate auto-download of files). Three tiers based on the encoded payload size:
+The 10 MB boundary becomes meaningful again — under it, ride the existing inline `Message::Clipboard` path; over it, take the file-transfer path with a "treat as clipboard" hint.
 
-#### Tier 1 — ≤ 10 MB: inline blob (no change)
+#### The four cases
 
-Existing path. Sender broadcasts the bytes inside `ClipboardPayload.blob`, encrypted, in a single `Message::Clipboard` over the `clustercut-transport` ALPN. Receiver decrypts and immediately writes to the OS clipboard. Paste is instant. **Nothing changes for this tier — the threshold split is invisible to typical users.**
+| # | What the user does | Wire path | Receiver behaviour |
+|---|---|---|---|
+| **A** | Copies a 6 MB JPEG (anything ≤ 10 MB inline) | `Message::Clipboard` — existing inline blob path | Decrypt, write to OS clipboard, paste-ready instantly. **No change from today.** |
+| **B1** | Copies a 15 MB PNG (over inline cap, under `max_auto_download_size`) | `Message::Clipboard` carries a *descriptor* (fetch_id + mime + total_size + dims) instead of bytes. Sender writes bytes to a temp file and registers it in `local_files` keyed by message id, then bytes ride the existing `clustercut-file` ALPN stream. | Auto-download in background. **"Receiving large clipboard image…"** notification → **"Image available to paste"** notification once bytes land. The bytes are written to the OS clipboard (not disk), so paste-into-Word works. |
+| **B2** | Copies a 65 MB mega-PNG (over `max_auto_download_size`) | Same wire shape as B1 — descriptor + file stream. | Receiver checks `total_size` against its `max_auto_download_size`. Over threshold → notify the user with size, **don't auto-download**. User clicks Accept → fetch starts → bytes land on the OS clipboard. Same paste destination as B1, just with a manual gate. |
+| **C** | Copies an *image file* in the file manager (right-click → Copy in Nautilus / Files / Finder / Explorer) | Existing `Files(Vec<FileMetadata>)` path — completely unchanged. | Receiver gets a *file reference*. Pasting into a file manager works (file copy); pasting into Word/Photos as an image doesn't. **No change from today.** |
 
-#### Tier 2 — > 10 MB and ≤ `max_auto_download_size`: descriptor + auto-fetch
+The split between **B (clipboard intent)** and **C (file intent)** is preserved end-to-end via:
+- The sender's clipboard monitor knows whether the source was an image-bytes copy or a file-paths copy and routes accordingly.
+- A new `delivery_target` field on `FileStreamHeader` says either `Disk` (existing) or `Clipboard { mime, width, height }` (new).
+- The receiver's `clustercut-file` stream listener routes the incoming bytes to disk-write or in-memory-then-OS-clipboard based on `delivery_target`.
 
-Sender broadcasts a *descriptor* over the existing `Message::Clipboard` path — same encryption, same dedup signature shape — but with `ClipboardBlob` containing a `fetch_id`, `mime_type`, `width`, `height`, and `total_size` instead of the bytes themselves. `data` is empty. (`fetch_id` reuses or mirrors the existing `id` shape from `FileRequestPayload`.)
+#### Why this is structurally better than what we had
 
-Receiver, on seeing a fetch-style blob:
-1. Emits a `"Downloading data…"` notification + a placeholder history entry showing dimensions and size with a download progress bar (same UI vocabulary as large file transfers, but the destination is the clipboard rather than disk).
-2. Opens a `clustercut-file` ALPN stream to the sender, pulls the bytes (ALPN, not the inline transport — it's already engineered for multi-MB streaming with `stopped()`-based ACK and a 64 MB-per-message cap doesn't apply because file streams are uni and chunked).
-3. Once download completes, decodes/decrypts the bytes, writes to the OS clipboard via the existing `set_clipboard_image` path (the same one Tier 1 uses), and emits a `"Data available to paste"` notification.
-4. From then on, paste behaves identically to a Tier 1 image.
+Pre-fix, we tried to stuff multi-MB blobs through the inline `Message::Clipboard` path. That hit:
+- The 64 MB transport per-message cap once `Vec<u8>` JSON int-array inflation pushed encrypted ciphertext over.
+- Fixed with base64 outer wrapping, but still capped at ~35 MB practical.
+- Anything over silently dropped, with no UX feedback.
+- Slow and unreliable for the multi-MB sizes users actually want.
 
-UX requirement: the two notifications above are essential. Without them, users will hit Ctrl+V mid-download, paste the previous clipboard contents instead of the newly-arriving image, and conclude that sync is broken. The "Downloading data…" toast prevents that confusion.
+The file-transfer path doesn't have any of that:
+- Uni-directional QUIC stream — no per-message cap.
+- Already engineered for multi-MB transfers with `stopped()` ACK and 30 s drain timeout.
+- Notifications + accept/reject UX already wired up.
+- Race protection (in-flight tracking by id) already exists.
 
-**Concurrency / race**: if the user copies something else (text, smaller image, etc.) on the *receiver* while a Tier 2 download is in flight, the newest copy wins — the receiver's clipboard monitor has already detected the local change, and the in-progress download (if it eventually completes) is discarded rather than overwriting the user's intent. Easy to encode: each download tracks the `id` it was started for; if `state.last_clipboard_content` no longer matches that id when the download finishes, drop the bytes.
+#### Wire-format additions
 
-#### Tier 3 — > `max_auto_download_size`: file-transfer fallback (no clipboard restock)
+Two struct extensions, both `#[serde(default)]` for backward compatibility:
 
-For genuinely huge clipboard payloads (40K wallpapers, raw camera dumps, multi-second uncompressed audio), the descriptor goes onto the wire as today's **large-file** notification, **not** as a clipboard event. The receiver gets the same notification + history entry it gets for any large file transfer, the user clicks "Accept" to download (or doesn't), and the result lands as a file in the configured download location.
+```rust
+pub struct ClipboardBlob {
+    pub mime_type: String,
+    pub data: String,                 // base64 — empty when fetch_id is Some
+    #[serde(default)] pub width: Option<u32>,
+    #[serde(default)] pub height: Option<u32>,
+    /// New: descriptor mode. When Some, `data` is empty and the receiver
+    /// must fetch bytes via `Message::FileRequest` referencing this id.
+    #[serde(default)] pub fetch_id: Option<String>,
+    /// New: total raw byte size of the eventual blob — receiver uses this
+    /// to decide auto-fetch vs. user-confirm against `max_auto_download_size`.
+    #[serde(default)] pub total_size: Option<u64>,
+}
 
-**Important UX shift**: Tier 3 is no longer a "clipboard sync" experience. The data ends up as a *file* the user can open or drag/copy into another app. It does **not** auto-restock the OS clipboard. This is the same model files already use today, and consistent with how big files arrive — but worth being explicit about, because the user copied something expecting it to be on the clipboard, and at this size that expectation isn't met. The notification text needs to be specific so the user understands: "Large clipboard image from {sender} ({size}) — too large to auto-paste. Click to download as a file."
+pub enum DeliveryTarget {
+    Disk,                                          // existing default
+    Clipboard {
+        mime_type: String,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
+}
 
-Future option (not in scope of this doc): a clipboard-side "restock" button on the Tier 3 history entry that, after the user has explicitly accepted the file, decodes it and pushes onto the OS clipboard. Trades manual click for the missing auto-paste. Reasonable v2.
+pub struct FileStreamHeader {
+    pub id: String,
+    pub file_index: usize,
+    pub file_name: String,
+    pub file_size: u64,
+    pub auth_token: String,
+    #[serde(default)] pub compressed: bool,
+    /// New: Disk (existing) or Clipboard. Receiver routes the incoming
+    /// stream bytes accordingly.
+    #[serde(default = "default_delivery_target")] pub delivery_target: DeliveryTarget,
+}
+```
 
-#### macOS optimisation (defer)
+`DeliveryTarget::Disk` is the default for backward compat — older peers' headers omit the field, deserialise as Disk, behave exactly as today.
 
-NSPasteboard supports lazy/promise-based pasteboard owners (`NSPasteboardWriting` + `pasteboard:item:provideDataForType:`). On macOS specifically, the receiver could put a *promise* on the pasteboard immediately on Tier 2 descriptor receipt and only pull the bytes when an app actually pastes. That would make Ctrl+V "just work" with on-demand fetch and skip the awkward "wait for the toast to flip" UX for tier 2. Windows and X11/Wayland don't have an equivalent, so this is purely a macOS gloss layered on top of Model A above — out of scope until tier 2 itself ships.
+#### Race protection
+
+Receiver tracks in-flight clipboard fetches by id. If a new clipboard event arrives (any path) before the fetch completes, the in-flight fetch is abandoned: bytes still drain off the wire to keep QUIC happy, but they don't overwrite the OS clipboard. State key: `state.in_flight_clipboard_fetch: Option<String>` — the id the receiver is currently fetching for clipboard delivery. Cleared on completion or abandonment.
+
+#### Notifications
+
+| State | Notification |
+|---|---|
+| B1 fetch starts | "Receiving large clipboard image from {sender}…" — info, dismissable |
+| B1 fetch completes | "Image available to paste" — same as today's auto-receive notification |
+| B2 awaiting confirmation | "Large clipboard image from {sender} ({size} MB) — accept?" — actionable, with Accept button → triggers fetch |
+| B2 user accepts → fetching | same as B1 fetch-starts |
+| Fetch fails (network, timeout, sender no longer has the bytes) | "Couldn't receive clipboard image from {sender}: {reason}" — dismissable |
+
+#### Cleanup
+
+Sender's temp file: written under `temp_downloads`/`<id>.<ext>` (existing temp dir). Cleaned up on:
+1. Successful FileRequest response from a peer (file served, bytes delivered).
+2. Sender's app exit (existing `clear_cache` already wipes this dir on startup; could also wipe on quit).
+3. Periodic sweep — files older than 1 hour get deleted.
+
+For now, just rely on (1) and (2). Add (3) only if leakage shows up in testing.
 
 ---
 
@@ -121,8 +181,8 @@ NSPasteboard supports lazy/promise-based pasteboard owners (`NSPasteboardWriting
 | 3.1 | SVG (vector image) clipboard sync — verbatim pass-through | ✅ complete (test plan: T-3.1.x) |
 | 3.2 | Animated GIF preservation — verbatim pass-through | ✅ complete (test plan: T-3.2.x) |
 | 3.2b | JPEG passthrough (avoids 5-30× PNG re-encode inflation for photos) | ✅ complete (test plan: T-3.2.6) |
-| 3.3 v1 | Inline cap raised to a real **35 MB** + large-blob notification + base64 outer wrapping (was claimed 60 MB but actual usable was ~13 MB pre-fix because `Vec<u8>` JSON int-array inflated random encrypted bytes 3.57×; base64 brings outer inflation to 1.33×, total ~1.78× vs the 64 MB transport cap) | ✅ complete (test plan: T-3.3.1–T-3.3.5) |
-| 3.3 v2 | Descriptor + auto-fetch over `clustercut-file` ALPN, race protection, Tier 3 file-fallback | ⏸ deferred (test plan: T-3.3.6) |
+| 3.3 a | Inline cap restored to honest 10 MB; base64 outer wrapping kept (still useful for the inline path's wire size) | ✅ complete |
+| 3.3 b | Descriptor on `Message::Clipboard` + `delivery_target` on `FileStreamHeader` for blob intent over the file-transfer path. Tier B1 (auto-fetch) and B2 (user-confirm above `max_auto_download_size`) | ✅ complete (test plan: T-3.3.x) |
 | TIRI-stale | IGNORED guard auto-expires after 10 s if echo never arrives — fixes stuck `Image(svg+xml)` driving spurious "variant differs" broadcasts on every later clipboard event | ✅ complete (test plan: T-TIRI-stale) |
 
 ### Release polish (after Parts 1 + 2 + 3 are in)
@@ -255,62 +315,105 @@ Expected:
 
 ---
 
-### §3.3 — Large-blob inline transfer (v1 — cap raised to 60 MB)
+### §3.3 — Large-blob descriptor + file-transfer-with-clipboard-hint
 
-> **Scope note**: §3.3 ships in two phases. **v1 (this commit)** raises the inline cap from 10 MB to 60 MB and adds a "Large Image Received" notification. Big blobs ride the same `Message::Clipboard` path as small ones — no descriptor, no fetch indirection. Test cases below validate the v1 path.
+> **Design recap**: ≤ 10 MB images ride inline on `Message::Clipboard` (Tier A, unchanged). > 10 MB images: sender writes the bytes to a temp file under `temp_downloads/<id>.<ext>`, registers them in `state.local_clipboard_blobs`, and broadcasts a *descriptor* on `Message::Clipboard` with empty data plus `fetch_id`, `mime_type`, `total_size`, and dims. Receivers route into one of two paths based on `total_size` vs. `max_auto_download_size`:
 >
-> **v2 (deferred)** is the descriptor + auto-fetch design from earlier in this document — separate `clustercut-file` ALPN stream, "Downloading data…" → "Data available to paste" UX, race protection (newest copy wins), and Tier 3 file-fallback for >50 MB. Test cases below labeled **(v2 — deferred)** describe what *should* be tested once that lands; they're not actionable yet.
+> - **Tier B1** (≤ `max_auto_download_size`): auto-fetch via the existing `clustercut-file` ALPN stream. The new `delivery_target = Clipboard { mime, w, h }` field on `FileStreamHeader` tells the receiver to land the bytes on the OS clipboard rather than in `temp_downloads`. Notifications fire at fetch start ("Receiving Clipboard Image…") and on completion ("Image Available to Paste"). Race protection: a newer clipboard event clears `state.in_flight_clipboard_fetch`, and bytes for the older fetch — though still drained off the wire to keep QUIC happy — are dropped instead of overwriting the OS clipboard.
+> - **Tier B2** (> `max_auto_download_size`): same wire shape, but the receiver does not fetch automatically. Instead the descriptor is stashed in `state.pending_clipboard` and an actionable notification fires. The user accepts via the existing pending-clipboard UI, which calls `confirm_pending_clipboard`; that command detects descriptor mode and triggers the FileRequest.
+>
+> **Tier C** (file from file manager) is unchanged — `Files()` payload, `delivery_target = Disk`, paste lands as a file reference.
 
-#### T-3.3.1 — 11–60 MB image transfers cleanly
+#### T-3.3.1 — Inline path unchanged for ≤ 10 MB images
 
-1. Find or generate a high-resolution PNG that encodes to 15–25 MB (e.g. a screenshot of a 4K display, a photo edited at maximum quality). Verify the PNG file size on disk first.
-2. Open the image in any clipboard-aware app and Copy.
-3. Wait a few seconds for the transfer to complete; observe receiver logs and notifications.
-4. Paste into a destination app on the receiver.
-
-Expected:
-- Sender log: `send_message: connecting … for <N> byte payload` where N is roughly 1.04× the encoded size.
-- Receiver log: `Received clipboard image from <peer>: mime=image/png, decoded=<size> bytes, WxH`.n
-- A "Large Image Received" notification fires on the receiver with the size in MB.
-- Paste produces the original image. No truncation, no corruption.
-
-#### T-3.3.2 — Above the 60 MB cap, sender silently drops
-
-1. Generate or find a PNG that encodes to >60 MB (rare in practice — typically requires uncompressed-style PNG of a very large image).
-2. Copy on the sender.
+1. Copy a small image (a few hundred KB) on the sender.
+2. Observe normal behaviour on the receiver.
 
 Expected:
-- Sender log: `Clipboard image PNG (<N> bytes) exceeds <60 MB> byte wire cap; skipping.`
-- Receiver sees nothing. No bounce, no error to user.
-- **TODO when v2 lands**: this case should route to Tier 3 file-fallback instead of silently dropping.
+- Receiver log: `Received clipboard image from <peer>: mime=image/png, decoded=<size> bytes, WxH`.
+- "Image Received" notification fires with body "Image copied to clipboard" — **not** "Receiving Clipboard Image…" or "Large Image Received". Confirms the threshold gate works.
+- Paste produces the original image, no latency change vs. pre-§3.3.
 
-#### T-3.3.3 — Existing ≤10 MB path is unchanged
+#### T-3.3.2 — > 10 MB image auto-fetches via descriptor (Tier B1)
 
-1. Copy a small image (a few hundred KB).
-2. Observe normal behaviour.
-
-Expected:
-- Receiver log: `Received clipboard image from <peer>: …` as before.
-- Notification text is the *original* "Image Received" / "Image copied to clipboard" — **not** "Large Image Received". Confirms the >10 MB threshold gate works.
-- No latency change vs. the pre-§3.3 behaviour.
-
-#### T-3.3.4 — Network strain / throughput sanity
-
-1. Copy a 30 MB encoded image on the sender.
-2. While transfer is in flight, copy a small text snippet on a *different* peer (so two clipboard events compete on the cluster bus).
-3. Observe both arrive.
+1. Configure `max_auto_download_size = 50 MB` (default).
+2. Find or generate a PNG that encodes to ~25 MB (e.g. a 4K screenshot saved as PNG with no quality knob, or copy a 25 MB JPEG photo via `wl-copy --type image/jpeg`).
+3. Copy on the sender.
+4. Observe the receiver.
 
 Expected:
-- Both events propagate to all peers eventually. The big blob doesn't block the message bus indefinitely. (Each `Message::Clipboard` is its own QUIC stream, so this should hold even under inline transfer.)
-- If you observe one stalling behind the other for >5 s on a healthy LAN, file an issue — that's a transport problem worth digging into.
+- Sender log:
+  - `[ClipboardBlob] Large blob detected (<bytes>, mime=…) — broadcasting descriptor (id=<uuid>)`
+  - On peer FileRequest: `Opening QUIC Stream to <addr> for clipboard-blob '<id>.<ext>' (<bytes> bytes, mime=…)`
+  - `Clipboard-blob sent successfully: <path>`
+- Receiver log:
+  - `Received clipboard image descriptor from <sender>: mime=…, total=<bytes>, fetch_id=<uuid>`
+  - `[ClipboardBlob] Auto-fetching descriptor (<bytes>, mime=…)`
+  - `Receiving Clipboard Blob: mime=…, <bytes> bytes, id=<uuid>, from=<addr>`
+  - `Clipboard-blob stream complete: <bytes> in <duration>`
+- Two notifications fire on the receiver:
+  - "Receiving Clipboard Image — Receiving X.Y MB image from <sender>…" at fetch start.
+  - "Image Available to Paste — X.Y MB image is now on the clipboard." on completion.
+- Pasting on the receiver into an image-aware app shows the original image. The history view shows the entry with a thumbnail and size.
 
-#### T-3.3.5 — Encryption + transport sanity for large blobs
+#### T-3.3.3 — > `max_auto_download_size` requires user accept (Tier B2)
 
-1. Copy a 50 MB encoded image.
-2. On the receiver, watch for any `quinn::ReadToEndError::TooLong` or decrypt-failure log lines.
+1. Lower `max_auto_download_size` to 20 MB in Settings → File Transfer.
+2. Copy a 25 MB image on the sender.
+3. Observe the receiver.
 
 Expected:
-- No errors. ChaCha20Poly1305 handles 50 MB without trouble; QUIC stream `read_to_end` cap is 64 MB so 50 MB raw + ~28 byte AEAD overhead + JSON wrapping (≈1.04× = ~52 MB) fits cleanly.
+- Receiver log:
+  - `Received clipboard image descriptor from <sender>: mime=…, total=…`
+  - `[ClipboardBlob] Descriptor <bytes> exceeds auto-download limit <bytes> bytes — awaiting accept`
+- "Large Clipboard Image — X.Y MB image from <sender> — accept to receive." actionable notification fires.
+- The descriptor appears as a pending entry in the receiver's history view (same UI as auto-receive=off).
+- User accepts via the history UI → `confirm_pending_clipboard` triggers the fetch → bytes land on the OS clipboard, paste works.
+- If the user never accepts, the descriptor sits in `pending_clipboard` until the next clipboard event displaces it. No silent drop.
+
+#### T-3.3.4 — Race: newest clipboard event wins
+
+1. With `max_auto_download_size = 50 MB`, copy a 25 MB image on the sender.
+2. Within a second of the receiver's "Receiving Clipboard Image…" notification, copy a *different* image (or any text) on a *third* peer (so both events arrive at the receiver while the first fetch is in flight).
+3. Observe the receiver.
+
+Expected:
+- Receiver log:
+  - First fetch starts: `[ClipboardBlob] Auto-fetching descriptor`
+  - Second event arrives: `Received clipboard image (or text) from <other-sender>` (the new BLOB HANDLING block clears `in_flight_clipboard_fetch`)
+  - When the first fetch's bytes finish landing: `[ClipboardBlob] Discarding fetched bytes for id=<old-uuid> — superseded by a newer clipboard event`
+- Final clipboard contents on the receiver = the newer (second) event, never the older (first) one. **Newest copy wins**, regardless of fetch ordering.
+
+#### T-3.3.5 — `enable_file_transfer = false` blocks descriptor fetches
+
+1. In Settings → File Transfer, disable file transfers.
+2. Copy a 25 MB image on the sender.
+3. Observe the receiver.
+
+Expected:
+- Receiver log: `File transfer disabled in settings. Ignoring large clipboard descriptor.`
+- No fetch is attempted, no clipboard write happens, no notification fires.
+- The user-visible result is silent drop. Acceptable: file-transfer-off explicitly opts out of all file-shaped wire activity, of which descriptor-mode is one.
+
+#### T-3.3.6 — Backward compat: pre-§3.3 peer
+
+1. Pair a peer running ClusterCut 0.3.0-alpha-2 (no descriptor support) with a peer running this build.
+2. Copy a > 10 MB image on the new-build peer.
+3. Observe the old-build peer.
+
+Expected:
+- The descriptor `Message::Clipboard` deserialises on the old peer with `blob.fetch_id = None` and `blob.data = ""`. The old peer's blob handler tries to decode empty data, gets nothing, and the receive is a silent no-op rather than a crash. **Acceptable graceful degradation.**
+- Going the other direction: an old peer copying a small image inline still works on the new peer (the new peer's `is_descriptor()` check returns false, the inline path runs as before).
+
+#### T-3.3.7 — File path is unchanged
+
+1. Copy a regular file (e.g. a PDF) from the file manager on the sender (right-click → Copy in Nautilus / Files / Finder / Explorer).
+2. Observe the receiver.
+
+Expected:
+- Wire payload uses `Files(Vec<FileMetadata>)`, **not** the descriptor blob path. `delivery_target` on the file-transfer header is `Disk`.
+- Receiver log: existing `Receiving File: <name> (<bytes>) [ID: <id>]` followed by the regular download progress, ending with `File Sent Successfully` / `File Transfer Verified OK`.
+- File lands in `temp_downloads`, paste behaves as today (file reference, file-manager paste copies the file).
 
 ### T-TIRI-stale — IGNORED guard auto-expires after 10 s
 
@@ -339,13 +442,4 @@ Expected:
 - Both peers end up with the text on their clipboards (the image was the sender's transient state).
 - No infinite bouncing.
 
-#### T-3.3.6 (v2 — deferred) — Descriptor + auto-fetch path
-
-When the §3.3 v2 work lands, run:
-
-1. Configure `max_auto_download_size = 50 MB` (default).
-2. Copy a 25 MB image. Verify the receive UX is **"Downloading data… 12 MB / 25 MB"** progress notification, then **"Data available to paste"** — paste works after the second notification.
-3. Copy a 30 MB image while the previous download is still in flight on the receiver. Verify the older download is abandoned (newest-copy-wins race rule), the new descriptor is fetched, and the second image ends up on the clipboard.
-4. Configure `max_auto_download_size = 20 MB` and copy a 25 MB image. Verify the receiver routes through the file-transfer path (Tier 3) — the bytes land as a file in the configured download dir, **not** on the clipboard. Notification text reflects this.
-
-Expected: all three Tier 2 / Tier 3 / race scenarios behave as described in §3.3.
+_(Earlier deferred T-3.3.6 — descriptor + auto-fetch — is superseded by T-3.3.2 through T-3.3.7 above and removed.)_

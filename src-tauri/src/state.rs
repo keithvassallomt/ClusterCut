@@ -3,6 +3,20 @@ use crate::storage::AppSettings;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// One entry in `AppState.local_clipboard_blobs` — everything the sender's
+/// `FileRequest` handler needs to serve a clipboard-blob fetch back to the
+/// requesting peer with the right `delivery_target` hint and clipboard
+/// metadata. Created when the sender writes a >10 MB image to a temp file
+/// and broadcasts a descriptor on `Message::Clipboard`.
+#[derive(Debug, Clone)]
+pub struct ClipboardBlobMetadata {
+    pub path: std::path::PathBuf,
+    pub mime_type: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub total_size: u64,
+}
 // use crate::crypto::SpakeState; // We'll just use explicit path or generic if needed, but explicit path is best.
 // actually, let's use Any or just simple wrapper if circular dep is issue.
 // But valid rust module path is crate::crypto::SpakeState
@@ -39,6 +53,20 @@ pub struct AppState {
     // Mapping of Message ID -> File Paths (for serving file requests)
     // Mapping of Message ID -> File Paths (for serving file requests)
     pub local_files: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Sender-side registry of large clipboard blobs that ride the file-
+    /// transfer ALPN (§3.3 Tier B). Keyed by the originating
+    /// `ClipboardPayload.id`. When a peer responds to the descriptor
+    /// broadcast with a `FileRequest` for this id, we pull the entry, open
+    /// the temp file at `path`, and stream it under
+    /// `delivery_target = Clipboard { mime, w, h }`. Receivers know to land
+    /// the bytes on their OS clipboard rather than disk.
+    pub local_clipboard_blobs: Arc<Mutex<HashMap<String, ClipboardBlobMetadata>>>,
+    /// Receiver-side: the `ClipboardPayload.id` of a clipboard-blob fetch
+    /// currently in flight, or `None` if idle. Used so a fresh clipboard
+    /// event arriving mid-fetch can mark the older fetch as abandoned —
+    /// bytes still drain off the wire to keep QUIC happy, but they don't
+    /// overwrite the OS clipboard once they finish landing. Newest copy wins.
+    pub in_flight_clipboard_fetch: Arc<Mutex<Option<String>>>,
     // Transport instance for sending messages from commands
     pub transport: Arc<Mutex<Option<crate::transport::Transport>>>,
     // Tray Menu Handle
@@ -76,6 +104,8 @@ impl AppState {
             pending_clipboard: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
             local_files: Arc::new(Mutex::new(HashMap::new())),
+            local_clipboard_blobs: Arc::new(Mutex::new(HashMap::new())),
+            in_flight_clipboard_fetch: Arc::new(Mutex::new(None)),
             transport: Arc::new(Mutex::new(None)),
             tray_menu: Arc::new(Mutex::new(None)),
             current_theme: Arc::new(Mutex::new(None)),

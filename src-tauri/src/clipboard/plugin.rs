@@ -55,10 +55,14 @@ static WORKER_CMD_TX: OnceLock<mpsc::Sender<WorkerCommand>> = OnceLock::new();
 /// Cap on RGBA bytes returned by arboard. A 4K image is ~33 MB; 200 MB
 /// covers up to ~7K screenshots without risking absurd allocations.
 const MAX_CLIPBOARD_IMAGE_RGBA_BYTES: usize = 200 * 1024 * 1024;
-/// Wire-format size cap. PNG-encoded blobs over this are dropped on send.
-/// Sourced from the shared cap in `common.rs` so all backends drop at the
-/// same threshold.
-use super::common::MAX_CLIPBOARD_IMAGE_WIRE_BYTES;
+/// Absolute upper bound on the PNG-encoded blob. Anything larger is dropped
+/// (with a warning) — both the inline path and the §3.3 descriptor + file-
+/// transfer path can in principle handle it, but truly enormous PNGs
+/// (multi-hundred-MB) are vanishingly rare in real-world clipboard use and
+/// hit memory pressure on the encode path. The §3.3 inline-vs-descriptor
+/// branch (`MAX_CLIPBOARD_IMAGE_WIRE_BYTES`) is applied later in
+/// `process_clipboard_change`.
+use super::common::MAX_CLIPBOARD_IMAGE_BYTES;
 
 /// Try to pull an image from the clipboard via arboard, encode to PNG, and
 /// return it as a `ClipboardBlob`. Returns `None` for any failure mode —
@@ -105,11 +109,11 @@ fn read_clipboard_image_arboard(arboard: &mut arboard::Clipboard) -> Option<Clip
         return None;
     }
 
-    if png_bytes.len() > MAX_CLIPBOARD_IMAGE_WIRE_BYTES {
+    if png_bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
         tracing::warn!(
-            "Clipboard image PNG ({} bytes) exceeds {} byte wire cap; skipping.",
+            "Clipboard image PNG ({} bytes) exceeds {} byte absolute cap; skipping.",
             png_bytes.len(),
-            MAX_CLIPBOARD_IMAGE_WIRE_BYTES
+            MAX_CLIPBOARD_IMAGE_BYTES
         );
         return None;
     }

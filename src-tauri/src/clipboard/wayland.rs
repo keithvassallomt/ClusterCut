@@ -17,8 +17,12 @@ use wl_clipboard_rs::paste::{
 };
 
 /// Hard cap on bytes we'll read from the clipboard for an image probe.
-/// A 4K uncompressed BMP is ~33 MB; 64 MB is generous headroom.
-const MAX_CLIPBOARD_IMAGE_READ_BYTES: u64 = 64 * 1024 * 1024;
+/// Sized to match `common::MAX_CLIPBOARD_IMAGE_BYTES` so the wlroots backend
+/// can see clipboard images up to the same upper bound the descriptor
+/// (§3.3) path supports — anything below the 10 MB inline cap rides
+/// `Message::Clipboard` directly, anything above goes via the file-transfer
+/// ALPN.
+const MAX_CLIPBOARD_IMAGE_READ_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Raster image MIME types we know how to decode, in preference order.
 /// PNG first because it's lossless and the most commonly offered by browsers.

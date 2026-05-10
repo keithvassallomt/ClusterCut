@@ -1,35 +1,30 @@
 use crate::crypto;
 use crate::protocol::{ClipboardBlob, ClipboardFormat, ClipboardPayload, FileMetadata, Message};
-use crate::state::AppState;
+use crate::state::{AppState, ClipboardBlobMetadata};
 use crate::transport::Transport;
 use std::thread;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
 
-/// Wire-format size cap for clipboard image blobs (raw / encoded bytes).
-/// Sender drops anything over.
-///
-/// Math: the per-message transport cap is 64 MB (`MESSAGE_BYTE_CAP` in
-/// `transport.rs`). Total inflation from raw image bytes to wire is ~1.78×:
-/// inner `ClipboardBlob.data` is base64 (1.33×), gets encrypted (no
-/// expansion), and the encrypted ciphertext is then base64-encoded again
-/// at the `Message::Clipboard` wrapper layer (1.33×) so it survives JSON
-/// serialisation without the random-byte int-array bloat that hit ~3.57×.
-/// 1.33² ≈ 1.78. So 35 MB raw → ~62 MB wire, comfortably under the
-/// 64 MB transport cap.
-///
-/// (An earlier 60 MB cap was set under the assumption of a ~1.04× wire
-/// inflation, which turned out to be a misreading — actual inflation
-/// pre-fix was ~4.75× because of `Vec<u8>` JSON int-array, so blobs
-/// over ~13 MB were already silently dropping at the receiver. The 35 MB
-/// cap here matches the post-fix wire shape.)
-///
-/// **Future work** (descriptor + auto-fetch over `clustercut-file` ALPN
-/// with race protection and Tier 3 file-fallback) is documented in
-/// `BLOB_DATA_TRANSFER_PLAN.md` §3.3 v2 — not yet implemented.
-pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 35 * 1024 * 1024;
+/// Encoded-byte threshold above which a clipboard image switches from the
+/// inline `Message::Clipboard` path to the descriptor + file-transfer path
+/// (§3.3 in `BLOB_DATA_TRANSFER_PLAN.md`). At or below this size, bytes
+/// ride inline; above it, the sender writes a temp file, registers it,
+/// and broadcasts a descriptor for the receiver to fetch via the
+/// `clustercut-file` ALPN stream.
+pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Absolute upper bound on clipboard-image bytes. Anything larger drops with
+/// a warning — both the inline path and the descriptor + file-transfer path
+/// would still in principle work (file transfer has no per-message cap), but
+/// arbitrarily large clipboard payloads hit memory pressure on the sender's
+/// PNG encode and the receiver's accumulator, and are vanishingly rare in
+/// real-world clipboard use. 500 MB is several times bigger than the
+/// largest plausible image clipboard payload (a 4K uncompressed BMP is
+/// ~33 MB, an 8K PNG screenshot tops out around ~150 MB).
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 500 * 1024 * 1024;
 
 /// Threshold above which a "Receiving large clipboard…" notification fires on
 /// the receiver side. A multi-MB inline transfer takes a perceptible amount
@@ -83,6 +78,14 @@ pub fn payload_signature(payload: &ClipboardPayload) -> String {
         }
     }
     if let Some(blob) = payload.blob.as_ref() {
+        // Descriptor mode (§3.3 large blob): `data` is empty and the unique
+        // identifier is the parent payload id, which sender + receiver share
+        // verbatim. Hash that plus mime + total_size so a re-broadcast of
+        // the same descriptor matches and a different one doesn't.
+        if let Some(fetch_id) = blob.fetch_id.as_ref() {
+            let total = blob.total_size.unwrap_or(0);
+            return format!("BLOBDESC:{}:{}:{}", blob.mime_type, fetch_id, total);
+        }
         let raw = blob.data.as_bytes();
         let head_len = raw.len().min(16);
         let tail_start = raw.len().saturating_sub(16);
@@ -164,11 +167,11 @@ pub fn normalize_image_blob_from_bytes(
         out
     };
 
-    if png_bytes.len() > MAX_CLIPBOARD_IMAGE_WIRE_BYTES {
+    if png_bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
         tracing::warn!(
-            "Clipboard image PNG ({} bytes) exceeds {} byte wire cap; skipping.",
+            "Clipboard image PNG ({} bytes) exceeds {} byte absolute cap; skipping.",
             png_bytes.len(),
-            MAX_CLIPBOARD_IMAGE_WIRE_BYTES
+            MAX_CLIPBOARD_IMAGE_BYTES
         );
         return None;
     }
@@ -199,12 +202,12 @@ pub fn normalize_image_blob_from_bytes(
 #[cfg(target_os = "linux")]
 pub fn build_image_blob(bytes: Vec<u8>, source_mime: &str) -> Option<ClipboardBlob> {
     if is_passthrough_image_mime(source_mime) {
-        if bytes.len() > MAX_CLIPBOARD_IMAGE_WIRE_BYTES {
+        if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
             tracing::warn!(
-                "Clipboard {} ({} bytes) exceeds {} byte wire cap; skipping.",
+                "Clipboard {} ({} bytes) exceeds {} byte absolute cap; skipping.",
                 source_mime,
                 bytes.len(),
-                MAX_CLIPBOARD_IMAGE_WIRE_BYTES
+                MAX_CLIPBOARD_IMAGE_BYTES
             );
             return None;
         }
@@ -494,6 +497,67 @@ pub fn should_process_content(
     verdict
 }
 
+/// File extension for the §3.3 temp-file written when a large clipboard blob
+/// is staged for the file-transfer path. Used in `temp_downloads/<id>.<ext>`.
+/// Picked from MIME so the file is visually meaningful if it leaks past the
+/// startup `clear_cache` (which it shouldn't — but if it does, having the
+/// right extension makes manual cleanup easier).
+fn extension_for_clipboard_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/svg+xml" => "svg",
+        "image/webp" => "webp",
+        "image/bmp" | "image/x-bmp" => "bmp",
+        "image/tiff" => "tiff",
+        _ => "bin",
+    }
+}
+
+/// Stage a large clipboard blob's raw bytes to disk in `temp_downloads/<id>.<ext>`
+/// and register the entry in `state.local_clipboard_blobs`. Used by the §3.3
+/// descriptor path: when an image's encoded size exceeds the inline cap, the
+/// sender writes the bytes here so peers can fetch them via the existing
+/// `clustercut-file` ALPN stream once they receive the descriptor on
+/// `Message::Clipboard`.
+fn stage_clipboard_blob_temp_file(
+    app: &AppHandle,
+    state: &AppState,
+    msg_id: &str,
+    mime_type: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("resolve cache dir: {}", e))?
+        .join("temp_downloads");
+    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("create temp dir: {}", e))?;
+
+    let ext = extension_for_clipboard_mime(mime_type);
+    let path = cache_dir.join(format!("{}.{}", msg_id, ext));
+
+    std::fs::write(&path, bytes).map_err(|e| format!("write temp file {:?}: {}", path, e))?;
+
+    let metadata = ClipboardBlobMetadata {
+        path: path.clone(),
+        mime_type: mime_type.to_string(),
+        width,
+        height,
+        total_size: bytes.len() as u64,
+    };
+
+    {
+        let mut map = state.local_clipboard_blobs.lock().unwrap();
+        map.insert(msg_id.to_string(), metadata);
+    }
+
+    Ok(())
+}
+
 /// Process a changed clipboard content: build payload and broadcast.
 pub fn process_clipboard_change(
     content: ClipboardContent,
@@ -648,15 +712,83 @@ pub fn process_clipboard_change(
                 .unwrap_or_default()
                 .as_secs();
             let local_id = state.local_device_id.lock().unwrap().clone();
-            let payload_obj = ClipboardPayload {
-                id: msg_id,
-                text: String::new(),
-                files: None,
-                blob: Some(blob),
-                formats: None,
-                timestamp: ts,
-                sender: hostname,
-                sender_id: local_id,
+
+            // Inline-vs-descriptor decision (§3.3). Decoded byte size is
+            // what would actually ride the wire as base64 inside
+            // Message::Clipboard; over the threshold, switch to the
+            // descriptor + file-transfer path.
+            let decoded_len = blob.decoded_len();
+            let payload_obj = if decoded_len <= MAX_CLIPBOARD_IMAGE_WIRE_BYTES {
+                ClipboardPayload {
+                    id: msg_id,
+                    text: String::new(),
+                    files: None,
+                    blob: Some(blob),
+                    formats: None,
+                    timestamp: ts,
+                    sender: hostname,
+                    sender_id: local_id,
+                }
+            } else {
+                // Descriptor path. Write the bytes to a temp file under the
+                // same `temp_downloads` dir the file-transfer path uses on
+                // the receiver side, register in `local_clipboard_blobs`, and
+                // emit a descriptor-only `ClipboardBlob` on the wire. Peers
+                // will respond with `Message::FileRequest` and pull the bytes
+                // over the `clustercut-file` ALPN.
+                let raw_bytes = match blob.raw_bytes() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to decode clipboard blob bytes for descriptor path: {}",
+                            e
+                        );
+                        return;
+                    }
+                };
+                match stage_clipboard_blob_temp_file(
+                    app_handle,
+                    state,
+                    &msg_id,
+                    &blob.mime_type,
+                    blob.width,
+                    blob.height,
+                    &raw_bytes,
+                ) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "[ClipboardBlob] Large blob detected ({} bytes, mime={}) — broadcasting descriptor (id={})",
+                            raw_bytes.len(),
+                            blob.mime_type,
+                            msg_id
+                        );
+                        ClipboardPayload {
+                            id: msg_id.clone(),
+                            text: String::new(),
+                            files: None,
+                            blob: Some(ClipboardBlob::descriptor(
+                                blob.mime_type.clone(),
+                                msg_id,
+                                raw_bytes.len() as u64,
+                                blob.width,
+                                blob.height,
+                            )),
+                            formats: None,
+                            timestamp: ts,
+                            sender: hostname,
+                            sender_id: local_id,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to stage large clipboard blob to temp file: {} (size={} bytes, mime={})",
+                            e,
+                            raw_bytes.len(),
+                            blob.mime_type
+                        );
+                        return;
+                    }
+                }
             };
 
             let sig = payload_signature(&payload_obj);
@@ -956,6 +1088,8 @@ mod tests {
             data: data.to_string(),
             width: w,
             height: h,
+            fetch_id: None,
+            total_size: None,
         }
     }
 
@@ -1022,6 +1156,59 @@ mod tests {
             ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}"),
         ];
         assert!(!rich_eq_stable("hello", &only_html, "hello", &html_and_rtf));
+    }
+
+    // ─── §3.3 — descriptor signature is stable, fetch_id-keyed ─────────────
+
+    #[test]
+    fn signature_for_descriptor_blob_uses_fetch_id() {
+        let descriptor = ClipboardBlob::descriptor(
+            "image/png",
+            "abc-123",
+            25_000_000,
+            Some(1920),
+            Some(1080),
+        );
+        let payload = ClipboardPayload {
+            id: "abc-123".to_string(),
+            text: String::new(),
+            files: None,
+            blob: Some(descriptor),
+            formats: None,
+            timestamp: 0,
+            sender: "host".to_string(),
+            sender_id: "device".to_string(),
+        };
+        let sig = payload_signature(&payload);
+        assert!(sig.starts_with("BLOBDESC:image/png:abc-123:"), "got: {}", sig);
+        assert!(sig.contains("25000000"), "size missing from sig: {}", sig);
+    }
+
+    #[test]
+    fn signature_descriptor_distinguishes_different_fetch_ids() {
+        let a = ClipboardBlob::descriptor("image/png", "id-a", 100, None, None);
+        let b = ClipboardBlob::descriptor("image/png", "id-b", 100, None, None);
+        let pa = ClipboardPayload {
+            id: "id-a".to_string(),
+            text: String::new(),
+            files: None,
+            blob: Some(a),
+            formats: None,
+            timestamp: 0,
+            sender: "h".to_string(),
+            sender_id: "d".to_string(),
+        };
+        let pb = ClipboardPayload {
+            id: "id-b".to_string(),
+            text: String::new(),
+            files: None,
+            blob: Some(b),
+            formats: None,
+            timestamp: 0,
+            sender: "h".to_string(),
+            sender_id: "d".to_string(),
+        };
+        assert_ne!(payload_signature(&pa), payload_signature(&pb));
     }
 
     #[test]

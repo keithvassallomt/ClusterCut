@@ -27,8 +27,16 @@ pub struct FileMetadata {
     pub size: u64,
 }
 
-// In-memory clipboard image data, normalised to PNG on the wire.
+// In-memory clipboard image data.
 // Width/height are hints for the receiver (UI thumbnails, debug logs).
+//
+// Two modes:
+// - **Inline** (`fetch_id = None`): `data` carries the bytes base64-encoded.
+//   Used for images ≤ MAX_CLIPBOARD_IMAGE_WIRE_BYTES.
+// - **Descriptor** (`fetch_id = Some`): `data` is empty. The receiver fetches
+//   the actual bytes via `Message::FileRequest` referencing `fetch_id` over
+//   the existing `clustercut-file` ALPN stream, then writes them to its OS
+//   clipboard under `mime_type`. Used for images > MAX_CLIPBOARD_IMAGE_WIRE_BYTES.
 //
 // `data` is **base64-encoded** because serde_json serialises a raw `Vec<u8>`
 // as a JSON array of integers (`[1,2,3,…]`), which adds ~3.5× per-byte bloat.
@@ -41,6 +49,18 @@ pub struct ClipboardBlob {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
+    /// Descriptor mode. When `Some`, `data` is empty and the receiver must
+    /// fetch the bytes via `Message::FileRequest` referencing this id (which
+    /// equals the parent `ClipboardPayload.id`). Older peers that omit this
+    /// field deserialise it as `None` and treat the blob as inline — they
+    /// just decode an empty `data`, which produces an empty image they
+    /// quietly drop. Graceful degradation against pre-§3.3 peers.
+    #[serde(default)]
+    pub fetch_id: Option<String>,
+    /// Total raw byte size of the eventual blob — receiver uses this to
+    /// decide auto-fetch vs. user-confirm against `max_auto_download_size`.
+    #[serde(default)]
+    pub total_size: Option<u64>,
 }
 
 impl ClipboardBlob {
@@ -57,7 +77,36 @@ impl ClipboardBlob {
             data: base64::engine::general_purpose::STANDARD.encode(bytes),
             width,
             height,
+            fetch_id: None,
+            total_size: None,
         }
+    }
+
+    /// Construct a descriptor blob: no inline bytes, just metadata so the
+    /// receiver can decide whether to auto-fetch via the file-transfer ALPN
+    /// stream or prompt the user to accept. `fetch_id` should equal the
+    /// parent `ClipboardPayload.id`.
+    pub fn descriptor(
+        mime_type: impl Into<String>,
+        fetch_id: impl Into<String>,
+        total_size: u64,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data: String::new(),
+            width,
+            height,
+            fetch_id: Some(fetch_id.into()),
+            total_size: Some(total_size),
+        }
+    }
+
+    /// True if this blob is a descriptor (no inline bytes; receiver must
+    /// fetch via `Message::FileRequest`).
+    pub fn is_descriptor(&self) -> bool {
+        self.fetch_id.is_some()
     }
 
     /// Decode the base64 wire form back into raw bytes ready to feed into
@@ -164,6 +213,35 @@ pub struct FileRequestPayload {
     pub offset: u64,
 }
 
+/// Where the receiver should land an incoming file-transfer stream. `Disk`
+/// is the existing behaviour (write to `temp_downloads`, surface via
+/// `file-received`, paste as a file reference). `Clipboard` is the §3.3
+/// large-blob path: accumulate bytes in memory and write them to the OS
+/// clipboard as an image under the given MIME / dims. The wire shape and
+/// streaming/auth/ack machinery are identical for both — the only thing
+/// that changes is what the receiver does with the bytes once delivered.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryTarget {
+    Disk,
+    Clipboard {
+        mime_type: String,
+        #[serde(default)]
+        width: Option<u32>,
+        #[serde(default)]
+        height: Option<u32>,
+    },
+}
+
+impl Default for DeliveryTarget {
+    fn default() -> Self {
+        DeliveryTarget::Disk
+    }
+}
+
+fn default_delivery_target() -> DeliveryTarget {
+    DeliveryTarget::Disk
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileStreamHeader {
     pub id: String, // Message/Batch ID
@@ -175,6 +253,11 @@ pub struct FileStreamHeader {
     // Defaults to false so headers from peers <= 0.2.2 (which omit the field) parse cleanly.
     #[serde(default)]
     pub compressed: bool,
+    /// Disk (existing default) or Clipboard. Receiver routes the stream's
+    /// bytes accordingly. Older peers that omit the field deserialise as
+    /// Disk and behave exactly as today.
+    #[serde(default = "default_delivery_target")]
+    pub delivery_target: DeliveryTarget,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -461,5 +544,73 @@ mod tests {
         let parsed: ClipboardFormat = serde_json::from_str(json).unwrap();
         assert!(!parsed.binary);
         assert_eq!(parsed.data, "<p>x</p>");
+    }
+
+    // ─── §3.3 — descriptor mode (large blobs ride the file-transfer ALPN) ───
+
+    #[test]
+    fn clipboard_blob_descriptor_round_trips_through_json() {
+        let blob = ClipboardBlob::descriptor("image/png", "abc-123", 25_000_000, Some(1920), Some(1080));
+        assert!(blob.is_descriptor());
+        assert_eq!(blob.fetch_id.as_deref(), Some("abc-123"));
+        assert_eq!(blob.total_size, Some(25_000_000));
+        assert!(blob.data.is_empty());
+
+        let json = serde_json::to_string(&blob).unwrap();
+        let parsed: ClipboardBlob = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, blob);
+    }
+
+    #[test]
+    fn clipboard_blob_pre_descriptor_field_format_deserializes_as_inline() {
+        // A 0.3.0-alpha-2 payload without fetch_id/total_size must still
+        // parse, with the new fields defaulting to None (inline mode).
+        let old_json = r#"{
+            "mime_type": "image/png",
+            "data": "AQID",
+            "width": 100,
+            "height": 100
+        }"#;
+        let parsed: ClipboardBlob = serde_json::from_str(old_json).unwrap();
+        assert!(!parsed.is_descriptor());
+        assert!(parsed.fetch_id.is_none());
+        assert!(parsed.total_size.is_none());
+        assert_eq!(parsed.raw_bytes().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn file_stream_header_pre_delivery_target_field_deserializes_as_disk() {
+        // A pre-§3.3 header (peers up through 0.3.0-alpha-2) without
+        // delivery_target must still parse and behave as Disk delivery.
+        let old_json = r#"{
+            "id": "abc",
+            "file_index": 0,
+            "file_name": "test.txt",
+            "file_size": 42,
+            "auth_token": "QUFB",
+            "compressed": false
+        }"#;
+        let parsed: FileStreamHeader = serde_json::from_str(old_json).unwrap();
+        assert_eq!(parsed.delivery_target, DeliveryTarget::Disk);
+    }
+
+    #[test]
+    fn file_stream_header_clipboard_delivery_target_round_trips() {
+        let header = FileStreamHeader {
+            id: "blob-1".to_string(),
+            file_index: 0,
+            file_name: "blob-1.png".to_string(),
+            file_size: 12_345_678,
+            auth_token: "QUFB".to_string(),
+            compressed: false,
+            delivery_target: DeliveryTarget::Clipboard {
+                mime_type: "image/png".to_string(),
+                width: Some(1920),
+                height: Some(1080),
+            },
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        let parsed: FileStreamHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.delivery_target, header.delivery_target);
     }
 }
