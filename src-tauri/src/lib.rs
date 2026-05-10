@@ -1991,8 +1991,6 @@ async fn handle_pairing_connection(
         return;
     }
 
-    gossip_peer(&p, &state, &transport, Some(peer_addr));
-
     // Step 5: read PairFingerprint (must arrive on the same socket)
     let encrypted_fp_payload = match crate::transport::read_pairing_frame(&mut stream).await {
         Ok(PairingMessage::PairFingerprint { encrypted_payload }) => encrypted_payload,
@@ -2011,7 +2009,7 @@ async fn handle_pairing_connection(
             serde_json::from_slice::<crate::protocol::PairFingerprintPayload>(&plaintext)
                 .map_err(|e| e.to_string())
         });
-    match payload_result {
+    let fully_paired_peer = match payload_result {
         Ok(crate::protocol::PairFingerprintPayload { device_id, fingerprint }) => {
             let mut kp_lock = state.known_peers.lock().unwrap();
             if let Some(peer) = kp_lock.get_mut(&device_id) {
@@ -2021,13 +2019,25 @@ async fn handle_pairing_connection(
                 drop(kp_lock);
                 let _ = app_handle.emit("peer-update", &updated);
                 tracing::info!("Pinned fingerprint for paired peer {}", device_id);
+                Some(updated)
             } else {
                 tracing::warn!("PairFingerprint for unknown peer id {}", device_id);
+                None
             }
         }
         Err(e) => {
             tracing::error!("Failed to decrypt PairFingerprint from {}: {}", peer_addr, e);
+            None
         }
+    };
+
+    // Gossip the new peer ONLY after PairFingerprint completes — under the
+    // strict mTLS model, other peers in the cluster need the new peer's
+    // fingerprint to accept its inbound connections. Gossiping with
+    // `fingerprint=None` (as we did before mTLS landed) would leave the
+    // new peer unable to talk to anyone except the responder.
+    if let Some(updated_peer) = fully_paired_peer {
+        gossip_peer(&updated_peer, &state, &transport, Some(peer_addr));
     }
 }
 
@@ -2881,13 +2891,21 @@ pub fn run() {
             let listener_handle = app.handle().clone();
             let listener_state = (*app.state::<AppState>()).clone();
 
-            // Wire fingerprint resolver: known_peers is loaded by now, so
-            // post-pairing sends pin the looked-up fingerprint. Pairing-flow
-            // sends use the `_unauthenticated` variants and skip this lookup.
+            // Wire both fingerprint resolvers now that known_peers is loaded.
+            //   - fingerprint_resolver: client side, address → expected fp.
+            //   - known_fingerprints_resolver: server side, fp → "is paired?".
+            // Pairing itself runs over plain TCP and bypasses both, so the
+            // chicken-and-egg of "first contact" is handled separately.
             {
                 let resolver_state = listener_state.clone();
                 transport.set_fingerprint_resolver(std::sync::Arc::new(move |addr| {
                     resolver_state.fingerprint_for(addr)
+                }));
+            }
+            {
+                let resolver_state = listener_state.clone();
+                transport.set_known_fingerprints_resolver(std::sync::Arc::new(move |fp| {
+                    resolver_state.knows_fingerprint(fp)
                 }));
             }
 

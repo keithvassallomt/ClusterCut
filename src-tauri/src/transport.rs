@@ -7,50 +7,66 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// Maps a peer's socket address to the SHA-256 fingerprint of the cert we
+/// expect that peer to present. Used by the *client* side to pin the server
+/// cert during handshake.
 pub type FingerprintResolver = Arc<dyn Fn(SocketAddr) -> Option<Vec<u8>> + Send + Sync>;
+
+/// Predicate over fingerprints: returns true if the given SHA-256 is one of
+/// our paired peers. Used by the *server* side to validate a presented
+/// client cert during the QUIC mTLS handshake — at that point we don't yet
+/// know which peer is connecting, only that it must be one of ours.
+pub type KnownFingerprintsResolver = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Transport {
     pub endpoint: Endpoint,
-    no_fp_transport_config: ClientConfig,
-    no_fp_file_config: ClientConfig,
     local_cert_der: Vec<u8>,
+    local_key_der: Vec<u8>,
     fingerprint_resolver: Arc<Mutex<Option<FingerprintResolver>>>,
+    known_fingerprints_resolver: Arc<Mutex<Option<KnownFingerprintsResolver>>>,
 }
 
 impl Transport {
     /// Build a Transport from a pre-existing self-signed cert. Persisting and loading
     /// the cert is the caller's responsibility — `Transport` doesn't touch disk.
     pub fn new(port: u16, cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<Self, Box<dyn Error>> {
-        let server_config = configure_server(cert_der.clone(), key_der)?;
+        let known_fingerprints_resolver: Arc<Mutex<Option<KnownFingerprintsResolver>>> =
+            Arc::new(Mutex::new(None));
 
-        // Fallback configs used only for legacy peers paired before cert
-        // pinning landed (their `known_peers.json` entry has no fingerprint).
-        // Phase 2 of the security redesign removes this branch entirely —
-        // peers without a pinned fingerprint will be unreachable and must
-        // re-pair. Pairing itself never goes through QUIC anymore (it runs
-        // on a dedicated plaintext-TCP channel; see `start_pairing_listener`).
-        let no_fp_transport_config = configure_client(vec![b"clustercut-transport".to_vec()], None)?;
-        let no_fp_file_config = configure_client(vec![b"clustercut-file".to_vec()], None)?;
+        let server_config = configure_server(
+            cert_der.clone(),
+            key_der.clone(),
+            known_fingerprints_resolver.clone(),
+        )?;
 
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        let mut endpoint = Endpoint::server(server_config, addr)?;
-        endpoint.set_default_client_config(no_fp_transport_config.clone());
+        // No `set_default_client_config` — every outbound connection goes
+        // through `connect_with(...)` with a per-peer pinned config. Calling
+        // `connect()` without an explicit config will error, which is what
+        // we want: there is no safe default for an mTLS-only endpoint.
+        let endpoint = Endpoint::server(server_config, addr)?;
 
         Ok(Self {
             endpoint,
-            no_fp_transport_config,
-            no_fp_file_config,
             local_cert_der: cert_der,
+            local_key_der: key_der,
             fingerprint_resolver: Arc::new(Mutex::new(None)),
+            known_fingerprints_resolver,
         })
     }
 
     /// Install (or replace) the resolver that maps a peer address to its pinned
-    /// SHA-256 fingerprint. Call this once known_peers is loaded; until then
-    /// every send falls back to skip-verify.
+    /// SHA-256 fingerprint. Call this once known_peers is loaded.
     pub fn set_fingerprint_resolver(&self, resolver: FingerprintResolver) {
         *self.fingerprint_resolver.lock().unwrap() = Some(resolver);
+    }
+
+    /// Install (or replace) the predicate used by the server side of the
+    /// QUIC mTLS handshake to recognise paired peers' client certs. Without
+    /// this set, every inbound QUIC connection is rejected.
+    pub fn set_known_fingerprints_resolver(&self, resolver: KnownFingerprintsResolver) {
+        *self.known_fingerprints_resolver.lock().unwrap() = Some(resolver);
     }
 
     /// SHA-256 of the local cert DER, used as the device's public TLS identity.
@@ -67,19 +83,29 @@ impl Transport {
     }
 
     fn transport_config_for(&self, addr: SocketAddr) -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
-        match self.resolve_fingerprint(addr) {
-            Some(fp) => configure_client(vec![b"clustercut-transport".to_vec()], Some(fp))
-                .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() }),
-            None => Ok(self.no_fp_transport_config.clone()),
-        }
+        let fp = self.resolve_fingerprint(addr).ok_or_else(|| -> Box<dyn Error + Send + Sync> {
+            format!("no pinned fingerprint for {addr}; peer must re-pair").into()
+        })?;
+        configure_client(
+            vec![b"clustercut-transport".to_vec()],
+            fp,
+            self.local_cert_der.clone(),
+            self.local_key_der.clone(),
+        )
+        .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })
     }
 
     fn file_config_for(&self, addr: SocketAddr) -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
-        match self.resolve_fingerprint(addr) {
-            Some(fp) => configure_client(vec![b"clustercut-file".to_vec()], Some(fp))
-                .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() }),
-            None => Ok(self.no_fp_file_config.clone()),
-        }
+        let fp = self.resolve_fingerprint(addr).ok_or_else(|| -> Box<dyn Error + Send + Sync> {
+            format!("no pinned fingerprint for {addr}; peer must re-pair").into()
+        })?;
+        configure_client(
+            vec![b"clustercut-file".to_vec()],
+            fp,
+            self.local_cert_der.clone(),
+            self.local_key_der.clone(),
+        )
+        .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })
     }
 
     pub async fn send_message(
@@ -307,13 +333,24 @@ pub fn cert_fingerprint(cert_der: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn configure_server(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<ServerConfig, Box<dyn Error>> {
+fn configure_server(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    known_fingerprints_resolver: Arc<Mutex<Option<KnownFingerprintsResolver>>>,
+) -> Result<ServerConfig, Box<dyn Error>> {
     let cert = rustls::pki_types::CertificateDer::from(cert_der);
     let key =
         rustls::pki_types::PrivateKeyDer::try_from(key_der).map_err(|_| "Invalid private key")?;
 
+    let algorithms = signature_algorithms()?;
+    let client_verifier = Arc::new(KnownFingerprintsClientVerifier {
+        resolver: known_fingerprints_resolver,
+        algorithms,
+        no_subjects: Vec::new(),
+    });
+
     let mut crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+        .with_client_cert_verifier(client_verifier)
         .with_single_cert(vec![cert], key)?;
 
     crypto.alpn_protocols = vec![
@@ -343,91 +380,165 @@ fn configure_server(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<ServerConfig,
     Ok(server_config)
 }
 
+fn signature_algorithms() -> Result<rustls::crypto::WebPkiSupportedAlgorithms, Box<dyn Error>> {
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .ok_or("no rustls crypto provider installed")?;
+    Ok(provider.signature_verification_algorithms)
+}
+
+/// Server-cert verifier used by the client side of every QUIC connection.
+/// Pins the SHA-256 of the server's end-entity cert DER (substituting the
+/// usual CA chain validation) AND delegates the TLS handshake-signature
+/// check to rustls's WebPKI implementation so the peer is forced to prove
+/// possession of the matching private key — fingerprint match alone is
+/// not enough (see issue #9).
+#[derive(Debug)]
+struct PinnedFingerprintServerVerifier {
+    expected: Vec<u8>,
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedFingerprintServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let actual = cert_fingerprint(end_entity.as_ref());
+        if actual.as_slice() != self.expected.as_slice() {
+            return Err(rustls::Error::General(format!(
+                "server cert fingerprint mismatch: expected {}, got {}",
+                hex_short(&self.expected),
+                hex_short(&actual)
+            )));
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
+/// Client-cert verifier used by the server side of every QUIC connection.
+/// Accepts any client cert whose SHA-256 fingerprint is in our paired-peers
+/// set (consulted live via the resolver — new pairings during the session
+/// are picked up without restart). Delegates handshake-signature validation
+/// to rustls's WebPKI just like the server-cert verifier above.
+struct KnownFingerprintsClientVerifier {
+    resolver: Arc<Mutex<Option<KnownFingerprintsResolver>>>,
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+    /// rustls's `ClientCertVerifier` returns a slice of root-hint subjects
+    /// in the CertificateRequest. We don't use a CA / DN-based system, so
+    /// this is intentionally empty.
+    no_subjects: Vec<rustls::DistinguishedName>,
+}
+
+impl std::fmt::Debug for KnownFingerprintsClientVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KnownFingerprintsClientVerifier")
+            .finish_non_exhaustive()
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for KnownFingerprintsClientVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &self.no_subjects
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        let actual = cert_fingerprint(end_entity.as_ref());
+        let resolver = self.resolver.lock().unwrap();
+        match resolver.as_ref() {
+            Some(r) if r(&actual) => {
+                Ok(rustls::server::danger::ClientCertVerified::assertion())
+            }
+            Some(_) => Err(rustls::Error::General(format!(
+                "client cert fingerprint not in known peers: {}",
+                hex_short(&actual)
+            ))),
+            None => Err(rustls::Error::General(
+                "client auth attempted before known-fingerprints resolver installed".into(),
+            )),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
 fn configure_client(
     alpn_protocols: Vec<Vec<u8>>,
-    pinned_fingerprint: Option<Vec<u8>>,
+    pinned_fingerprint: Vec<u8>,
+    local_cert_der: Vec<u8>,
+    local_key_der: Vec<u8>,
 ) -> Result<ClientConfig, Box<dyn Error>> {
-    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::{DigitallySignedStruct, SignatureScheme};
+    let algorithms = signature_algorithms()?;
+    let verifier = Arc::new(PinnedFingerprintServerVerifier {
+        expected: pinned_fingerprint,
+        algorithms,
+    });
 
-    /// Verifier that pins the SHA-256 of the server's cert DER if a fingerprint
-    /// is configured. With `expected = None` it accepts any cert (pairing path
-    /// before fingerprint exchange, and legacy peers without a stored
-    /// fingerprint — see issue #9).
-    #[derive(Debug)]
-    struct FingerprintVerifier {
-        expected: Option<Vec<u8>>,
-    }
-    impl ServerCertVerifier for FingerprintVerifier {
-        fn verify_server_cert(
-            &self,
-            end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            if let Some(expected) = &self.expected {
-                let actual = cert_fingerprint(end_entity.as_ref());
-                if actual.as_slice() != expected.as_slice() {
-                    return Err(rustls::Error::General(format!(
-                        "cert fingerprint mismatch: expected {}, got {}",
-                        hex_short(expected),
-                        hex_short(&actual)
-                    )));
-                }
-            }
-            Ok(ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::RSA_PSS_SHA256,
-                SignatureScheme::RSA_PSS_SHA384,
-                SignatureScheme::RSA_PSS_SHA512,
-                SignatureScheme::ED25519,
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::ECDSA_NISTP384_SHA384,
-            ]
-        }
-    }
+    let cert = rustls::pki_types::CertificateDer::from(local_cert_der);
+    let key = rustls::pki_types::PrivateKeyDer::try_from(local_key_der)
+        .map_err(|_| "Invalid client key")?;
 
     let mut client_config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(FingerprintVerifier {
-            expected: pinned_fingerprint,
-        }))
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(vec![cert], key)?;
 
-    // Set ALPN protocols on the underlying rustls config
     client_config.alpn_protocols = alpn_protocols;
 
-    // Client ALPN will be set per-connection ("connect(..., alpn)") so we don't need default here,
-    // but we can add them to supported.
     let mut quic_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_config)?,
     ));
 
-    // Increase Transport Limits for Client Config
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.stream_receive_window(quinn::VarInt::from_u32(100 * 1024 * 1024));
     transport_config.receive_window(quinn::VarInt::from_u32(250 * 1024 * 1024));

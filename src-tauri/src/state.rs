@@ -117,16 +117,27 @@ impl AppState {
         self.shutdown.load(Ordering::SeqCst)
     }
 
-    /// Look up the pinned cert fingerprint for the peer at `addr`. Returns None
-    /// for peers not in known_peers, peers paired before cert-pinning landed,
-    /// or during the pairing flow itself — those connections fall back to
-    /// skip-verify (see issue #9).
+    /// Look up the pinned cert fingerprint for the peer at `addr`, used by
+    /// the *client* side of QUIC handshakes to verify the responder's cert.
+    /// Returns None for peers not in known_peers or peers without a pinned
+    /// fingerprint (those need to re-pair under the v0.3 strict mTLS model).
     pub fn fingerprint_for(&self, addr: std::net::SocketAddr) -> Option<Vec<u8>> {
         let peers = self.known_peers.lock().unwrap();
         peers
             .values()
             .find(|p| p.ip == addr.ip())
             .and_then(|p| p.fingerprint.clone())
+    }
+
+    /// True if `fp` matches the pinned fingerprint of any peer in
+    /// known_peers. Used by the *server* side of QUIC handshakes (mTLS
+    /// client-cert validation) where we only know the presented cert,
+    /// not which peer is connecting.
+    pub fn knows_fingerprint(&self, fp: &[u8]) -> bool {
+        let peers = self.known_peers.lock().unwrap();
+        peers
+            .values()
+            .any(|p| p.fingerprint.as_deref() == Some(fp))
     }
 
     pub fn add_peer(&self, peer: Peer) {
