@@ -422,6 +422,36 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
     #[cfg(target_os = "macos")]
     {
         let _ = increment_badge;
+
+        // Dev-mode fallback: when the binary isn't running inside an
+        // `.app` bundle, user-notify silently swallows everything via its
+        // `NotificationManagerMock` (no UNUserNotificationCenter access
+        // outside a bundle). Detect that and shell out to `osascript`
+        // instead — actions aren't supported but the user at least sees
+        // the notification banner. The bundle-check log fires at startup
+        // (see `init_logging`).
+        let in_bundle = std::env::current_exe()
+            .map(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+            .unwrap_or(false);
+        if !in_bundle {
+            tracing::info!("[Notification] macOS dev mode — falling back to osascript (no bundle).");
+            let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+            let script = format!(
+                "display notification \"{}\" with title \"{}\"",
+                escape(body),
+                escape(title)
+            );
+            std::thread::spawn(move || {
+                if let Err(e) = std::process::Command::new("osascript")
+                    .args(["-e", &script])
+                    .output()
+                {
+                    tracing::warn!("[Notification] osascript fallback failed: {}", e);
+                }
+            });
+            return;
+        }
+
         tracing::info!("[Notification] macOS detected. Using user-notify...");
 
         // Update last notification time
