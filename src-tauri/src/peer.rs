@@ -12,12 +12,14 @@ pub struct Peer {
     // Network Name (discovered via mDNS)
     #[serde(default)]
     pub network_name: Option<String>,
-    // Cluster Authentication Signature (Base64)
-    #[serde(default)]
+    /// Legacy field from the pre-mTLS cluster-key signature scheme.
+    /// Always None on v0.3+; kept as `#[serde(default)]` so on-disk
+    /// `known_peers.json` from older versions deserialises cleanly.
+    #[serde(default, skip_serializing)]
     pub signature: Option<String>,
-    // SHA-256 of the peer's TLS cert DER. Set during pairing or learned via
-    // gossip from a trusted peer; absent for peers paired before cert-pinning
-    // landed (those connections fall back to skip-verify until re-pair).
+    // SHA-256 of the peer's TLS cert DER. Set during pairing. Peers
+    // paired before mTLS landed have None here and need to re-pair
+    // (Phase 4 surfaces this in the UI).
     #[serde(default)]
     pub fingerprint: Option<Vec<u8>>,
 }

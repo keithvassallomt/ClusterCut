@@ -1,26 +1,6 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-/// serde adapter: serialise/deserialise `Vec<u8>` as a base64 JSON string
-/// instead of the default `[1,2,3,…]` integer array. Used for the encrypted
-/// `Message::Clipboard` payload, which can be tens of MB; the int-array
-/// form inflates random-byte content by ~3.57× (measured), pushing
-/// large blobs over the receiver's 64 MB transport cap. Base64 inflates
-/// at ~1.33×, comfortably under the cap.
-mod b64_bytes {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&BASE64.encode(v))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let s = String::deserialize(d)?;
-        BASE64.decode(s.as_bytes()).map_err(serde::de::Error::custom)
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileMetadata {
     pub name: String,
@@ -248,7 +228,6 @@ pub struct FileStreamHeader {
     pub file_index: usize,
     pub file_name: String,
     pub file_size: u64,
-    pub auth_token: String, // Encrypted token proving Cluster Key possession
     // Whether the payload following the header line is zstd-compressed.
     // Defaults to false so headers from peers <= 0.2.2 (which omit the field) parse cleanly.
     #[serde(default)]
@@ -262,41 +241,49 @@ pub struct FileStreamHeader {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WelcomePayload {
-    pub cluster_key: Vec<u8>,
+    /// Stable cluster identifier (UUID). Replaces the v0.2 `cluster_key`
+    /// shared secret — the secret role is now provided by mTLS, and we
+    /// only need a non-secret handle for grouping in the UI and for
+    /// gossip-loop suppression.
+    pub cluster_id: String,
     pub known_peers: Vec<crate::peer::Peer>,
     pub network_name: String,
-    pub network_pin: String,
-    // SHA-256 of the responder's TLS cert DER. The initiator pins this for
-    // all future connections to the responder. Optional for backward compat
-    // with peers paired before cert-pinning landed.
-    #[serde(default)]
-    pub responder_fingerprint: Option<Vec<u8>>,
+    /// SHA-256 of the responder's TLS cert DER. The initiator pins this
+    /// for all future QUIC connections to the responder.
+    pub responder_fingerprint: Vec<u8>,
+    /// SAS-confirm tag binding this payload to the SPAKE2 session key.
+    /// Computed via `crypto::encrypt(session_key, PAIR_CONFIRM_PLAINTEXT)`.
+    /// Receiver decrypts; success implies both sides derived the same key
+    /// from the same PIN, so the payload can be trusted. See
+    /// [`crypto::PAIR_CONFIRM_PLAINTEXT`].
+    pub confirm: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PairFingerprintPayload {
     pub device_id: String,
     pub fingerprint: Vec<u8>,
+    /// SAS-confirm tag — same construction as `WelcomePayload.confirm`,
+    /// in the opposite direction.
+    pub confirm: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
-    /// Encrypted `ClipboardPayload`. Field is base64-encoded on the wire
-    /// (see `b64_bytes` above) — at multi-MB blob sizes the default
-    /// `Vec<u8>` JSON int-array encoding (3.57×) exceeds the receiver's
-    /// 64 MB transport cap; base64 stays at 1.33× and fits comfortably.
-    /// **Wire-format break**: peers running pre-§3.x versions deserialise
-    /// this as a JSON int-array and reject the base64 string, surfacing
-    /// as a deserialisation error on the receive side.
-    Clipboard(#[serde(with = "b64_bytes")] Vec<u8>),
+    /// `ClipboardPayload` carried directly. Pre-v0.3 the field was
+    /// app-layer-encrypted bytes wrapped here; v0.3+ relies on QUIC mTLS
+    /// for confidentiality and authenticity, so the payload travels as
+    /// a typed struct. Image bytes inside `ClipboardBlob.data` are still
+    /// base64-encoded so they don't bloat to a JSON int-array.
+    Clipboard(ClipboardPayload),
     // Gossip: Broadcast new peer to known peers
     PeerDiscovery(crate::peer::Peer),
     // Broadcast removal of a peer (kick/leave)
     PeerRemoval(String), // Payload is device_id
     // Broadcast deletion of history item
     HistoryDelete(String), // Payload is item ID
-    // Encrypted File Request (FileRequestPayload)
-    FileRequest(Vec<u8>),
+    // File request (typed; pre-v0.3 was an encrypted byte-string wrapper)
+    FileRequest(FileRequestPayload),
     // Liveness Check
     Ping,
     Pong,
@@ -307,6 +294,11 @@ pub enum Message {
 /// confidentiality (it's a PAKE), and wrapping it in unauthenticated TLS
 /// adds complexity without security. Once pairing completes, all further
 /// traffic moves to mutually-authenticated QUIC (steady-state `Message`).
+///
+/// Welcome and PairFingerprint travel plaintext; their `confirm` fields
+/// carry a SAS tag that lets each side prove it derived the same SPAKE2
+/// session key (i.e. matching PIN) before trusting the payload. A wrong-
+/// PIN MITM gets a different key and the SAS check fails closed.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum PairingMessage {
     PairRequest {
@@ -317,19 +309,11 @@ pub enum PairingMessage {
         msg: Vec<u8>,
         device_id: String,
     },
-    /// Responder → Initiator after the SPAKE2 handshake completes. Body is
-    /// SPAKE2-session-key-encrypted (a wrong-PIN MITM gets a different key
-    /// and decryption fails closed). The payload-encryption layer is set to
-    /// be replaced with explicit SAS confirmation + plaintext payloads in
-    /// the next phase, alongside the cluster_key removal.
-    Welcome {
-        encrypted_payload: Vec<u8>,
-    },
+    /// Responder → Initiator after the SPAKE2 handshake completes.
+    Welcome(WelcomePayload),
     /// Initiator → Responder after Welcome, completing the bidirectional
-    /// fingerprint exchange. Same encryption scheme as Welcome.
-    PairFingerprint {
-        encrypted_payload: Vec<u8>,
-    },
+    /// fingerprint exchange.
+    PairFingerprint(PairFingerprintPayload),
 }
 
 #[cfg(test)]
@@ -384,18 +368,6 @@ mod tests {
         let parsed: ClipboardPayload = serde_json::from_str(old_json).expect("parse old");
         assert!(parsed.blob.is_none());
         assert_eq!(parsed.text, "hello");
-    }
-
-    #[test]
-    fn clipboard_blob_round_trip_through_encryption() {
-        let key = [0u8; 32];
-        let blob = sample_blob();
-        let payload = sample_payload(Some(blob.clone()));
-        let json = serde_json::to_vec(&payload).unwrap();
-        let cipher = crate::crypto::encrypt(&key, &json).unwrap();
-        let plain = crate::crypto::decrypt(&key, &cipher).unwrap();
-        let recovered: ClipboardPayload = serde_json::from_slice(&plain).unwrap();
-        assert_eq!(recovered.blob.expect("blob survives crypto"), blob);
     }
 
     #[test]
@@ -487,59 +459,15 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_format_round_trip_through_encryption() {
-        let key = [0u8; 32];
-        let html = ClipboardFormat::from_text(
-            "text/html",
-            "<p>Hello <strong>bold</strong> world</p>",
-        );
-        let rtf = ClipboardFormat::from_text(
-            "text/rtf",
-            r"{\rtf1\ansi Hello {\b bold} world}",
-        );
-        let payload = sample_payload_with_formats(vec![html.clone(), rtf.clone()]);
-        let json = serde_json::to_vec(&payload).unwrap();
-        let cipher = crate::crypto::encrypt(&key, &json).unwrap();
-        let plain = crate::crypto::decrypt(&key, &cipher).unwrap();
-        let recovered: ClipboardPayload = serde_json::from_slice(&plain).unwrap();
-        let formats = recovered.formats.expect("formats survive crypto");
-        assert_eq!(formats, vec![html, rtf]);
-    }
-
-    #[test]
-    fn measure_clipboard_message_wire_inflation() {
-        // Regression guard: the Message::Clipboard variant must use the
-        // base64 serde adapter, not the default Vec<u8> JSON int-array,
-        // or large-blob clipboard sync will silently break against the
-        // 64 MB transport cap.
-        let cipher: Vec<u8> = (0..10_000).map(|i| ((i * 37 + 11) % 256) as u8).collect();
-        let msg = Message::Clipboard(cipher.clone());
-        let json = serde_json::to_vec(&msg).unwrap();
-        let ratio = json.len() as f64 / cipher.len() as f64;
-        println!(
-            "Message::Clipboard({} cipher bytes) -> JSON {} bytes (ratio {:.2}x)",
-            cipher.len(),
-            json.len(),
-            ratio
-        );
-        // Base64 inflation is ~1.34× plus `{"Clipboard":"..."}` overhead.
-        // Anything over 1.5× is a clear regression to int-array shape.
-        assert!(
-            ratio < 1.5,
-            "Message::Clipboard wire inflation regressed to {:.2}x — base64 adapter likely missing",
-            ratio
-        );
-    }
-
-    #[test]
-    fn clipboard_message_round_trips_through_base64_adapter() {
-        let cipher: Vec<u8> = vec![0u8, 1, 2, 254, 255, 128, 64, 32];
-        let msg = Message::Clipboard(cipher.clone());
-        let json = serde_json::to_vec(&msg).unwrap();
-        let parsed: Message = serde_json::from_slice(&json).unwrap();
+    fn message_clipboard_round_trips_through_json() {
+        let blob = sample_blob();
+        let payload = sample_payload(Some(blob.clone()));
+        let msg = Message::Clipboard(payload);
+        let json = serde_json::to_vec(&msg).expect("serialize");
+        let parsed: Message = serde_json::from_slice(&json).expect("deserialize");
         match parsed {
-            Message::Clipboard(round_tripped) => {
-                assert_eq!(round_tripped, cipher);
+            Message::Clipboard(p) => {
+                assert_eq!(p.blob.expect("blob preserved"), blob);
             }
             other => panic!("expected Clipboard variant, got {:?}", other),
         }
@@ -587,29 +515,12 @@ mod tests {
     }
 
     #[test]
-    fn file_stream_header_pre_delivery_target_field_deserializes_as_disk() {
-        // A pre-§3.3 header (peers up through 0.3.0-alpha-2) without
-        // delivery_target must still parse and behave as Disk delivery.
-        let old_json = r#"{
-            "id": "abc",
-            "file_index": 0,
-            "file_name": "test.txt",
-            "file_size": 42,
-            "auth_token": "QUFB",
-            "compressed": false
-        }"#;
-        let parsed: FileStreamHeader = serde_json::from_str(old_json).unwrap();
-        assert_eq!(parsed.delivery_target, DeliveryTarget::Disk);
-    }
-
-    #[test]
     fn file_stream_header_clipboard_delivery_target_round_trips() {
         let header = FileStreamHeader {
             id: "blob-1".to_string(),
             file_index: 0,
             file_name: "blob-1.png".to_string(),
             file_size: 12_345_678,
-            auth_token: "QUFB".to_string(),
             compressed: false,
             delivery_target: DeliveryTarget::Clipboard {
                 mime_type: "image/png".to_string(),

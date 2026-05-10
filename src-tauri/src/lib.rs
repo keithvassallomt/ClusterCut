@@ -317,16 +317,16 @@ fn get_hostname_internal() -> String {
 use discovery::Discovery;
 use peer::Peer;
 use rand::Rng;
-use state::AppState;
+use state::{AppState, LegacyPeerInfo};
 use storage::{
-    load_cluster_key, load_device_id, load_known_peers, load_network_name, load_network_pin,
-    save_cluster_key, save_device_id, save_known_peers, save_network_name, save_network_pin,
+    load_cluster_id, load_device_id, load_known_peers, load_network_name, load_network_pin,
+    save_cluster_id, save_device_id, save_known_peers, save_network_name,
+    wipe_legacy_cluster_key,
     reset_network_state, load_settings, AppSettings,
 };
 use tauri::{Emitter, Manager};
 use transport::Transport;
 // use tauri_plugin_notification::NotificationExt;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 // Track last notification time for macOS cleaner
 #[cfg(target_os = "macos")]
@@ -1258,6 +1258,24 @@ fn get_known_peers(state: tauri::State<AppState>) -> std::collections::HashMap<S
     state.known_peers.lock().unwrap().clone()
 }
 
+/// List of peers loaded from `known_peers.json` without a stored cert
+/// fingerprint. Returns an empty Vec for clean v0.3 installs. The frontend
+/// reads this on mount to decide whether to show the "please re-pair"
+/// banner after a v0.2 → v0.3 upgrade.
+#[tauri::command]
+fn get_legacy_peers(state: tauri::State<AppState>) -> Vec<crate::state::LegacyPeerInfo> {
+    state.legacy_peers.lock().unwrap().clone()
+}
+
+/// Dismiss the legacy-peer banner for the current run. The banner reappears
+/// on next startup if any legacy peers are still present in known_peers,
+/// so the user is reminded until they re-pair (or forget) every affected
+/// peer.
+#[tauri::command]
+fn dismiss_legacy_peer_banner(state: tauri::State<AppState>) {
+    state.legacy_peers.lock().unwrap().clear();
+}
+
 /// Returns true when the user has at least one manual peer AND none of those
 /// manual peers are on a directly-reachable subnet. This is the gate for the
 /// "having trouble connecting?" modal — show it only when we'd actually expect
@@ -1294,43 +1312,6 @@ fn get_local_ip() -> String {
 
 use ipnetwork::IpNetwork;
 
-// Signature Helpers
-fn generate_signature(key: &[u8; 32], id: &str) -> Option<String> {
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let payload = format!("{}:{}", id, ts);
-    if let Ok(encrypted) = crypto::encrypt(key, payload.as_bytes()) {
-        return Some(BASE64.encode(encrypted));
-    }
-    None
-}
-
-fn verify_signature(key: &[u8; 32], id: &str, signature: &str) -> bool {
-    if let Ok(encrypted) = BASE64.decode(signature) {
-         if let Ok(decrypted) = crypto::decrypt(key, &encrypted) {
-             if let Ok(payload) = String::from_utf8(decrypted) {
-                 // Payload: "ID:TIMESTAMP"
-                 let parts: Vec<&str> = payload.split(':').collect();
-                 if parts.len() == 2 {
-                     if parts[0] == id {
-                         if let Ok(ts) = parts[1].parse::<u64>() {
-                             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                             // Allow 60s skew/replay window
-                             if now >= ts && (now - ts) < 60 {
-                                 return true;
-                             }
-                             // Also allow minor clock drift (future timestamp)? 
-                             if ts > now && (ts - now) < 10 {
-                                 return true;
-                             }
-                         }
-                     }
-                 }
-             }
-         }
-    }
-    false
-}
-
 // Helper to probe a specific IP/Port
 async fn probe_ip(
     ip: std::net::IpAddr,
@@ -1357,15 +1338,6 @@ async fn probe_ip(
     let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
     let network_name = state.network_name.lock().unwrap().clone();
 
-    let mut signature = None;
-    if let Some(key_vec) = state.cluster_key.lock().unwrap().as_ref() {
-        if key_vec.len() == 32 {
-            let mut key_arr = [0u8; 32];
-            key_arr.copy_from_slice(key_vec);
-            signature = generate_signature(&key_arr, &local_id);
-        }
-    }
-    
     // Send OUR info so they can add us.
     let my_peer = Peer {
         id: local_id.clone(),
@@ -1376,7 +1348,7 @@ async fn probe_ip(
         is_trusted: false, // We don't know if we are trusted yet
         is_manual: true,
         network_name: Some(network_name),
-        signature,
+        signature: None,
         fingerprint: Some(transport.local_fingerprint()),
     };
 
@@ -1746,8 +1718,8 @@ async fn start_pairing(
     tracing::info!("Auth Success (Initiator)! Waiting for Welcome...");
 
     // Read Welcome
-    let encrypted_welcome = match crate::transport::read_pairing_frame(&mut stream).await {
-        Ok(PairingMessage::Welcome { encrypted_payload }) => encrypted_payload,
+    let welcome_payload = match crate::transport::read_pairing_frame(&mut stream).await {
+        Ok(PairingMessage::Welcome(p)) => p,
         Ok(other) => {
             return Err(format!("Pairing protocol error: expected Welcome, got {:?}", other));
         }
@@ -1757,36 +1729,31 @@ async fn start_pairing(
         }
     };
 
-    let welcome_plaintext = match crypto::decrypt(&sk_arr, &encrypted_welcome) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = app_handle.emit("pairing-failed", "Failed to join network. The PIN may be incorrect.");
-            return Err(format!("Welcome decryption failed: {}", e));
-        }
-    };
-    let welcome_payload: crate::protocol::WelcomePayload =
-        serde_json::from_slice(&welcome_plaintext).map_err(|e| e.to_string())?;
+    // Validate the SAS-confirm tag before trusting any field of the
+    // Welcome — a wrong-PIN MITM would have a different SPAKE2 key and
+    // the decryption inside `verify_pair_confirm` will fail.
+    if let Err(e) = crypto::verify_pair_confirm(&sk_arr, &welcome_payload.confirm) {
+        let _ = app_handle.emit("pairing-failed", "Failed to join network. The PIN may be incorrect.");
+        return Err(format!("Welcome confirm verification failed: {}", e));
+    }
+
     let crate::protocol::WelcomePayload {
-        cluster_key,
+        cluster_id,
         known_peers,
         network_name,
-        network_pin,
         responder_fingerprint,
+        confirm: _,
     } = welcome_payload;
 
-    tracing::info!("Joined Network: {}", network_name);
+    tracing::info!("Joined Network: {} (cluster {})", network_name, cluster_id);
     {
-        let mut ck = state.cluster_key.lock().unwrap();
-        *ck = Some(cluster_key.clone());
-        save_cluster_key(&app_handle, &cluster_key);
+        let mut cid = state.cluster_id.lock().unwrap();
+        *cid = cluster_id.clone();
+        save_cluster_id(&app_handle, &cluster_id);
 
         let mut nn = state.network_name.lock().unwrap();
         *nn = network_name.clone();
         save_network_name(&app_handle, &network_name);
-
-        let mut np = state.network_pin.lock().unwrap();
-        *np = network_pin.clone();
-        save_network_pin(&app_handle, &network_pin);
     }
 
     let local_quic_port = transport.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -1808,12 +1775,9 @@ async fn start_pairing(
             if peer.ip == peer_addr.ip() {
                 peer.is_trusted = true;
                 peer.network_name = Some(network_name.clone());
-                // Pin the responder's TLS fingerprint — the entire WelcomePayload
-                // was SPAKE2-encrypted, so this fingerprint is bound to the
-                // PIN-authenticated session.
-                if responder_fingerprint.is_some() {
-                    peer.fingerprint = responder_fingerprint.clone();
-                }
+                // Pin the responder's TLS fingerprint — the SAS-confirm
+                // bound this payload to the PIN-authenticated session.
+                peer.fingerprint = Some(responder_fingerprint.clone());
                 let _ = app_handle.emit("peer-update", &*peer);
                 kp_lock.insert(id.clone(), peer.clone());
                 break;
@@ -1823,15 +1787,16 @@ async fn start_pairing(
     }
 
     // Send PairFingerprint with our local fingerprint, completing the
-    // bidirectional fingerprint exchange.
+    // bidirectional fingerprint exchange. The `confirm` field proves to
+    // the responder that we derived the same SPAKE2 key.
     let local_fp = transport.local_fingerprint();
+    let confirm = crypto::make_pair_confirm(&sk_arr).map_err(|e| e.to_string())?;
     let fp_payload = crate::protocol::PairFingerprintPayload {
         device_id: local_id,
         fingerprint: local_fp,
+        confirm,
     };
-    let plaintext = serde_json::to_vec(&fp_payload).map_err(|e| e.to_string())?;
-    let encrypted_payload = crypto::encrypt(&sk_arr, &plaintext).map_err(|e| e.to_string())?;
-    let pf_msg = PairingMessage::PairFingerprint { encrypted_payload };
+    let pf_msg = PairingMessage::PairFingerprint(fp_payload);
     if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &pf_msg).await {
         // Non-fatal: we've already joined the cluster. Responder will retry
         // pinning on next contact.
@@ -1907,12 +1872,12 @@ async fn handle_pairing_connection(
     session_key_arr.copy_from_slice(&session_key);
     tracing::info!("Authentication Success for {}!", peer_device_id);
 
-    // Step 4: build WelcomePayload, encrypt, send Welcome
-    let cluster_key_opt = state.cluster_key.lock().unwrap().clone();
-    let Some(cluster_key) = cluster_key_opt else {
-        tracing::error!("Cannot Welcome {}: no cluster_key on responder", peer_device_id);
+    // Step 4: build WelcomePayload (plaintext + SAS confirm) and send.
+    let cluster_id = state.cluster_id.lock().unwrap().clone();
+    if cluster_id.is_empty() {
+        tracing::error!("Cannot Welcome {}: no cluster_id on responder", peer_device_id);
         return;
-    };
+    }
 
     let known_peers_vec: Vec<_> = state
         .known_peers
@@ -1922,32 +1887,25 @@ async fn handle_pairing_connection(
         .cloned()
         .collect();
     let network_name = state.network_name.lock().unwrap().clone();
-    let network_pin = state.network_pin.lock().unwrap().clone();
-    let payload = crate::protocol::WelcomePayload {
-        cluster_key,
-        known_peers: known_peers_vec,
-        network_name: network_name.clone(),
-        network_pin,
-        responder_fingerprint: Some(transport.local_fingerprint()),
-    };
-    let encrypt_result = serde_json::to_vec(&payload)
-        .map_err(|e| e.to_string())
-        .and_then(|plaintext| {
-            crypto::encrypt(&session_key_arr, &plaintext).map_err(|e| e.to_string())
-        });
-    let encrypted_payload = match encrypt_result {
-        Ok(p) => p,
+    let confirm = match crypto::make_pair_confirm(&session_key_arr) {
+        Ok(c) => c,
         Err(e) => {
-            tracing::error!("Welcome encrypt error for {}: {}", peer_addr, e);
+            tracing::error!("Failed to build pair-confirm for {}: {}", peer_addr, e);
             return;
         }
     };
+    let payload = crate::protocol::WelcomePayload {
+        cluster_id,
+        known_peers: known_peers_vec,
+        network_name: network_name.clone(),
+        responder_fingerprint: transport.local_fingerprint(),
+        confirm,
+    };
 
     // Insert peer record before sending Welcome, mirroring the previous
-    // QUIC-flow ordering: the initiator may fire PairFingerprint back almost
-    // immediately, racing the responder's lookup. Prefer the hostname mDNS
-    // already discovered; fall back to a placeholder if the peer isn't in
-    // runtime peers yet.
+    // ordering: the initiator may fire PairFingerprint back immediately,
+    // racing the responder's lookup. Prefer the hostname mDNS already
+    // discovered; fall back to a placeholder.
     let prior_hostname = {
         let runtime_peers = state.peers.lock().unwrap();
         runtime_peers
@@ -1985,15 +1943,15 @@ async fn handle_pairing_connection(
     state.add_peer(p.clone());
     let _ = app_handle.emit("peer-update", &p);
 
-    let welcome_msg = PairingMessage::Welcome { encrypted_payload };
+    let welcome_msg = PairingMessage::Welcome(payload);
     if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &welcome_msg).await {
         tracing::error!("Failed to send Welcome to {}: {}", peer_addr, e);
         return;
     }
 
-    // Step 5: read PairFingerprint (must arrive on the same socket)
-    let encrypted_fp_payload = match crate::transport::read_pairing_frame(&mut stream).await {
-        Ok(PairingMessage::PairFingerprint { encrypted_payload }) => encrypted_payload,
+    // Step 5: read PairFingerprint and validate its SAS-confirm tag.
+    let fp_payload = match crate::transport::read_pairing_frame(&mut stream).await {
+        Ok(PairingMessage::PairFingerprint(p)) => p,
         Ok(other) => {
             tracing::warn!("Expected PairFingerprint from {}, got {:?}", peer_addr, other);
             return;
@@ -2003,30 +1961,27 @@ async fn handle_pairing_connection(
             return;
         }
     };
-    let payload_result = crypto::decrypt(&session_key_arr, &encrypted_fp_payload)
-        .map_err(|e| e.to_string())
-        .and_then(|plaintext| {
-            serde_json::from_slice::<crate::protocol::PairFingerprintPayload>(&plaintext)
-                .map_err(|e| e.to_string())
-        });
-    let fully_paired_peer = match payload_result {
-        Ok(crate::protocol::PairFingerprintPayload { device_id, fingerprint }) => {
-            let mut kp_lock = state.known_peers.lock().unwrap();
-            if let Some(peer) = kp_lock.get_mut(&device_id) {
-                peer.fingerprint = Some(fingerprint);
-                let updated = peer.clone();
-                save_known_peers(&app_handle, &kp_lock);
-                drop(kp_lock);
-                let _ = app_handle.emit("peer-update", &updated);
-                tracing::info!("Pinned fingerprint for paired peer {}", device_id);
-                Some(updated)
-            } else {
-                tracing::warn!("PairFingerprint for unknown peer id {}", device_id);
-                None
-            }
-        }
-        Err(e) => {
-            tracing::error!("Failed to decrypt PairFingerprint from {}: {}", peer_addr, e);
+    if let Err(e) = crypto::verify_pair_confirm(&session_key_arr, &fp_payload.confirm) {
+        tracing::error!(
+            "PairFingerprint confirm verification failed for {}: {} — aborting pairing",
+            peer_addr,
+            e
+        );
+        return;
+    }
+    let crate::protocol::PairFingerprintPayload { device_id, fingerprint, confirm: _ } = fp_payload;
+    let fully_paired_peer = {
+        let mut kp_lock = state.known_peers.lock().unwrap();
+        if let Some(peer) = kp_lock.get_mut(&device_id) {
+            peer.fingerprint = Some(fingerprint);
+            let updated = peer.clone();
+            save_known_peers(&app_handle, &kp_lock);
+            drop(kp_lock);
+            let _ = app_handle.emit("peer-update", &updated);
+            tracing::info!("Pinned fingerprint for paired peer {}", device_id);
+            Some(updated)
+        } else {
+            tracing::warn!("PairFingerprint for unknown peer id {}", device_id);
             None
         }
     };
@@ -2050,7 +2005,7 @@ fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppState, port: 
     {
         let mut kp = state.known_peers.lock().unwrap();
         let mut peers = state.peers.lock().unwrap();
-        let mut ck = state.cluster_key.lock().unwrap();
+        let mut cid = state.cluster_id.lock().unwrap();
         let mut nn = state.network_name.lock().unwrap();
         let mut np = state.network_pin.lock().unwrap();
 
@@ -2060,20 +2015,24 @@ fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppState, port: 
             p.is_trusted = false;
         }
 
-        // Generate new Cluster Key
-        let mut new_key = [0u8; 32];
-        rand::thread_rng().fill(&mut new_key);
-        *ck = Some(new_key.to_vec());
-        save_cluster_key(app_handle, &new_key);
+        // Generate a fresh cluster_id (UUID) — new cluster, new handle.
+        let new_cluster_id = uuid::Uuid::new_v4().to_string();
+        *cid = new_cluster_id.clone();
+        save_cluster_id(app_handle, &new_cluster_id);
 
         // Load new identity (generated by accessors if missing)
         let new_name_val = load_network_name(app_handle);
         let new_pin_val = load_network_pin(app_handle);
-        
+
         *nn = new_name_val.clone();
         *np = new_pin_val.clone();
-        
-        tracing::info!("Reset to New Network: {} (PIN: {})", new_name_val, new_pin_val);
+
+        tracing::info!(
+            "Reset to New Network: {} (PIN: {}, cluster {})",
+            new_name_val,
+            new_pin_val,
+            new_cluster_id
+        );
     }
 
     // Reset cluster mode to auto
@@ -2127,49 +2086,39 @@ async fn send_clipboard(
     // Emit local event so history updates
     let _ = app_handle.emit("clipboard-change", &payload_obj);
 
-    // Encrypt & Send
-    let ck_lock = state.cluster_key.lock().unwrap();
-    if let Some(key) = ck_lock.as_ref() {
-        if key.len() == 32 {
-             let mut key_arr = [0u8; 32];
-             key_arr.copy_from_slice(key);
-             let json_payload = serde_json::to_vec(&payload_obj).map_err(|e| e.to_string())?;
-             
-             match crypto::encrypt(&key_arr, &json_payload) {
-                 Ok(cipher) => {
-                     let msg = Message::Clipboard(cipher);
-                     let data = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
-                     
-                     let peers = state.get_peers();
-                     for p in peers.values() {
-                         let addr = std::net::SocketAddr::new(p.ip, p.port);
-                         let transport_clone = (*transport).clone();
-                         let data_vec = data.clone();
-                         tauri::async_runtime::spawn(async move {
-                             if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
-                                 tracing::error!("[Clipboard] Failed to send to {}: {}", addr, e);
-                             } else {
-                                 tracing::debug!("[Clipboard] Sent to {}", addr);
-                             }
-                         });
-                     }
-                     
-                     // Notify locally
-                     let notifications = state.settings.lock().unwrap().notifications.clone();
-                     if notifications.data_sent {
-                         send_notification(&app_handle, "Clipboard Sent", "Manual broadcast successful.", false, Some(2), "history", NotificationPayload::None);
-                     }
-                     
-                     Ok(())
-                 },
-                 Err(e) => Err(format!("Encryption failed: {}", e))
-             }
-        } else {
-            Err("Invalid Cluster Key".to_string())
-        }
-    } else {
-        Err("No Cluster Key set".to_string())
+    // Send (mTLS provides confidentiality + sender auth; no app-layer
+    // encryption needed since v0.3 dropped cluster_key).
+    let msg = Message::Clipboard(payload_obj);
+    let data = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
+
+    let peers = state.get_peers();
+    for p in peers.values() {
+        let addr = std::net::SocketAddr::new(p.ip, p.port);
+        let transport_clone = (*transport).clone();
+        let data_vec = data.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
+                tracing::error!("[Clipboard] Failed to send to {}: {}", addr, e);
+            } else {
+                tracing::debug!("[Clipboard] Sent to {}", addr);
+            }
+        });
     }
+
+    let notifications = state.settings.lock().unwrap().notifications.clone();
+    if notifications.data_sent {
+        send_notification(
+            &app_handle,
+            "Clipboard Sent",
+            "Manual broadcast successful.",
+            false,
+            Some(2),
+            "history",
+            NotificationPayload::None,
+        );
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -2605,22 +2554,47 @@ pub fn run() {
             {
                 let state = app.state::<AppState>();
 
-                // 1. Load Cluster Key
-                let mut ck_lock = state.cluster_key.lock().unwrap();
-                if let Some(key) = load_cluster_key(app_handle) {
-                    *ck_lock = Some(key);
+                // 1. Load (or generate) cluster_id, and wipe the legacy
+                //    cluster_key.bin secret if it's still on disk from v0.2.
+                wipe_legacy_cluster_key(app_handle);
+                let mut cid_lock = state.cluster_id.lock().unwrap();
+                if let Some(id) = load_cluster_id(app_handle) {
+                    *cid_lock = id;
                 } else {
-                    tracing::info!("No Cluster Key found. Generating new one...");
-                    let mut new_key = [0u8; 32];
-                    rand::thread_rng().fill(&mut new_key);
-                    save_cluster_key(app_handle, &new_key);
-                    *ck_lock = Some(new_key.to_vec());
+                    let new_id = uuid::Uuid::new_v4().to_string();
+                    tracing::info!("No cluster_id found. Generated {}.", new_id);
+                    save_cluster_id(app_handle, &new_id);
+                    *cid_lock = new_id;
                 }
 
-                // 2. Load Known Peers
-                let mut kp_lock = state.known_peers.lock().unwrap();
-                *kp_lock = load_known_peers(app_handle);
-                drop(kp_lock);
+                // 2. Load Known Peers, then sweep for legacy entries that
+                //    pre-date mTLS — peers without a stored fingerprint can
+                //    no longer talk to us under the v0.3 strict-pinning model
+                //    and need to be re-paired. Their hostnames are stashed
+                //    in `state.legacy_peers` so the UI can surface a banner.
+                {
+                    let mut kp_lock = state.known_peers.lock().unwrap();
+                    *kp_lock = load_known_peers(app_handle);
+
+                    let mut legacy = Vec::new();
+                    for (id, peer) in kp_lock.iter_mut() {
+                        if peer.fingerprint.is_none() {
+                            peer.is_trusted = false;
+                            legacy.push(LegacyPeerInfo {
+                                id: id.clone(),
+                                hostname: peer.hostname.clone(),
+                            });
+                        }
+                    }
+                    if !legacy.is_empty() {
+                        tracing::warn!(
+                            "Detected {} pre-mTLS peer(s) needing re-pair: {:?}",
+                            legacy.len(),
+                            legacy.iter().map(|p| &p.hostname).collect::<Vec<_>>()
+                        );
+                        *state.legacy_peers.lock().unwrap() = legacy;
+                    }
+                }
 
 
                 // 4. Load Settings
@@ -2763,9 +2737,18 @@ pub fn run() {
                                         tracing::warn!("Discovered peer {} WITHOUT network name (properties: {:?})", id, info.get_properties());
                                     }
 
-                                    // Lock known_peers to prevent race with PairRequest
+                                    // Lock known_peers to prevent race with PairRequest.
+                                    // Trust requires a stored fingerprint under the v0.3
+                                    // strict-mTLS model — a known-but-unfingerprinted entry
+                                    // is a legacy peer and must re-pair.
                                     let kp = d_state.known_peers.lock().unwrap();
-                                    let is_known = kp.contains_key(&id);
+                                    let known_entry = kp.get(&id).cloned();
+                                    let is_trusted = known_entry
+                                        .as_ref()
+                                        .map(|p| p.fingerprint.is_some())
+                                        .unwrap_or(false);
+                                    let stored_fingerprint = known_entry
+                                        .and_then(|p| p.fingerprint);
 
                                     // Extract hostname from property or fallback to mDNS hostname
                                     let h_prop = info.get_property_val_str("h");
@@ -2787,11 +2770,13 @@ pub fn run() {
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_secs(),
-                                        is_trusted: is_known,
+                                        is_trusted,
                                         is_manual: false, // Discovered via mDNS
                                         network_name: network_name_prop,
                                         signature: None,
-                                        fingerprint: None,
+                                        // Carry the stored fingerprint forward into the
+                                        // runtime peer record so it shows up in the UI.
+                                        fingerprint: stored_fingerprint,
                                     };
 
                                     // Check if peer is already active to prevent duplicate notifications
@@ -2999,15 +2984,6 @@ pub fn run() {
                     let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
                     let network_name = hb_state.network_name.lock().unwrap().clone();
 
-                    let mut signature = None;
-                    if let Some(key_vec) = hb_state.cluster_key.lock().unwrap().as_ref() {
-                        if key_vec.len() == 32 {
-                            let mut key_arr = [0u8; 32];
-                            key_arr.copy_from_slice(key_vec);
-                            signature = generate_signature(&key_arr, &local_id);
-                        }
-                    }
-
                     // Self Peer (for payload)
                     let my_peer = Peer {
                         id: local_id,
@@ -3018,7 +2994,7 @@ pub fn run() {
                         is_trusted: false,
                         is_manual: true,
                         network_name: Some(network_name),
-                        signature,
+                        signature: None,
                         fingerprint: Some(hb_transport.local_fingerprint()),
                     };
 
@@ -3134,6 +3110,8 @@ pub fn run() {
             show_native_notification,
             get_theme_override,
             get_current_theme,
+            get_legacy_peers,
+            dismiss_legacy_peer_banner,
         ])
 
         .on_window_event(|window, event| {
@@ -3281,40 +3259,9 @@ async fn handle_incoming_clipboard_blob_stream(
         mime_type, header.file_size, header.id, addr
     );
 
-    // Verify Auth Token — same shape as the file stream path.
-    let mut session_key = [0u8; 32];
-    {
-        let ck_lock = state.cluster_key.lock().unwrap();
-        if let Some(key) = ck_lock.as_ref() {
-            if key.len() == 32 {
-                session_key.copy_from_slice(key);
-            } else {
-                tracing::error!("Cluster Key invalid length!");
-                return;
-            }
-        } else {
-            tracing::error!("Cluster Key missing!");
-            return;
-        }
-    }
-    match BASE64.decode(&header.auth_token) {
-        Ok(token_cipher) => match crypto::decrypt(&session_key, &token_cipher) {
-            Ok(plaintext) if plaintext.len() == 8 => {}
-            Ok(_) => {
-                tracing::error!("Invalid clipboard-blob auth token length");
-                return;
-            }
-            Err(e) => {
-                tracing::error!("Clipboard-blob auth token decryption failed: {}", e);
-                return;
-            }
-        },
-        Err(e) => {
-            tracing::error!("Invalid clipboard-blob auth token base64: {}", e);
-            return;
-        }
-    }
-
+    // No app-layer auth token to verify — the QUIC connection itself is
+    // mTLS-pinned to the sending peer (see issue #9 follow-up).
+    //
     // Drain the stream into memory. Cap defensively at MAX_CLIPBOARD_IMAGE_BYTES
     // so a malformed sender can't OOM the receiver.
     let cap = clipboard::common::MAX_CLIPBOARD_IMAGE_BYTES;
@@ -3533,46 +3480,9 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
         }
     };
     
-    // 3. Verify Auth Token
-    let mut session_key = [0u8; 32];
-    {
-         let ck_lock = state.cluster_key.lock().unwrap();
-         if let Some(key) = ck_lock.as_ref() {
-             if key.len() == 32 {
-                 session_key.copy_from_slice(key);
-             } else {
-                 tracing::error!("Cluster Key invalid length!");
-                 return;
-             }
-         } else {
-             tracing::error!("Cluster Key missing!");
-             return;
-         }
-    }
-
-    match BASE64.decode(&header.auth_token) {
-        Ok(token_cipher) => {
-            match crypto::decrypt(&session_key, &token_cipher) {
-                Ok(plaintext) => {
-                    if plaintext.len() == 8 {
-                        // TODO: Verify timestamp freshness if desired
-                        tracing::info!("Auth Token Verified. Starting Download...");
-                    } else {
-                        tracing::error!("Invalid Auth Token length");
-                        return;
-                    }
-                },
-                Err(e) => {
-                    tracing::error!("Auth Token Decryption Failed: {}", e);
-                    return;
-                }
-            }
-        },
-        Err(e) => {
-            tracing::error!("Invalid Auth Token Base64: {}", e);
-            return;
-        }
-    }
+    // 3. No app-layer auth token to verify — sender identity is already
+    //    authenticated by the QUIC mTLS handshake (see issue #9 follow-up).
+    tracing::info!("Starting Download...");
 
     // 4. Stream Data (Zero-Copy-ish)
     let start_time = std::time::Instant::now();
@@ -3668,7 +3578,6 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
          "file_name": header.file_name,
          "file_size": header.file_size,
          "file_index": header.file_index,
-         "auth_token": header.auth_token, // (optional, maybe redact?)
          "path": file_path.to_string_lossy()
      }));
      
@@ -3692,45 +3601,13 @@ async fn handle_incoming_file_stream(recv: quinn::RecvStream, addr: std::net::So
 
 async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state: AppState, listener_handle: tauri::AppHandle, transport_inside: Transport) {
     match msg {
-        Message::Clipboard(ciphertext) => {
-            // Decrypt
-            tracing::debug!("Received Encrypted Clipboard from {}", addr);
-            let key_opt = {
-                listener_state.cluster_key.lock().unwrap().clone()
-            };
-
-            if let Some(key) = key_opt {
-                let mut key_arr = [0u8; 32];
-                if key.len() == 32 {
-                    key_arr.copy_from_slice(&key);
-                    match crypto::decrypt(&key_arr, &ciphertext).map_err(|e| e.to_string()) {
-                        Ok(plaintext) => {
-                            // Try to parse as ClipboardPayload
-                            let (text, id, ts, sender, payload) = if let Ok(payload) = serde_json::from_slice::<crate::protocol::ClipboardPayload>(&plaintext) {
-                                    (payload.text.clone(), payload.id.clone(), payload.timestamp, payload.sender.clone(), payload)
-                            } else if let Ok(text) = String::from_utf8(plaintext.clone()) {
-                                    // Backward compatibility / Fallback
-                                    (
-                                        text.clone(),
-                                        uuid::Uuid::new_v4().to_string(),
-                                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                                        "Unknown (Legacy)".to_string(),
-                                        crate::protocol::ClipboardPayload {
-                                            text: text.clone(),
-                                            id: uuid::Uuid::new_v4().to_string(),
-                                            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                                            sender: "Unknown (Legacy)".to_string(),
-                                            sender_id: "unknown".to_string(),
-                                            files: None,
-                                            blob: None,
-                                            formats: None,
-                                        }
-                                    )
-                            } else {
-                                    tracing::error!("Failed to parse decrypted clipboard payload.");
-                                    return;
-                            };
-
+        Message::Clipboard(payload) => {
+            tracing::debug!("Received Clipboard from {}", addr);
+            let text = payload.text.clone();
+            let id = payload.id.clone();
+            let ts = payload.timestamp;
+            let sender = payload.sender.clone();
+            {
                             // Verify Timestamp Freshness (120s threshold)
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -3839,18 +3716,13 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                                     file_index: idx,
                                                     offset: 0,
                                                 };
-                                                // Encrypt Request
-                                                if let Ok(req_json) = serde_json::to_vec(&req_payload) {
-                                                    if let Ok(req_cipher) = crypto::encrypt(&key_arr, &req_json) {
-                                                        let msg = Message::FileRequest(req_cipher);
-                                                        if let Ok(data) = serde_json::to_vec(&msg) {
-                                                            let transport_clone = transport_inside.clone();
-                                                            let addr_clone = addr;
-                                                            tauri::async_runtime::spawn(async move {
-                                                                let _ = transport_clone.send_message(addr_clone, &data).await;
-                                                            });
-                                                        }
-                                                    }
+                                                let msg = Message::FileRequest(req_payload);
+                                                if let Ok(data) = serde_json::to_vec(&msg) {
+                                                    let transport_clone = transport_inside.clone();
+                                                    let addr_clone = addr;
+                                                    tauri::async_runtime::spawn(async move {
+                                                        let _ = transport_clone.send_message(addr_clone, &data).await;
+                                                    });
                                                 }
                                             }
                                         } else {
@@ -4001,19 +3873,15 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                             file_index: 0,
                                             offset: 0,
                                         };
-                                        if let Ok(req_json) = serde_json::to_vec(&req_payload) {
-                                            if let Ok(req_cipher) = crypto::encrypt(&key_arr, &req_json) {
-                                                let msg = Message::FileRequest(req_cipher);
-                                                if let Ok(data) = serde_json::to_vec(&msg) {
-                                                    let transport_clone = transport_inside.clone();
-                                                    let sender_addr = addr;
-                                                    tauri::async_runtime::spawn(async move {
-                                                        if let Err(e) = transport_clone.send_message(sender_addr, &data).await {
-                                                            tracing::error!("Failed to send clipboard FileRequest to {}: {}", sender_addr, e);
-                                                        }
-                                                    });
+                                        let msg = Message::FileRequest(req_payload);
+                                        if let Ok(data) = serde_json::to_vec(&msg) {
+                                            let transport_clone = transport_inside.clone();
+                                            let sender_addr = addr;
+                                            tauri::async_runtime::spawn(async move {
+                                                if let Err(e) = transport_clone.send_message(sender_addr, &data).await {
+                                                    tracing::error!("Failed to send clipboard FileRequest to {}: {}", sender_addr, e);
                                                 }
-                                            }
+                                            });
                                         }
                                     }
                                 } else {
@@ -4127,34 +3995,22 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 }
                             }
 
-                            // Relay Logic
+                            // Relay Logic — re-broadcast to other cluster
+                            // members (mTLS authenticates each hop; no
+                            // app-layer encryption needed).
                             let auto_send = { listener_state.settings.lock().unwrap().auto_send };
                             if !auto_send {
-                                    return; 
+                                return;
                             }
-                            
-                            let state_relay = listener_state.clone();
-                            let transport_relay = transport_inside.clone(); 
+
                             let sender_addr = addr;
-                            let relay_key_arr = key_arr; 
-                            
-                            let payload_bytes = serde_json::to_vec(&payload_obj).unwrap_or(plaintext);
-                            
-                            if let Ok(relay_ciphertext) = crypto::encrypt(&relay_key_arr, &payload_bytes).map_err(|e| e.to_string()) {
-                                let relay_data = serde_json::to_vec(&Message::Clipboard(relay_ciphertext)).unwrap_or_default();
-                                let peers = state_relay.get_peers();
-                                for p in peers.values() {
-                                    let p_addr = std::net::SocketAddr::new(p.ip, p.port);
-                                    if p_addr == sender_addr { continue; }
-                                    let _ = transport_relay.send_message(p_addr, &relay_data).await;
-                                }
+                            let relay_data = serde_json::to_vec(&Message::Clipboard(payload_obj.clone())).unwrap_or_default();
+                            let peers = listener_state.get_peers();
+                            for p in peers.values() {
+                                let p_addr = std::net::SocketAddr::new(p.ip, p.port);
+                                if p_addr == sender_addr { continue; }
+                                let _ = transport_inside.send_message(p_addr, &relay_data).await;
                             }
-                        }
-                        Err(e) => tracing::error!("Decryption failed: {}", e),
-                    }
-                } else {
-                    tracing::warn!("Received clipboard but no Cluster Key set!"); 
-                }
             }
         }
         Message::HistoryDelete(id) => {
@@ -4227,30 +4083,12 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                      should_reply = true;
                  }
 
-                 let mut is_signature_valid = false;
-                 if let Some(sig) = &peer.signature {
-                     if let Some(key_vec) = listener_state.cluster_key.lock().unwrap().as_ref() {
-                         if key_vec.len() == 32 {
-                             let mut key_arr = [0u8; 32];
-                             key_arr.copy_from_slice(key_vec);
-                             if verify_signature(&key_arr, &peer.id, sig) {
-                                 is_signature_valid = true;
-                             }
-                         }
-                     }
-                 }
-                 
-                 if is_signature_valid {
-                     tracing::debug!("Verified Signature for {}! Trust maintained/granted.", peer.id);
-                     peer.is_trusted = true;
-                 } else {
-                     if let Some(existing) = kp_lock.get(&peer.id) {
-                         if existing.is_trusted {
-                            tracing::warn!("Revoking Trust for {}: Invalid/Missing Signature.", peer.id);
-                         }
-                     }
-                     peer.is_trusted = false;
-                 }
+                 // Under v0.3 mTLS, the gossip arrived over an authenticated
+                 // QUIC connection — the sender's cert had to match a paired
+                 // peer's pinned fingerprint or it would not have been accepted.
+                 // Transitive trust: a paired peer's gossip about any peer is
+                 // taken as cluster membership.
+                 peer.is_trusted = true;
 
                  listener_state.add_peer(peer.clone());
                  let _ = listener_handle.emit("peer-update", &peer);
@@ -4285,16 +4123,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                 let local_id = listener_state.local_device_id.lock().unwrap().clone();
                 let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
                 let network_name = listener_state.network_name.lock().unwrap().clone();
-                
-                let mut signature = None;
-                if let Some(key_vec) = listener_state.cluster_key.lock().unwrap().as_ref() {
-                    if key_vec.len() == 32 {
-                        let mut key_arr = [0u8; 32];
-                        key_arr.copy_from_slice(key_vec);
-                        signature = generate_signature(&key_arr, &local_id);
-                    }
-                }
-                
+
                 let my_peer = crate::peer::Peer {
                     id: local_id,
                     ip: transport_inside.local_addr().unwrap().ip(),
@@ -4304,7 +4133,7 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                     is_trusted: false,
                     is_manual: true,
                     network_name: Some(network_name),
-                    signature,
+                    signature: None,
                     fingerprint: Some(transport_inside.local_fingerprint()),
                 };
                 
@@ -4344,33 +4173,24 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
             }
         }
         
-        Message::FileRequest(req_cipher) => {
-             // HANDLE FILE REQUEST (Sender)
-             // 1. Decrypt Request
-             tracing::info!("Received File Request from {}", addr);
-             let key_opt = { listener_state.cluster_key.lock().unwrap().clone() };
-             if let Some(key) = key_opt {
-                 let mut key_arr = [0u8; 32];
-                 if key.len() == 32 {
-                     key_arr.copy_from_slice(&key);
-                     match crypto::decrypt(&key_arr, &req_cipher).map_err(|e| e.to_string()) {
-                         Ok(plaintext) => {
-                             if let Ok(req) = serde_json::from_slice::<crate::protocol::FileRequestPayload>(&plaintext) {
-                                 tracing::info!("Processing File Request: ID={}, Index={}", req.id, req.file_index);
+        Message::FileRequest(req) => {
+             // HANDLE FILE REQUEST (Sender). The connection is mTLS-pinned
+             // to a paired peer, so we trust the request without an
+             // app-layer auth token (issue #9 follow-up).
+             tracing::info!("Received File Request from {}: ID={}, Index={}", addr, req.id, req.file_index);
 
-                                 // 2a. Clipboard-blob serve (§3.3): if `req.id`
-                                 // matches a registered large clipboard blob,
-                                 // serve it with `delivery_target = Clipboard{…}`
-                                 // so the receiver lands the bytes on its OS
-                                 // clipboard. The temp file lives in
-                                 // `temp_downloads/<id>.<ext>` (cleaned by the
-                                 // existing startup `clear_cache`).
-                                 let clipboard_blob_meta = {
-                                     let map = listener_state.local_clipboard_blobs.lock().unwrap();
-                                     map.get(&req.id).cloned()
-                                 };
+             // 2a. Clipboard-blob serve (§3.3): if `req.id` matches a
+             // registered large clipboard blob, serve it with
+             // `delivery_target = Clipboard{…}` so the receiver lands
+             // the bytes on its OS clipboard. The temp file lives in
+             // `temp_downloads/<id>.<ext>` (cleaned by the existing
+             // startup `clear_cache`).
+             let clipboard_blob_meta = {
+                 let map = listener_state.local_clipboard_blobs.lock().unwrap();
+                 map.get(&req.id).cloned()
+             };
 
-                                 if let Some(meta) = clipboard_blob_meta {
+             if let Some(meta) = clipboard_blob_meta {
                                       let file_path = meta.path.clone();
                                       let mime_type = meta.mime_type.clone();
                                       let width = meta.width;
@@ -4400,24 +4220,11 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                           );
                                           match transport_inside.send_file_stream(addr).await {
                                               Ok((_connection, mut stream)) => {
-                                                  let timestamp = std::time::SystemTime::now()
-                                                      .duration_since(std::time::UNIX_EPOCH)
-                                                      .unwrap_or_default()
-                                                      .as_secs();
-                                                  let auth_payload = timestamp.to_le_bytes();
-                                                  let auth_token = match crypto::encrypt(&key_arr, &auth_payload) {
-                                                      Ok(c) => BASE64.encode(c),
-                                                      Err(e) => {
-                                                          tracing::error!("Failed to generate auth token: {}", e);
-                                                          return;
-                                                      }
-                                                  };
                                                   let header = crate::protocol::FileStreamHeader {
                                                       id: req_id,
                                                       file_index: req_file_index,
                                                       file_name,
                                                       file_size,
-                                                      auth_token,
                                                       compressed: false, // never compress already-compressed image bytes
                                                       delivery_target: crate::protocol::DeliveryTarget::Clipboard {
                                                           mime_type,
@@ -4497,32 +4304,16 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                            // Open QUIC Stream
                                            match transport_inside.send_file_stream(addr).await {
                                                Ok((_connection, mut stream)) => {
-                                                   // 4a. Generate Auth Token
-                                                   let timestamp = std::time::SystemTime::now()
-                                                       .duration_since(std::time::UNIX_EPOCH)
-                                                       .unwrap_or_default()
-                                                       .as_secs();
-                                                   
-                                                   let auth_payload = timestamp.to_le_bytes();
-                                                   let auth_token = match crypto::encrypt(&key_arr, &auth_payload) {
-                                                       Ok(c) => BASE64.encode(c),
-                                                       Err(e) => {
-                                                           tracing::error!("Failed to generate auth token: {}", e);
-                                                           return;
-                                                       }
-                                                   };
-                                                   
                                                    // Decide whether to compress this file (deterministic rules).
                                                    let compressed = compress_enabled
                                                        && crate::compression::should_compress(&file_name, file_size);
 
-                                                   // 4b. Send Header
+                                                   // Send Header (no auth_token; mTLS authenticates the sender).
                                                    let header = crate::protocol::FileStreamHeader {
                                                        id: req.id,
                                                        file_index: req.file_index,
                                                        file_name,
                                                        file_size,
-                                                       auth_token,
                                                        compressed,
                                                        delivery_target: crate::protocol::DeliveryTarget::Disk,
                                                    };
@@ -4604,12 +4395,6 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                  } else {
                                      tracing::warn!("Requested file not found (ID: {}, Index: {})", req.id, req.file_index);
                                  }
-                             }
-                         }
-                         Err(e) => tracing::error!("Failed to decrypt FileRequest: {}", e),
-                     }
-                 }
-             }
         }
         Message::Ping => {
             tracing::debug!("Received Ping from {}. Sending Pong.", addr);
@@ -4683,32 +4468,17 @@ pub async fn request_file_internal(
         t_lock.clone().ok_or("Transport not initialized".to_string())?
     };
     
-    // 3. Encrypt & Send Request
+    // 3. Send Request (mTLS provides confidentiality + sender auth).
     let req_payload = crate::protocol::FileRequestPayload {
         id: file_id,
         file_index,
         offset: 0,
     };
-    
-    let key_opt = state.cluster_key.lock().unwrap().clone();
-    if let Some(key) = key_opt {
-        if key.len() == 32 {
-            let mut key_arr = [0u8; 32];
-            key_arr.copy_from_slice(&key);
-             if let Ok(req_json) = serde_json::to_vec(&req_payload) {
-                if let Ok(req_cipher) = crypto::encrypt(&key_arr, &req_json).map_err(|e| e.to_string()) {
-                    let msg = Message::FileRequest(req_cipher);
-                    if let Ok(data) = serde_json::to_vec(&msg) {
-                        transport.send_message(addr, &data).await.map_err(|e| e.to_string())?;
-                        tracing::info!("File Request sent to {}", addr);
-                        return Ok(());
-                    }
-                }
-             }
-        }
-    }
-    
-    Err("Failed to encrypt/send request".to_string())
+    let msg = Message::FileRequest(req_payload);
+    let data = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
+    transport.send_message(addr, &data).await.map_err(|e| e.to_string())?;
+    tracing::info!("File Request sent to {}", addr);
+    Ok(())
 }
 
 fn register_shortcuts(app_handle: &tauri::AppHandle) {
@@ -4788,35 +4558,23 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
                         // Emit local event
                         let _ = app_handle.emit("clipboard-change", &payload_obj);
 
-                        // Encrypt & Send
-                        let ck_lock = state.cluster_key.lock().unwrap();
-                        if let Some(key) = ck_lock.as_ref() {
-                            if key.len() == 32 {
-                                let mut key_arr = [0u8; 32];
-                                key_arr.copy_from_slice(key);
-                                if let Ok(json_payload) = serde_json::to_vec(&payload_obj) {
-                                    if let Ok(cipher) = crypto::encrypt(&key_arr, &json_payload) {
-                                        let msg = Message::Clipboard(cipher);
-                                        if let Ok(data) = serde_json::to_vec(&msg) {
-                                            let transport = app_handle.state::<Transport>();
-                                            let peers = state.get_peers();
-                                            for p in peers.values() {
-                                                let addr = std::net::SocketAddr::new(p.ip, p.port);
-                                                let transport_clone = (*transport).clone();
-                                                let data_vec = data.clone();
-                                                tauri::async_runtime::spawn(async move {
-                                                    let _ = transport_clone.send_message(addr, &data_vec).await;
-                                                });
-                                            }
-                                            
-                                            // Notification
-                                            let notif_settings = settings.notifications.clone();
-                                            if notif_settings.data_sent {
-                                                send_notification(app_handle, "Clipboard Sent", "Manual broadcast successful.", false, Some(2), "history", NotificationPayload::None);
-                                            }
-                                        }
-                                    }
-                                }
+                        // Send (mTLS handles confidentiality + sender auth).
+                        let msg = Message::Clipboard(payload_obj);
+                        if let Ok(data) = serde_json::to_vec(&msg) {
+                            let transport = app_handle.state::<Transport>();
+                            let peers = state.get_peers();
+                            for p in peers.values() {
+                                let addr = std::net::SocketAddr::new(p.ip, p.port);
+                                let transport_clone = (*transport).clone();
+                                let data_vec = data.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    let _ = transport_clone.send_message(addr, &data_vec).await;
+                                });
+                            }
+
+                            let notif_settings = settings.notifications.clone();
+                            if notif_settings.data_sent {
+                                send_notification(app_handle, "Clipboard Sent", "Manual broadcast successful.", false, Some(2), "history", NotificationPayload::None);
                             }
                         }
                    },

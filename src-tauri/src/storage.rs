@@ -46,12 +46,12 @@ pub fn save_network_name(app: &AppHandle, name: &str) {
     let _ = fs::write(path, name);
 }
 
-pub fn load_cluster_key(app: &AppHandle) -> Option<Vec<u8>> {
+pub fn load_cluster_id(app: &AppHandle) -> Option<String> {
     let path_resolver = app.path();
-    let path = match path_resolver.resolve("cluster_key.bin", BaseDirectory::AppConfig) {
+    let path = match path_resolver.resolve("cluster_id", BaseDirectory::AppConfig) {
         Ok(p) => p,
         Err(e) => {
-            tracing::error!("Failed to resolve cluster key path: {}", e);
+            tracing::error!("Failed to resolve cluster id path: {}", e);
             return None;
         }
     };
@@ -60,28 +60,29 @@ pub fn load_cluster_key(app: &AppHandle) -> Option<Vec<u8>> {
         return None;
     }
 
-    match fs::read(&path) {
-        Ok(key) => {
-            if key.len() != 32 {
-                tracing::error!("Cluster key file has invalid length: {}", key.len());
-                return None;
+    match fs::read_to_string(&path) {
+        Ok(s) => {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                tracing::debug!("Loaded cluster_id from disk.");
+                Some(trimmed)
             }
-            tracing::debug!("Loaded Cluster Key from disk.");
-            Some(key)
         }
         Err(e) => {
-            tracing::warn!("Failed to read cluster key file: {}", e);
+            tracing::warn!("Failed to read cluster_id file: {}", e);
             None
         }
     }
 }
 
-pub fn save_cluster_key(app: &AppHandle, key: &[u8]) {
+pub fn save_cluster_id(app: &AppHandle, id: &str) {
     let path_resolver = app.path();
-    let path = match path_resolver.resolve("cluster_key.bin", BaseDirectory::AppConfig) {
+    let path = match path_resolver.resolve("cluster_id", BaseDirectory::AppConfig) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Failed to resolve cluster key path for saving: {}", e);
+            eprintln!("Failed to resolve cluster_id path for saving: {}", e);
             return;
         }
     };
@@ -90,10 +91,28 @@ pub fn save_cluster_key(app: &AppHandle, key: &[u8]) {
         let _ = fs::create_dir_all(parent);
     }
 
-    if let Err(e) = fs::write(path, key) {
-        tracing::error!("Failed to write cluster key file: {}", e);
+    if let Err(e) = fs::write(path, id) {
+        tracing::error!("Failed to write cluster_id file: {}", e);
     } else {
-        tracing::debug!("Saved Cluster Key to disk.");
+        tracing::debug!("Saved cluster_id to disk.");
+    }
+}
+
+/// Delete the legacy `cluster_key.bin` file from earlier versions. v0.3+
+/// no longer treats the cluster key as a secret (mTLS replaces its role);
+/// the file is wiped on first boot of the new build to avoid leaving a
+/// stale 32-byte secret on disk.
+pub fn wipe_legacy_cluster_key(app: &AppHandle) {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("cluster_key.bin", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if path.exists() {
+        match fs::remove_file(&path) {
+            Ok(_) => tracing::info!("Wiped legacy cluster_key.bin from {:?}", path),
+            Err(e) => tracing::warn!("Failed to wipe legacy cluster_key.bin: {}", e),
+        }
     }
 }
 
@@ -291,7 +310,8 @@ pub fn reset_network_state(app: &AppHandle) {
     let path_resolver = app.path();
     // Include the actual filenames used by load/save
     let config_files = [
-        "cluster_key.bin",
+        "cluster_id",
+        "cluster_key.bin", // legacy from v0.2; deleted defensively
         "network_name",
         "network_pin",
         "known_peers.json",

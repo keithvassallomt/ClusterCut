@@ -1,8 +1,20 @@
 use crate::peer::Peer;
 use crate::storage::AppSettings;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// One entry surfaced to the UI for the "needs re-pair" banner. A peer
+/// loaded from `known_peers.json` with `fingerprint = None` predates the
+/// v0.3 strict-mTLS model and can no longer be reached over QUIC until
+/// re-paired. The frontend lists these on a banner so the user knows
+/// who's affected and how to fix it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyPeerInfo {
+    pub id: String,
+    pub hostname: String,
+}
 
 /// One entry in `AppState.local_clipboard_blobs` — everything the sender's
 /// `FileRequest` handler needs to serve a clipboard-blob fetch back to the
@@ -20,8 +32,15 @@ pub struct ClipboardBlobMetadata {
 #[derive(Clone)]
 pub struct AppState {
     pub peers: Arc<Mutex<HashMap<String, Peer>>>,
-    // Shared Network Key (One key to rule them all)
-    pub cluster_key: Arc<Mutex<Option<Vec<u8>>>>,
+    // Cluster identifier (UUID). Replaces the v0.2 `cluster_key` shared
+    // secret — secrecy/auth is now provided by mTLS, and this is just a
+    // non-secret handle for grouping in the UI and for gossip-loop
+    // suppression. Generated at first boot of a fresh cluster.
+    pub cluster_id: Arc<Mutex<String>>,
+    /// Peers loaded from `known_peers.json` without a pinned fingerprint
+    /// (pre-mTLS pairings). Surfaced to the UI for a one-time
+    /// "please re-pair" banner. Cleared as each entry gets re-paired.
+    pub legacy_peers: Arc<Mutex<Vec<LegacyPeerInfo>>>,
     // Known Peers (Persisted list of devices we know about)
     pub known_peers: Arc<Mutex<HashMap<String, Peer>>>,
     pub local_device_id: Arc<Mutex<String>>,
@@ -82,7 +101,8 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
-            cluster_key: Arc::new(Mutex::new(None)),
+            cluster_id: Arc::new(Mutex::new(String::new())),
+            legacy_peers: Arc::new(Mutex::new(Vec::new())),
             known_peers: Arc::new(Mutex::new(HashMap::new())),
             local_device_id: Arc::new(Mutex::new(String::new())),
             discovery: Arc::new(Mutex::new(None)),

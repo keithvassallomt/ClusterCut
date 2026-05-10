@@ -61,3 +61,41 @@ pub fn decrypt(
 
     Ok(plaintext)
 }
+
+/// Fixed plaintext encrypted under the SPAKE2 session key as a "key
+/// confirmation" tag. If the receiver's decryption succeeds and yields
+/// this exact byte string, both sides derived the same SPAKE2 key from
+/// the same PIN — proves PAKE agreement before either side trusts the
+/// payload that travels alongside.
+pub const PAIR_CONFIRM_PLAINTEXT: &[u8] = b"clustercut-pair-confirm-v1";
+
+/// Build the SAS-confirm tag for the local side to send to the peer.
+pub fn make_pair_confirm(session_key: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    if session_key.len() != 32 {
+        return Err("SPAKE2 session key must be 32 bytes".into());
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(session_key);
+    encrypt(&k, PAIR_CONFIRM_PLAINTEXT)
+}
+
+/// Validate a SAS-confirm tag received from the peer. Returns Ok(()) only
+/// if the tag decrypts under our session key and yields exactly
+/// `PAIR_CONFIRM_PLAINTEXT` — otherwise the keys disagree (wrong PIN or
+/// active MITM) and pairing must abort.
+pub fn verify_pair_confirm(
+    session_key: &[u8],
+    confirm: &[u8],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if session_key.len() != 32 {
+        return Err("SPAKE2 session key must be 32 bytes".into());
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(session_key);
+    let plaintext = decrypt(&k, confirm)
+        .map_err(|e| format!("pair-confirm decryption failed (likely PIN mismatch): {}", e))?;
+    if plaintext != PAIR_CONFIRM_PLAINTEXT {
+        return Err("pair-confirm plaintext mismatch".into());
+    }
+    Ok(())
+}

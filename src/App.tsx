@@ -427,6 +427,11 @@ export default function App() {
   const [myHostname, setMyHostname] = useState("Loading...");
   const [networkPin, setNetworkPin] = useState("...");
 
+  // Legacy-peer banner: surfaced when known_peers.json contains entries
+  // without a stored cert fingerprint (i.e. paired before mTLS landed).
+  // Those peers are unreachable under v0.3 and need to be re-paired.
+  const [legacyPeers, setLegacyPeers] = useState<{ id: string; hostname: string }[]>([]);
+
   const [unsavedChanges, setUnsavedChanges] = useState(false);
   const [dialog, setDialog] = useState<{
     open: boolean;
@@ -732,6 +737,12 @@ export default function App() {
     invoke<string>("get_network_name").then(name => setMyNetworkName(name));
     invoke<string>("get_network_pin").then(pin => setNetworkPin(pin));
     invoke<string>("get_hostname").then(h => setMyHostname(h));
+
+    // 2b. Legacy-peer banner: only non-empty after a v0.2 → v0.3 upgrade
+    // where stored peers lack pinned cert fingerprints.
+    invoke<{ id: string; hostname: string }[]>("get_legacy_peers")
+      .then(setLegacyPeers)
+      .catch(() => {});
 
     // 3. Settings
     fetchSettings();
@@ -1128,6 +1139,38 @@ export default function App() {
     <div className={clsx("min-h-screen w-full bg-zinc-50 dark:bg-zinc-950 bg-[radial-gradient(1200px_circle_at_0%_0%,rgba(16,185,129,0.10),transparent_60%),radial-gradient(1000px_circle_at_100%_0%,rgba(59,130,246,0.10),transparent_55%),radial-gradient(900px_circle_at_50%_100%,rgba(99,102,241,0.10),transparent_50%)] dark:bg-[radial-gradient(1200px_circle_at_0%_0%,rgba(16,185,129,0.12),transparent_60%),radial-gradient(1000px_circle_at_100%_0%,rgba(59,130,246,0.10),transparent_55%),radial-gradient(900px_circle_at_50%_100%,rgba(244,63,94,0.10),transparent_50%)] md:h-screen md:overflow-hidden")}>
 
       <Dialog {...dialog} />
+
+      {/* Legacy-peer (pre-mTLS) re-pair banner. Pre-v0.3 pairings have no
+          stored cert fingerprint; under the new strict-mTLS transport
+          they can't receive clipboard data until re-paired via the PIN
+          flow on the Devices tab. */}
+      {legacyPeers.length > 0 && (
+        <div className="fixed inset-x-0 top-0 z-40 border-b border-amber-300 bg-amber-50 px-4 py-3 shadow-sm dark:border-amber-700 dark:bg-amber-950/80">
+          <div className="mx-auto flex max-w-5xl items-start gap-3">
+            <ShieldCheck className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-600 dark:text-amber-400" />
+            <div className="flex-1 text-sm">
+              <div className="font-medium text-amber-900 dark:text-amber-100">
+                Security upgrade — please re-pair your devices
+              </div>
+              <div className="mt-1 text-amber-800 dark:text-amber-200">
+                {legacyPeers.length === 1
+                  ? `${legacyPeers[0].hostname} was paired before this version's TLS upgrade and can no longer receive clipboard data until re-paired.`
+                  : `${legacyPeers.length} devices (${legacyPeers.map((p) => p.hostname).join(", ")}) were paired before this version's TLS upgrade and can no longer receive clipboard data until re-paired.`}{" "}
+                Re-pair using the PIN flow on the Devices tab.
+              </div>
+            </div>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                invoke("dismiss_legacy_peer_banner").catch(() => {});
+                setLegacyPeers([]);
+              }}
+            >
+              Dismiss
+            </Button>
+          </div>
+        </div>
+      )}
 
       {/* Connection Failure Modal */}
       {isConnectionFailed && (

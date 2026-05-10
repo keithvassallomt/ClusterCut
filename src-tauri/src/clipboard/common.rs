@@ -1,4 +1,3 @@
-use crate::crypto;
 use crate::protocol::{ClipboardBlob, ClipboardFormat, ClipboardPayload, FileMetadata, Message};
 use crate::state::{AppState, ClipboardBlobMetadata};
 use crate::transport::Transport;
@@ -863,65 +862,52 @@ pub fn broadcast_clipboard(
 
     let _ = app_handle.emit("clipboard-change", &payload_obj);
 
-    let payload_bytes = match serde_json::to_vec(&payload_obj) {
-        Ok(b) => b,
+    // Send the typed payload directly. mTLS provides confidentiality
+    // and sender authenticity; no app-layer encryption needed since
+    // cluster_key was retired in v0.3.
+    let msg = Message::Clipboard(payload_obj.clone());
+    let data = match serde_json::to_vec(&msg) {
+        Ok(d) => d,
         Err(e) => {
-            tracing::error!("Failed to serialize clipboard payload: {}", e);
+            tracing::error!("Failed to serialize clipboard message: {}", e);
             return;
         }
     };
 
-    let ck_lock = state.cluster_key.lock().unwrap();
-    if let Some(key) = ck_lock.as_ref() {
-        if key.len() == 32 {
-            let mut key_arr = [0u8; 32];
-            key_arr.copy_from_slice(key);
-
-            match crypto::encrypt(&key_arr, &payload_bytes) {
-                Ok(cipher) => {
-                    let msg = Message::Clipboard(cipher);
-                    let data = serde_json::to_vec(&msg).unwrap_or_default();
-
-                    let peers = state.get_peers();
-                    if !peers.is_empty() {
-                        let notifications =
-                            state.settings.lock().unwrap().notifications.clone();
-                        if notifications.data_sent {
-                            let body = if payload_obj.files.is_some() {
-                                "File info broadcasted to cluster."
-                            } else if payload_obj.blob.is_some() {
-                                "Image broadcasted to cluster."
-                            } else {
-                                "Clipboard content broadcasted to cluster."
-                            };
-                            crate::send_notification(
-                                app_handle,
-                                "Clipboard Sent",
-                                body,
-                                false,
-                                Some(2),
-                                "history",
-                                crate::NotificationPayload::None,
-                            );
-                        }
-                    }
-
-                    for peer in peers.values() {
-                        let addr = std::net::SocketAddr::new(peer.ip, peer.port);
-                        let transport_clone = transport.clone();
-                        let data_vec = data.clone();
-                        tauri::async_runtime::spawn(async move {
-                            if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
-                                tracing::error!("Failed to send to {}: {}", addr, e);
-                            } else {
-                                tracing::info!("Sent clipboard to {}", addr);
-                            }
-                        });
-                    }
-                }
-                Err(e) => tracing::error!("Encryption failed: {}", e),
-            }
+    let peers = state.get_peers();
+    if !peers.is_empty() {
+        let notifications = state.settings.lock().unwrap().notifications.clone();
+        if notifications.data_sent {
+            let body = if payload_obj.files.is_some() {
+                "File info broadcasted to cluster."
+            } else if payload_obj.blob.is_some() {
+                "Image broadcasted to cluster."
+            } else {
+                "Clipboard content broadcasted to cluster."
+            };
+            crate::send_notification(
+                app_handle,
+                "Clipboard Sent",
+                body,
+                false,
+                Some(2),
+                "history",
+                crate::NotificationPayload::None,
+            );
         }
+    }
+
+    for peer in peers.values() {
+        let addr = std::net::SocketAddr::new(peer.ip, peer.port);
+        let transport_clone = transport.clone();
+        let data_vec = data.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
+                tracing::error!("Failed to send to {}: {}", addr, e);
+            } else {
+                tracing::info!("Sent clipboard to {}", addr);
+            }
+        });
     }
 }
 
