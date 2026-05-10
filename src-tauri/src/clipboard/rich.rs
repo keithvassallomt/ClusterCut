@@ -106,6 +106,11 @@ mod windows {
     /// HTML/RTF without artificially limiting real-world Word/browser content.
     const MAX_RICH_TEXT_BYTES: usize = 16 * 1024 * 1024;
 
+    /// Passthrough-image cap — must match `common::MAX_CLIPBOARD_IMAGE_BYTES`
+    /// so § 3.3 large-blob descriptor mode can stage > 10 MB images. Rich-text
+    /// stays at the smaller cap above; only the image read uses this one.
+    const MAX_PASSTHROUGH_IMAGE_BYTES: usize = 500 * 1024 * 1024;
+
     /// Number of times to retry opening the clipboard. tauri-plugin-clipboard
     /// runs its own monitor that can briefly hold the lock; same retry budget
     /// the image path uses.
@@ -347,12 +352,12 @@ mod windows {
         let mut buf: Vec<u8> = Vec::new();
         match RawData(id).read_clipboard(&mut buf) {
             Ok(_) if !buf.is_empty() => {
-                if buf.len() > MAX_RICH_TEXT_BYTES {
+                if buf.len() > MAX_PASSTHROUGH_IMAGE_BYTES {
                     tracing::warn!(
                         "Clipboard {} ({} bytes) exceeds {} byte cap; skipping.",
                         mime,
                         buf.len(),
-                        MAX_RICH_TEXT_BYTES
+                        MAX_PASSTHROUGH_IMAGE_BYTES
                     );
                     return None;
                 }
@@ -431,6 +436,10 @@ mod macos {
 
     /// 16 MB cap, same as Windows / wlroots.
     const MAX_RICH_TEXT_BYTES: usize = 16 * 1024 * 1024;
+
+    /// Passthrough-image cap — must match `common::MAX_CLIPBOARD_IMAGE_BYTES`
+    /// so § 3.3 large-blob descriptor mode can stage > 10 MB images.
+    const MAX_PASSTHROUGH_IMAGE_BYTES: usize = 500 * 1024 * 1024;
 
     fn pasteboard() -> Retained<NSPasteboard> {
         NSPasteboard::generalPasteboard()
@@ -571,12 +580,12 @@ mod macos {
             if len == 0 {
                 continue;
             }
-            if len > MAX_RICH_TEXT_BYTES {
+            if len > MAX_PASSTHROUGH_IMAGE_BYTES {
                 tracing::warn!(
                     "Clipboard {} ({} bytes) exceeds {} byte cap; skipping.",
                     mime,
                     len,
-                    MAX_RICH_TEXT_BYTES
+                    MAX_PASSTHROUGH_IMAGE_BYTES
                 );
                 continue;
             }

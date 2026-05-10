@@ -54,8 +54,16 @@ type ClipboardBlobPreview = {
   mime_type: string;
   width?: number;
   height?: number;
-  size: number;       // byte length, for "12 KB" display
-  object_url: string; // generated at receive time via URL.createObjectURL
+  size: number;        // byte length, for "12 KB" display
+  // Set on inline blobs that we decoded ourselves; absent for §3.3 descriptor
+  // blobs whose bytes haven't been fetched yet (no thumbnail to show until the
+  // user accepts and the file-transfer ALPN delivers the bytes).
+  object_url?: string;
+  // §3.3 descriptor — when true, `size` is the *total* expected size and
+  // `object_url` is undefined. The user must accept (via the sync modal) to
+  // trigger the file-transfer fetch; bytes then land on the OS clipboard
+  // directly without a UI thumbnail.
+  descriptor?: boolean;
 };
 
 // Lightweight summary of an alternate clipboard format (text/html, text/rtf, …)
@@ -87,7 +95,24 @@ type HistoryItem = {
 // the thumbnail can render straight from memory. Caller is responsible for
 // revoking the URL when the item is dropped.
 function blobFromPayload(payloadBlob: any): ClipboardBlobPreview | undefined {
-  if (!payloadBlob || typeof payloadBlob.data !== "string" || payloadBlob.data.length === 0) {
+  if (!payloadBlob) return undefined;
+
+  // §3.3 descriptor — bytes ride the file-transfer ALPN, not inline. Surface
+  // a preview without thumbnail so the pending UI / history list can render
+  // "Large image (X.Y MB) — accept to receive". User accept triggers the fetch
+  // through `confirm_pending_clipboard`, which the backend routes to a
+  // `Message::FileRequest`.
+  if (typeof payloadBlob.fetch_id === "string" && payloadBlob.fetch_id.length > 0) {
+    return {
+      mime_type: payloadBlob.mime_type || "image/png",
+      width: typeof payloadBlob.width === "number" ? payloadBlob.width : undefined,
+      height: typeof payloadBlob.height === "number" ? payloadBlob.height : undefined,
+      size: typeof payloadBlob.total_size === "number" ? payloadBlob.total_size : 0,
+      descriptor: true,
+    };
+  }
+
+  if (typeof payloadBlob.data !== "string" || payloadBlob.data.length === 0) {
     return undefined;
   }
   let bytes: Uint8Array;
@@ -1809,13 +1834,19 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
 
                     {it.blob && (
                       <div className="mt-2 flex flex-col gap-1 rounded-lg bg-zinc-50 p-2 dark:bg-zinc-800">
-                        <img
-                          src={it.blob.object_url}
-                          alt="Clipboard image"
-                          className="max-h-48 max-w-full rounded-md object-contain"
-                        />
+                        {it.blob.object_url ? (
+                          <img
+                            src={it.blob.object_url}
+                            alt="Clipboard image"
+                            className="max-h-48 max-w-full rounded-md object-contain"
+                          />
+                        ) : (
+                          <div className="flex h-24 w-full items-center justify-center rounded-md bg-zinc-200 text-3xl text-zinc-500 dark:bg-zinc-700">
+                            🖼️
+                          </div>
+                        )}
                         <div className="text-[11px] text-zinc-500">
-                          Image
+                          {it.blob.descriptor ? "Large image (not yet fetched)" : "Image"}
                           {it.blob.width && it.blob.height ? ` • ${it.blob.width}×${it.blob.height}` : ""}
                           {` • ${formatBytes(it.blob.size)}`}
                         </div>
@@ -2532,17 +2563,26 @@ function ManualSyncModal({
                 <>
                   {remoteContent.blob ? (
                     <div className="flex items-start gap-3 font-sans">
-                      <img
-                        src={remoteContent.blob.object_url}
-                        alt="Pending image"
-                        className="max-h-24 max-w-[40%] rounded object-contain"
-                      />
+                      {remoteContent.blob.object_url ? (
+                        <img
+                          src={remoteContent.blob.object_url}
+                          alt="Pending image"
+                          className="max-h-24 max-w-[40%] rounded object-contain"
+                        />
+                      ) : (
+                        <div className="flex h-24 w-24 items-center justify-center rounded bg-white/5 text-2xl text-zinc-500">
+                          🖼️
+                        </div>
+                      )}
                       <div className="text-xs text-zinc-300">
-                        Image
+                        {remoteContent.blob.descriptor ? "Large image (not yet fetched)" : "Image"}
                         {remoteContent.blob.width && remoteContent.blob.height
                           ? ` (${remoteContent.blob.width}×${remoteContent.blob.height})`
                           : ""}
                         <div className="text-zinc-500">{formatBytes(remoteContent.blob.size)}</div>
+                        {remoteContent.blob.descriptor && (
+                          <div className="mt-1 text-amber-400">Click "Apply to Clipboard" to download.</div>
+                        )}
                       </div>
                     </div>
                   ) : (

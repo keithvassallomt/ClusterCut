@@ -3484,8 +3484,14 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                         }
                                         let _ = listener_handle.emit("clipboard-pending", &payload_obj);
 
-                                        let notifications = listener_state.settings.lock().unwrap().notifications.clone();
-                                        if notifications.data_received {
+                                        // Notification is the primary cue that an
+                                        // accept is waiting — gate on
+                                        // `notify_large_files` (defaults true) so
+                                        // it fires even when `data_received` is
+                                        // off, mirroring the file-transfer accept
+                                        // notification.
+                                        let notify_large = listener_state.settings.lock().unwrap().notify_large_files;
+                                        if notify_large {
                                             send_notification(
                                                 &listener_handle,
                                                 "Large Clipboard Image",
@@ -3509,8 +3515,8 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                         }
                                         let _ = listener_handle.emit("clipboard-pending", &payload_obj);
 
-                                        let notifications = listener_state.settings.lock().unwrap().notifications.clone();
-                                        if notifications.data_received {
+                                        let notify_large = listener_state.settings.lock().unwrap().notify_large_files;
+                                        if notify_large {
                                             send_notification(
                                                 &listener_handle,
                                                 "Large Clipboard Image",
