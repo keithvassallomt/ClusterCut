@@ -20,8 +20,10 @@ use wl_clipboard_rs::paste::{
 /// A 4K uncompressed BMP is ~33 MB; 64 MB is generous headroom.
 const MAX_CLIPBOARD_IMAGE_READ_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Image MIME types we know how to decode, in preference order.
+/// Raster image MIME types we know how to decode, in preference order.
 /// PNG first because it's lossless and the most commonly offered by browsers.
+/// `image/gif` is intentionally absent — animated GIFs go through the
+/// passthrough path below to preserve animation.
 const IMAGE_MIME_PRIORITY: &[&str] = &[
     "image/png",
     "image/jpeg",
@@ -29,14 +31,14 @@ const IMAGE_MIME_PRIORITY: &[&str] = &[
     "image/bmp",
     "image/x-bmp",
     "image/tiff",
-    "image/gif",
 ];
 
-/// Vector image MIMEs — checked *before* the raster `IMAGE_MIME_PRIORITY` so
-/// when a source app offers both (e.g. Inkscape: image/svg+xml + a rasterised
-/// image/png fallback), we pick the higher-fidelity vector representation.
-/// Bytes pass through verbatim; receivers re-stock under the same MIME.
-const VECTOR_IMAGE_MIME_PRIORITY: &[&str] = &["image/svg+xml"];
+/// Passthrough image MIMEs — checked *before* the raster `IMAGE_MIME_PRIORITY`
+/// so a source app that offers both passthrough and raster representations
+/// (e.g. Inkscape: image/svg+xml + a rasterised image/png fallback) gives
+/// the higher-fidelity passthrough representation. Bytes go on the wire
+/// verbatim; receivers re-stock under the same MIME.
+const PASSTHROUGH_IMAGE_MIME_PRIORITY: &[&str] = &["image/svg+xml", "image/gif"];
 
 /// Rich-text MIME types we relay verbatim alongside the plain text. These
 /// carry formatted content (HTML/RTF) that destination apps can pick up
@@ -117,14 +119,14 @@ fn read_clipboard_files() -> Option<Vec<String>> {
     }
 }
 
-/// Probe for vector image formats (SVG) and pass the bytes through verbatim
-/// without raster decode. Called from `read_clipboard_image` before the raster
-/// MIME loop, so vector representations win over rasterised companions when
-/// both are offered.
-fn read_clipboard_vector_image(
+/// Probe for passthrough image formats (SVG, animated GIF) and pass the
+/// bytes through verbatim without raster decode/re-encode. Called from
+/// `read_clipboard_image` before the raster MIME loop, so passthrough
+/// representations win over rasterised companions when both are offered.
+fn read_clipboard_passthrough_image(
     offered: &std::collections::HashSet<String>,
 ) -> Option<ClipboardBlob> {
-    let mime = VECTOR_IMAGE_MIME_PRIORITY
+    let mime = PASSTHROUGH_IMAGE_MIME_PRIORITY
         .iter()
         .copied()
         .find(|m| offered.contains(*m))?;
@@ -175,8 +177,9 @@ fn read_clipboard_image() -> Option<ClipboardBlob> {
         Err(_) => return None,
     };
 
-    // Prefer vector representations when available — verbatim pass-through.
-    if let Some(blob) = read_clipboard_vector_image(&offered) {
+    // Prefer passthrough representations (SVG, animated GIF) when offered —
+    // verbatim bytes, no re-encoding.
+    if let Some(blob) = read_clipboard_passthrough_image(&offered) {
         return Some(blob);
     }
 

@@ -12,12 +12,20 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
 
-/// MIME types that carry image content but are *not* raster — bytes pass
-/// through verbatim instead of being decoded/re-encoded to PNG. SVG is the
-/// only one v2 supports today; other vector-shaped image MIMEs would slot
-/// in here.
-pub fn is_vector_image_mime(mime: &str) -> bool {
-    matches!(mime, "image/svg+xml")
+/// MIME types whose bytes pass through verbatim instead of being decoded
+/// and re-encoded to PNG. Two reasons to preserve a source MIME:
+///
+/// - **Vector**: SVG (`image/svg+xml`). PNG-normalising loses the vector
+///   representation entirely and gives downstream apps a flattened raster
+///   instead of an editable shape.
+/// - **Animated**: GIF (`image/gif`). PNG-normalising loses the animation
+///   (only frame 0 survives the RGBA round-trip).
+///
+/// Bytes ride the wire under the source MIME and the receiver writes them
+/// verbatim under that same MIME. Whether a destination app *paints* the
+/// SVG or *animates* the GIF is the destination's concern — see §3.1 / §3.2.
+pub fn is_passthrough_image_mime(mime: &str) -> bool {
+    matches!(mime, "image/svg+xml" | "image/gif")
 }
 
 /// Compute a stable, cheap content fingerprint for a `ClipboardPayload` used
@@ -143,20 +151,24 @@ pub fn normalize_image_blob_from_bytes(
     ))
 }
 
-/// Build a `ClipboardBlob` from raw clipboard bytes, branching between vector
-/// (verbatim pass-through) and raster (PNG-normalise) paths based on the
-/// source MIME. Vector MIMEs ride the wire as-is — receivers re-stock them
-/// under the same MIME, so e.g. SVG copied from Inkscape pastes as SVG into
-/// a vector-aware destination on the receiving peer.
+/// Build a `ClipboardBlob` from raw clipboard bytes, branching between
+/// passthrough (verbatim) and raster (PNG-normalise) paths based on the
+/// source MIME. Passthrough MIMEs ride the wire as-is — receivers re-stock
+/// them under the same MIME, so e.g. SVG copied from Inkscape pastes as SVG
+/// into a vector-aware destination on the receiving peer, and an animated
+/// GIF retains animation through to the receiver.
 ///
-/// Vector blobs have `width = height = None` because vector formats don't
-/// carry intrinsic raster dimensions. The TIRI fix's `image_blob_eq_stable`
-/// falls back to byte-exact comparison when dims are absent — for vector
-/// content that's correct: the bytes are UTF-8 XML and round-trip stably
-/// through every OS clipboard layer, so byte-exact compare doesn't bounce.
+/// Passthrough blobs have `width = height = None`. For SVG that's because
+/// vector formats don't carry intrinsic raster dimensions; for GIF we
+/// could parse the LSD header but skip it deliberately because the
+/// TIRI-fix's `image_blob_eq_stable` falls back to byte-exact comparison
+/// when dims are absent, and passthrough bytes round-trip stably through
+/// every OS clipboard layer (SVG XML, GIF byte stream — both preserved
+/// verbatim by NSPasteboard / Win32 registered formats / wlroots), so
+/// byte-exact compare doesn't bounce.
 #[cfg(target_os = "linux")]
 pub fn build_image_blob(bytes: Vec<u8>, source_mime: &str) -> Option<ClipboardBlob> {
-    if is_vector_image_mime(source_mime) {
+    if is_passthrough_image_mime(source_mime) {
         if bytes.len() > MAX_CLIPBOARD_IMAGE_WIRE_BYTES {
             tracing::warn!(
                 "Clipboard {} ({} bytes) exceeds {} byte wire cap; skipping.",

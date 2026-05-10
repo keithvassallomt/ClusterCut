@@ -119,21 +119,22 @@ function findOfferedMime(offered, prefix) {
     return null;
 }
 
-// Image MIME types we relay over D-Bus, in preference order. Vector MIMEs
-// (SVG) are checked first so a source that offers both vector and raster
-// (e.g. Inkscape: image/svg+xml + a raster fallback) gives the receiving
-// peer the higher-fidelity vector representation. The Rust side normalises
-// raster sources to PNG before broadcasting; vector sources pass through
-// verbatim.
+// Image MIME types we relay over D-Bus, in preference order. Passthrough
+// MIMEs (SVG vector, animated GIF) lead the list so a source that offers
+// both passthrough + raster (e.g. Inkscape: image/svg+xml + raster PNG;
+// some apps put image/gif + image/png) gives the receiving peer the
+// higher-fidelity passthrough representation. The Rust side normalises
+// raster sources to PNG before broadcasting; passthrough sources go
+// over the wire verbatim.
 const IMAGE_MIME_PRIORITY = [
     'image/svg+xml',
+    'image/gif',
     'image/png',
     'image/jpeg',
     'image/webp',
     'image/bmp',
     'image/x-bmp',
     'image/tiff',
-    'image/gif',
 ];
 
 let ClipboardBridgeIface = null;

@@ -132,9 +132,9 @@ fn read_clipboard_image_arboard(arboard: &mut arboard::Clipboard) -> Option<Clip
 /// bytes verbatim under the source MIME via OS-direct calls in `rich.rs` —
 /// arboard's API is RGBA-only and would lose the vector representation.
 fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Result<(), String> {
-    if super::common::is_vector_image_mime(&blob.mime_type) {
+    if super::common::is_passthrough_image_mime(&blob.mime_type) {
         let bytes = blob.raw_bytes()?;
-        return rich::write_clipboard_vector_image(&blob.mime_type, &bytes);
+        return rich::write_clipboard_passthrough_image(&blob.mime_type, &bytes);
     }
 
     let format = match blob.mime_type.as_str() {
@@ -265,11 +265,12 @@ fn read_clipboard(
         Err(_) => {}
     }
 
-    // Vector-image probe — sits *before* arboard's RGBA path so a source
-    // that offers both an SVG and a rasterised PNG fallback gives the
-    // higher-fidelity vector representation. arboard's `get_image()` is
-    // RGBA-only and would lose the vector. X11 returns None unconditionally.
-    if let Some((mime, bytes)) = rich::read_clipboard_vector_image() {
+    // Passthrough-image probe (SVG, animated GIF) — sits *before* arboard's
+    // RGBA path so sources that offer both passthrough + raster fallback
+    // give the higher-fidelity passthrough representation. arboard's
+    // `get_image()` is RGBA-only and would lose vector / animated content.
+    // X11 returns None unconditionally.
+    if let Some((mime, bytes)) = rich::read_clipboard_passthrough_image() {
         return ClipboardContent::Image(ClipboardBlob::from_bytes(
             mime, &bytes, None, None,
         ));

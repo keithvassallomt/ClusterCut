@@ -119,7 +119,7 @@ NSPasteboard supports lazy/promise-based pasteboard owners (`NSPasteboardWriting
 | # | Item | Status |
 |---|---|---|
 | 3.1 | SVG (vector image) clipboard sync — verbatim pass-through | ✅ complete (test plan: T-3.1.x) |
-| 3.2 | Animated GIF preservation | ⬜ not started |
+| 3.2 | Animated GIF preservation — verbatim pass-through | ✅ complete (test plan: T-3.2.x) |
 | 3.3 | Streaming/deferred-download for large blobs | ⬜ not started |
 
 ### Release polish (after Parts 1 + 2 + 3 are in)
@@ -174,3 +174,53 @@ Repeat T-3.1.1 with sender/receiver pairs across all four supported backend comb
 - Windows → Linux wlroots
 
 Expected: SVG arrives intact on all four. **X11 sender/receiver intentionally not in scope** — X11 falls back to the existing raster-PNG image path or no image at all.
+
+---
+
+### §3.2 — Animated GIF clipboard sync
+
+#### T-3.2.1 — Animated GIF preserves animation
+
+1. Find or create a small animated GIF (e.g. `wget` a sample, or any `.gif` file from your downloads). Open the file in a GIF-aware app — Firefox in image-view mode, an image editor that natively reads GIF, the GIMP "open" dialog, etc. — that will put the GIF bytes (not a rasterised frame) on the clipboard when copied.
+   - On GNOME/Wayland: open the GIF in `eog` (Eye of GNOME) or right-click in Files → "Copy" the file (note: this uses the **files** path, not blob — for the blob path you need an app that copies image bytes, not a path). Inkscape with an SVG canvas containing an embedded GIF works.
+   - Pragmatic shortcut: most desktop apps rasterise GIFs to PNG before they hit the clipboard. To exercise the path reliably, `xclip -i -selection clipboard -t image/gif < animation.gif` on Linux X11/wlroots, or PowerShell `Set-Clipboard` with a registered "image/gif" format on Windows. macOS: drag from a file manager into a `pbcopy`-style helper isn't trivial; use a test app or run a small Python/Swift snippet that writes `com.compuserve.gif` to NSPasteboard.
+2. On a peer running ClusterCut, paste into a GIF-aware app — Discord, Slack, Telegram desktop client, a web browser address bar.
+3. The pasted result animates.
+
+Expected:
+- Receiver-side log: `Received clipboard image from <peer>: mime=image/gif, decoded=<N> bytes` (no dimensions reported — same shape as SVG).
+- Pasting into Chromium/Electron-based apps (Discord, Slack, Edge/Chrome) preserves animation.
+- Pasting into "classic" raster-only apps (Paint on Windows, Preview on macOS) ignores the GIF and either pastes nothing or an existing raster fallback the source app may have provided.
+- **No silent rasterisation by ClusterCut.** The wire format stays `image/gif`; we do not synthesise a PNG companion.
+
+#### T-3.2.2 — GIF beats PNG when source offers both
+
+1. Use a source that offers both `image/gif` and `image/png` (a few image apps do this: the GIF for GIF-aware destinations, the PNG as a still-frame fallback). If you don't have one handy, simulate by manually putting both formats on the clipboard via the OS's clipboard CLI tools.
+2. Observe the receive event on the peer.
+
+Expected:
+- Receive log shows `mime=image/gif`, not `image/png`. ClusterCut prefers passthrough (animated) when available.
+- The PNG companion is not relayed.
+
+#### T-3.2.3 — GIF TIRI check
+
+1. With dev logs streaming on both peers, copy a GIF on the sender.
+2. Watch the receiver's log for ~5 seconds after the receive event.
+
+Expected:
+- Receiver logs `Received clipboard image from <sender>: mime=image/gif, …`.
+- **No** subsequent `Sent clipboard to <sender>` line within ~3 seconds. GIF bytes on the OS clipboard layer round-trip stably (NSPasteboard keeps them verbatim under `com.compuserve.gif`; Windows registered format atom is bytes-in-bytes-out; wlroots `image/gif` selection round-trip is stable). `image_blob_eq_stable`'s byte-equality fallback (when dims are absent) suppresses the echo.
+
+#### T-3.2.4 — Cross-backend coverage
+
+Repeat T-3.2.1 with the same backend pairs as T-3.1.4. Expected: GIF arrives intact on all combinations, animation preserved when the destination app supports `image/gif` paste, plain-bytes fallback otherwise. **X11 not in scope.**
+
+#### T-3.2.5 — Common-case regression check (Slack/Discord/Firefox copy-image)
+
+1. From Firefox/Chrome on Linux, right-click a regular *static* PNG image on a webpage → **Copy Image**.
+2. Receive on a peer.
+
+Expected:
+- Wire MIME is `image/png` (browsers rasterise static images at copy time, not GIF — confirmed earlier).
+- The existing raster-PNG path handles the receive; no regression from the GIF passthrough work.
+- `mime=image/png` in the receive log, with `width`/`height` populated as before.
