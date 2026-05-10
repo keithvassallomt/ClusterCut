@@ -755,18 +755,22 @@ export default function App() {
     if (!myHostname) return; // Wait for identity to prevent false "remote" detection
 
     const unlistenPeer = listen<Peer>("peer-update", (event) => {
-      // If we just paired (trusted), refresh metadata
-      if (event.payload.is_trusted) {
-        invoke<string>("get_network_name").then(name => setMyNetworkName(name));
-        invoke<string>("get_network_pin").then(pin => setNetworkPin(pin));
-        setJoinOpen(false); // Close modal on success
-      }
-
       setPeers((prev) => {
         const exists = prev.find((p) => p.id === event.payload.id);
         if (exists) return prev.map((p) => (p.id === event.payload.id ? event.payload : p));
         return [...prev, event.payload];
       });
+    });
+
+    // Pairing completion is signalled by a dedicated event from the backend
+    // rather than overloading `peer-update` — mDNS rediscovery of an
+    // already-known peer also fires `peer-update` with is_trusted=true and
+    // would otherwise race the PIN dialog closed before the user can submit.
+    const unlistenPairingSuccess = listen<string>("pairing-success", () => {
+      setJoinOpen(false);
+      setJoinBusy(false);
+      invoke<string>("get_network_name").then(name => setMyNetworkName(name));
+      invoke<string>("get_network_pin").then(pin => setNetworkPin(pin));
     });
 
     // Listen for Monitor Updates (When Auto-Send is OFF)
@@ -917,6 +921,7 @@ export default function App() {
       unlistenUpdate.then((f) => f());
       unlistenDelete.then((f) => f());
       unlistenPairingFailed.then((f) => f());
+      unlistenPairingSuccess.then((f) => f());
       unlistenNotification.then((f) => f());
       unlistenSettingsChanged.then((f) => f());
     };
