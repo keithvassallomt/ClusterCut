@@ -212,7 +212,11 @@ impl Transport {
         tauri::async_runtime::spawn(async move {
             tracing::info!("Starting transport listener loop...");
             while let Some(conn) = endpoint.accept().await {
-                // tracing::debug!("Transport accepted a connection attempt...");
+                // Capture the peer's address before the handshake-future
+                // consumes `conn`. Without this, a failed handshake logs an
+                // anonymous "rejected" line and you have no way to tell
+                // which host on the LAN tried to reach you.
+                let remote_for_log = conn.remote_address();
                 let connection = conn.await;
                 match connection {
                     Ok(conn) => {
@@ -306,7 +310,11 @@ impl Transport {
                             });
                         }
                     }
-                    Err(e) => tracing::error!("Connection handshake failed: {}", e),
+                    Err(e) => tracing::error!(
+                        "Connection handshake failed from {}: {}",
+                        remote_for_log,
+                        e
+                    ),
                 }
             }
         });

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Rejected inbound QUIC handshakes now log the remote address alongside the failure reason. Previously the error line was anonymous, so a "fingerprint not in known peers" rejection gave no clue which host on the LAN was attempting to connect.
+
 ## [0.3.0] - 2026-05-10
 
 ### Added
