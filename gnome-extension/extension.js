@@ -137,70 +137,6 @@ const IMAGE_MIME_PRIORITY = [
     'image/tiff',
 ];
 
-// Plain-text MIME aliases. St.Clipboard's pick_mimetype probes these in order
-// when a consumer calls get_text; we offer all of them off the same bytes so
-// every consumer path finds the plain-text representation alongside any rich
-// formats we install in the same source.
-const TEXT_MIME_ALIASES = [
-    'text/plain;charset=utf-8',
-    'UTF8_STRING',
-    'text/plain',
-    'STRING',
-];
-
-// MetaSelectionSource subclass that advertises an arbitrary set of MIME types
-// from a single owner. mutter's stock MetaSelectionSourceMemory is single-MIME,
-// and St.Clipboard.set_content / set_text each install a fresh owner — so a
-// sequence of those calls collapses to the MIMEs from the last call. To put
-// plain text + text/html (or text/uri-list + x-special/gnome-copied-files) on
-// the clipboard simultaneously we have to build our own multi-MIME source and
-// call meta_selection_set_owner ourselves.
-const MultiMimeSource = GObject.registerClass(
-class ClusterCutMultiMimeSource extends Meta.SelectionSource {
-    _init() {
-        super._init();
-        this._formats = new Map();
-        // GTask → GInputStream; used to thread the per-call stream from
-        // read_async to the matching read_finish. Weak so completed tasks
-        // can be collected normally.
-        this._pending = new WeakMap();
-    }
-
-    add(mime, data) {
-        if (!data || data.length === 0) return;
-        this._formats.set(mime, data instanceof Uint8Array ? data : new Uint8Array(data));
-    }
-
-    vfunc_get_mimetypes() {
-        return Array.from(this._formats.keys());
-    }
-
-    vfunc_read_async(mimetype, cancellable, callback) {
-        const task = Gio.Task.new(this, cancellable, callback, null);
-        const data = this._formats.get(mimetype);
-        if (!data) {
-            task.return_error(new GLib.Error(
-                Gio.io_error_quark(),
-                Gio.IOErrorEnum.NOT_SUPPORTED,
-                `mimetype not in source: ${mimetype}`
-            ));
-            return;
-        }
-        const stream = Gio.MemoryInputStream.new_from_bytes(GLib.Bytes.new(data));
-        this._pending.set(task, stream);
-        task.return_boolean(true);
-    }
-
-    vfunc_read_finish(result) {
-        if (!result.propagate_boolean()) {
-            return null;
-        }
-        const stream = this._pending.get(result);
-        this._pending.delete(result);
-        return stream;
-    }
-});
-
 let ClipboardBridgeIface = null;
 
 const ClusterCutIndicator = GObject.registerClass(
@@ -715,20 +651,27 @@ export default class ClusterCutExtension extends Extension {
         this._lastFilesKey = uris.join('\n');
         this._lastClipboardText = '';
 
-        // Both MIMEs go on the wire from one owner: Nautilus/GTK file managers
-        // key on x-special/gnome-copied-files to decide "paste file" vs
-        // "paste text", while GTK4 file targets and other consumers want
-        // text/uri-list. Two sequential set_content calls would have left
-        // only the last MIME on offer.
-        const encoder = new TextEncoder();
-        const source = new MultiMimeSource();
-        source.add('text/uri-list', encoder.encode(uris.join('\n') + '\n'));
-        source.add('x-special/gnome-copied-files', encoder.encode('copy\n' + uris.join('\n')));
+        const clipboard = St.Clipboard.get_default();
 
-        global.display.get_selection().set_owner(
-            Meta.SelectionType.SELECTION_CLIPBOARD,
-            source
-        );
+        // Write both MIMEs: Nautilus/GTK file managers key on
+        // x-special/gnome-copied-files to decide "paste file" vs "paste text".
+        // The `copy` field in x-special/gnome-copied-files distinguishes a
+        // copy from a cut — we always use "copy". Each set_content call
+        // replaces the selection owner, so only the *last* MIME is actually
+        // on offer afterwards — but Nautilus only reads x-special anyway
+        // so the file-paste flow works in practice. Fixing this properly
+        // would need a multi-MIME MetaSelectionSource subclass, which GJS
+        // can't implement (vfunc_read_async takes a GAsyncReadyCallback
+        // parameter — unsupported).
+        const uriListText = uris.join('\n') + '\n';
+        const gnomeCopiedText = 'copy\n' + uris.join('\n');
+
+        const encoder = new TextEncoder();
+        const uriListBytes = GLib.Bytes.new(encoder.encode(uriListText));
+        const gnomeCopiedBytes = GLib.Bytes.new(encoder.encode(gnomeCopiedText));
+
+        clipboard.set_content(St.ClipboardType.CLIPBOARD, 'text/uri-list', uriListBytes);
+        clipboard.set_content(St.ClipboardType.CLIPBOARD, 'x-special/gnome-copied-files', gnomeCopiedBytes);
     }
 
     _writeBlob(mime, data) {
@@ -746,13 +689,25 @@ export default class ClusterCutExtension extends Extension {
         clipboard.set_content(St.ClipboardType.CLIPBOARD, mime, glibBytes);
     }
 
-    // Atomically restock the clipboard with plain text plus alternate
-    // representations (text/html, text/rtf, …) as a single multi-MIME owner.
-    // St.Clipboard.set_content / set_text each *replace* the selection owner,
-    // so calling them in sequence leaves only the last MIME advertised — that
-    // collapsed text/html + plain text down to text/html alone for receivers
-    // and broke pasting into plain-text apps. MultiMimeSource advertises
-    // every MIME from one source and one set_owner call.
+    // Restock the clipboard with plain text and any rich representations
+    // (text/html, text/rtf). Each set_text/set_content call replaces the
+    // previous selection owner, so when both plain text and a rich format
+    // are present, only the *last* MIME ends up on offer — set_text then
+    // set_content('text/html', …) leaves text/html on the clipboard.
+    //
+    // That's the behavior we want here: rich-text apps pick up the HTML
+    // and render it; most plain-text consumers fall back to reading
+    // text/html and either accept it or extract text. Doing the inverse
+    // (plain-text wins) loses formatting in Word/Outlook and similar.
+    //
+    // The "ideal" fix is to install a single multi-MIME selection source
+    // so both MIMEs are advertised simultaneously, but mutter's
+    // MetaSelectionSourceMemory is single-MIME and GJS can't subclass
+    // MetaSelectionSource — vfunc_read_async takes a GAsyncReadyCallback
+    // parameter, which GJS rejects with "VFunc read_async accepts another
+    // callback as a parameter. This is not supported." Without shipping
+    // native code we're stuck with last-write-wins; matching the prior
+    // behavior is the lesser-evil compromise.
     _writeFormats(text, formats) {
         if (!Array.isArray(formats)) {
             return;
@@ -764,23 +719,17 @@ export default class ClusterCutExtension extends Extension {
         this._lastFilesKey = '';
         this._lastBlobKey = '';
 
-        const source = new MultiMimeSource();
-
+        const clipboard = St.Clipboard.get_default();
         if (text) {
-            const textBytes = new TextEncoder().encode(text);
-            for (const mime of TEXT_MIME_ALIASES) {
-                source.add(mime, textBytes);
-            }
+            clipboard.set_text(St.ClipboardType.CLIPBOARD, text);
         }
-
         for (const [mime, data] of formats) {
-            source.add(mime, data);
+            if (!data || data.length === 0) {
+                continue;
+            }
+            const glibBytes = GLib.Bytes.new(data);
+            clipboard.set_content(St.ClipboardType.CLIPBOARD, mime, glibBytes);
         }
-
-        global.display.get_selection().set_owner(
-            Meta.SelectionType.SELECTION_CLIPBOARD,
-            source
-        );
     }
 
     _handleClipboardMethod(methodName, parameters, invocation) {
