@@ -515,6 +515,10 @@ pub async fn pairing_connect(
 /// Bind a TCP pairing listener on `[::]:port` and spawn an accept loop that
 /// hands each accepted connection to `handler`. The listener runs for the
 /// process lifetime — there is no shutdown signal in Phase 1.
+///
+/// Bind happens synchronously (so a port conflict surfaces as an error
+/// immediately) but the std → tokio listener conversion is deferred into
+/// the spawned task because it requires an active tokio runtime.
 pub fn start_pairing_listener<F>(
     port: u16,
     handler: F,
@@ -525,10 +529,16 @@ where
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
     let std_listener = std::net::TcpListener::bind(bind_addr)?;
     std_listener.set_nonblocking(true)?;
-    let listener = TcpListener::from_std(std_listener)?;
     tracing::info!("Pairing TCP listener bound on {}", bind_addr);
 
     tauri::async_runtime::spawn(async move {
+        let listener = match TcpListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to attach pairing listener to tokio runtime: {}", e);
+                return;
+            }
+        };
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
