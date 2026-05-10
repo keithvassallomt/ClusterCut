@@ -406,7 +406,7 @@ mod windows {
             .map_err(|e| format!("clipboard-win open: {}", e))?;
         raw::empty().map_err(|e| format!("EmptyClipboard: {}", e))?;
         RawData(id)
-            .write_clipboard(bytes)
+            .write_clipboard(&bytes)
             .map_err(|e| format!("SetClipboardData({}): {}", mime, e))?;
         Ok(())
     }
