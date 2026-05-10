@@ -1462,33 +1462,68 @@ async fn probe_ip(
             }
 }
 
-#[cfg(target_os = "windows")]
+/// Description sentinel embedded in the netsh rule. Bumped whenever the rule
+/// shape changes so existing too-narrow rules from older versions get
+/// force-replaced via UAC on first launch instead of silently passing the
+/// "looks correct" check. v0.3 widens to include explicit outbound + scope.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const FIREWALL_RULE_SENTINEL: &str = "ClusterCut UDP sync v0.3";
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn configure_windows_firewall() {
-    // Check if the firewall rule already exists (does not require elevation)
+    // Check if the firewall rule already exists (does not require elevation).
+    // Existing rules from 0.2.x are inbound-only with no description, which
+    // surfaces in the wild as "Windows accepts QUIC packets but its outbound
+    // replies are dropped on restrictive Defender / enterprise policy".
+    // The sentinel below lets us detect a too-narrow legacy rule and force a
+    // single re-prompt to widen it.
     let check = std::process::Command::new("netsh")
-        .args(["advfirewall", "firewall", "show", "rule", "name=ClusterCut"])
+        .args(["advfirewall", "firewall", "show", "rule", "name=ClusterCut", "verbose"])
         .output();
 
     match check {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // If the rule exists, netsh prints its details including the port.
-            // Verify it matches our expected configuration.
             if output.status.success()
                 && stdout.contains("UDP")
                 && stdout.contains("4654")
+                && stdout.contains(FIREWALL_RULE_SENTINEL)
             {
-                tracing::info!("Windows Firewall rule 'ClusterCut' already exists and looks correct, skipping.");
+                tracing::info!(
+                    "Windows Firewall rule 'ClusterCut' already up to date ({}), skipping.",
+                    FIREWALL_RULE_SENTINEL
+                );
                 return;
             }
-            tracing::info!("Firewall rule missing or misconfigured, will create/update (requesting UAC)...");
+            tracing::info!(
+                "Firewall rule missing, missing the {} sentinel, or misconfigured — will create/update (requesting UAC)...",
+                FIREWALL_RULE_SENTINEL
+            );
         }
         Err(e) => {
             tracing::warn!("Could not check firewall rule: {}, will attempt to create it", e);
         }
     }
 
-    let cmd = "netsh advfirewall firewall delete rule name=\"ClusterCut\" 2>$null; netsh advfirewall firewall add rule name=\"ClusterCut\" dir=in action=allow protocol=UDP localport=4654 profile=any edge=yes";
+    // Three netsh calls in one elevated session:
+    //   1. Delete any existing "ClusterCut" rules so we don't end up with
+    //      duplicate / stale rules layered on top of each other.
+    //   2. Add inbound UDP/4654 (any source IP, edge traversal allowed).
+    //   3. Add outbound UDP/4654. Windows defaults to "allow outbound" but
+    //      Defender / enterprise / "Block all" private-profile configs do
+    //      override that — without an explicit allow rule, QUIC handshake
+    //      ACKs from this machine get dropped, which surfaces as "Linux
+    //      can't reach Windows but Windows can reach Linux" (the Linux
+    //      side sees its initial-Initial succeed but never the response).
+    //
+    // The description on every rule is the FIREWALL_RULE_SENTINEL so the
+    // pre-flight check above can detect it.
+    let cmd = format!(
+        "netsh advfirewall firewall delete rule name=\\\"ClusterCut\\\" 2>$null; \
+         netsh advfirewall firewall add rule name=\\\"ClusterCut\\\" dir=in action=allow protocol=UDP localport=4654 remoteip=any profile=any edge=yes description=\\\"{sentinel}\\\"; \
+         netsh advfirewall firewall add rule name=\\\"ClusterCut\\\" dir=out action=allow protocol=UDP localport=4654 remoteip=any profile=any description=\\\"{sentinel}\\\"",
+        sentinel = FIREWALL_RULE_SENTINEL
+    );
 
     match std::process::Command::new("powershell")
         .args([
@@ -1499,7 +1534,7 @@ fn configure_windows_firewall() {
         .spawn()
     {
         Ok(_) => {
-            tracing::info!("Triggered UAC prompt for Firewall configuration.");
+            tracing::info!("Triggered UAC prompt for Firewall configuration ({}).", FIREWALL_RULE_SENTINEL);
         }
         Err(e) => {
             tracing::error!("Failed to launch elevated PowerShell: {}", e);
@@ -1794,6 +1829,10 @@ async fn start_pairing(
     }
 
     let _ = stream.shutdown().await;
+
+    // Signal pairing completion to the UI. Distinct from `peer-update`
+    // (which also fires on mDNS rediscovery and would race the PIN dialog).
+    let _ = app_handle.emit("pairing-success", &peer_id);
     Ok(())
 }
 
