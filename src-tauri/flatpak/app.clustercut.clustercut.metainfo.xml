@@ -64,6 +64,21 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.0" date="2026-05-10">
+      <description>
+        <p>Image and rich-text clipboard sync, plus stronger security.</p>
+        <ul>
+          <li>Image clipboard sync — copy a picture (from a browser, a screenshot tool, etc.) and it's ready to paste on your other devices, into any app</li>
+          <li>Rich-text clipboard sync — formatting from Word, Pages, your browser, Apple Mail and similar apps now comes across to your other devices intact</li>
+          <li>Pairing and clipboard traffic have been redesigned for stronger security</li>
+          <li>If a device in your cluster is running a version too old to keep up, ClusterCut now flags which one and prompts you to upgrade</li>
+          <li>Clipboard history now scrolls properly when the list gets long</li>
+          <li>Windows reliability — images paste cleanly into apps like Paint and Word, notifications about new devices and incoming files no longer get dropped, and the firewall rule now covers everything ClusterCut needs</li>
+          <li>macOS Pages now preserves formatting when pasting rich text received from another device</li>
+          <li>All your devices need to be on 0.3.0 or later — older versions cannot talk to this release</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.3" date="2026-05-08">
       <description>
         <p>Faster file transfers and tighter privacy for LAN-only setups.</p>

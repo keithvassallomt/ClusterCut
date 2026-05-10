@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-05-10
 
 ### Added
 - Image clipboard sync. Copy an image — for example with right-click → "Copy Image" in a browser, or from a screenshot tool — and it appears on your peers' clipboards, ready to paste into any app (Word, Preview, GIMP, etc.). Wired up across all four clipboard backends: X11, Wayland (KDE/Sway/Hyprland), GNOME Wayland (via the ClusterCut extension), Windows, and macOS. History view shows a thumbnail with dimensions and size. Up to 10 MB of encoded image bytes ride inline on `Message::Clipboard`; larger images switch automatically to the descriptor + file-transfer path described below.
