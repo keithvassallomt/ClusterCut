@@ -4,6 +4,13 @@ use std::error::Error;
 
 pub const SERVICE_TYPE: &str = "_clustercut._tcp.local.";
 
+/// Protocol-compatibility version advertised in the mDNS `proto` TXT
+/// property. Bumped whenever a wire-format or transport-security change
+/// breaks compatibility with older peers. v0.3.0 marks the strict-mTLS
+/// transport + plaintext-payload model — pre-0.3.0 peers can't talk to
+/// 0.3.0+ peers, so we surface them as incompatible in the UI.
+pub const CLUSTERCUT_PROTOCOL_VERSION: &str = "0.3.0";
+
 pub struct Discovery {
     daemon: ServiceDaemon,
     registered_service: Option<String>, // Stores fullname of registered service
@@ -44,9 +51,13 @@ impl Discovery {
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "Unknown Device".to_string());
 
-        // Properties can be used to send public key fingerprint or other metadata
+        // Properties can be used to send public key fingerprint or other metadata.
+        // `proto` carries the wire-protocol-compatibility version (see
+        // [`CLUSTERCUT_PROTOCOL_VERSION`]). Peers below the receiver's expected
+        // value get a yellow warning indicator in the UI.
         let properties = [
             ("version", "0.1.0"),
+            ("proto", CLUSTERCUT_PROTOCOL_VERSION),
             ("id", device_id),
             ("n", network_name),     // n = network name
             ("h", &system_hostname), // h = visible hostname

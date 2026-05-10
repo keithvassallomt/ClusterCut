@@ -1060,6 +1060,56 @@ async fn removal_debounce_task(
     }
 }
 
+/// Parse a "MAJOR.MINOR.PATCH" string. Accepts a trailing `-prerelease`
+/// segment (digits-only prefix is taken from the patch component, so e.g.
+/// `0.3.0-alpha.1` parses as (0, 3, 0)). Returns `None` for unparseable
+/// input — caller treats that as "incompatible" so older peers that don't
+/// advertise a `proto` property are flagged.
+fn parse_protocol_version(s: &str) -> Option<(u32, u32, u32)> {
+    let leading_digits = |segment: &str| -> Option<u32> {
+        let head: String = segment.chars().take_while(|c| c.is_ascii_digit()).collect();
+        head.parse().ok()
+    };
+    let mut parts = s.split('.');
+    let major = leading_digits(parts.next()?)?;
+    let minor = leading_digits(parts.next()?)?;
+    let patch = parts.next().and_then(leading_digits).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// True if the peer's advertised `proto` version is at least the minimum
+/// this build can talk to (currently 0.3.0 — the strict-mTLS line). Returns
+/// false for peers that don't advertise the property at all (older builds).
+pub fn is_protocol_compatible(version: Option<&str>) -> bool {
+    let Some(v) = version else { return false };
+    parse_protocol_version(v).map_or(false, |parsed| parsed >= (0, 3, 0))
+}
+
+/// Log a send failure and, if the destination peer is on an incompatible
+/// protocol version, emit a `peer-incompatible` event for the UI to surface
+/// as a modal. Only fires for user-triggered sends (clipboard, file
+/// requests) — background pings/heartbeats use plain logging instead, so a
+/// transient unreachable peer doesn't spam the user.
+pub fn report_send_failure(
+    app: &tauri::AppHandle,
+    peer_id: &str,
+    peer_hostname: &str,
+    peer_version: Option<&str>,
+    addr: std::net::SocketAddr,
+    err: &str,
+) {
+    tracing::error!("Failed to send to {} ({}, {}): {}", peer_hostname, peer_id, addr, err);
+    if !is_protocol_compatible(peer_version) {
+        let _ = app.emit(
+            "peer-incompatible",
+            serde_json::json!({
+                "id": peer_id,
+                "hostname": peer_hostname,
+            }),
+        );
+    }
+}
+
 fn gossip_peer(
     new_peer: &Peer,
     state: &AppState,
@@ -1350,6 +1400,7 @@ async fn probe_ip(
         network_name: Some(network_name),
         signature: None,
         fingerprint: Some(transport.local_fingerprint()),
+        protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
     };
 
     let msg = Message::PeerDiscovery(my_peer);
@@ -1395,6 +1446,7 @@ async fn probe_ip(
                              network_name: None,
                              signature: None,
                              fingerprint: None,
+                             protocol_version: None,
                          };
                          peers.insert(id.clone(), peer.clone());
                          let _ = app_handle.emit("peer-update", &peer);
@@ -1934,6 +1986,7 @@ async fn handle_pairing_connection(
         network_name: Some(network_name.clone()),
         signature: None,
         fingerprint: None, // filled in by PairFingerprint below
+        protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
     };
     {
         let mut kp_lock = state.known_peers.lock().unwrap();
@@ -2096,9 +2149,20 @@ async fn send_clipboard(
         let addr = std::net::SocketAddr::new(p.ip, p.port);
         let transport_clone = (*transport).clone();
         let data_vec = data.clone();
+        let app_clone = app_handle.clone();
+        let peer_id = p.id.clone();
+        let peer_hostname = p.hostname.clone();
+        let peer_version = p.protocol_version.clone();
         tauri::async_runtime::spawn(async move {
             if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
-                tracing::error!("[Clipboard] Failed to send to {}: {}", addr, e);
+                report_send_failure(
+                    &app_clone,
+                    &peer_id,
+                    &peer_hostname,
+                    peer_version.as_deref(),
+                    addr,
+                    &e.to_string(),
+                );
             } else {
                 tracing::debug!("[Clipboard] Sent to {}", addr);
             }
@@ -2730,6 +2794,9 @@ pub fn run() {
                                     let network_name_prop = info
                                         .get_property_val_str("n")
                                         .map(|s| s.to_string());
+                                    let proto_prop = info
+                                        .get_property_val_str("proto")
+                                        .map(|s| s.to_string());
                                     
                                     if let Some(n) = &network_name_prop {
                                         tracing::debug!("Discovered peer {} with network name: {}", id, n);
@@ -2777,6 +2844,7 @@ pub fn run() {
                                         // Carry the stored fingerprint forward into the
                                         // runtime peer record so it shows up in the UI.
                                         fingerprint: stored_fingerprint,
+                                        protocol_version: proto_prop,
                                     };
 
                                     // Check if peer is already active to prevent duplicate notifications
@@ -2996,6 +3064,7 @@ pub fn run() {
                         network_name: Some(network_name),
                         signature: None,
                         fingerprint: Some(hb_transport.local_fingerprint()),
+                        protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
                     };
 
                     let msg = Message::PeerDiscovery(my_peer);
@@ -4135,8 +4204,9 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                     network_name: Some(network_name),
                     signature: None,
                     fingerprint: Some(transport_inside.local_fingerprint()),
+                    protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
                 };
-                
+
                 let msg = Message::PeerDiscovery(my_peer);
                 let data = serde_json::to_vec(&msg).unwrap_or_default();
                 tauri::async_runtime::spawn(async move {
@@ -4567,8 +4637,21 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
                                 let addr = std::net::SocketAddr::new(p.ip, p.port);
                                 let transport_clone = (*transport).clone();
                                 let data_vec = data.clone();
+                                let app_clone = app_handle.clone();
+                                let peer_id = p.id.clone();
+                                let peer_hostname = p.hostname.clone();
+                                let peer_version = p.protocol_version.clone();
                                 tauri::async_runtime::spawn(async move {
-                                    let _ = transport_clone.send_message(addr, &data_vec).await;
+                                    if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
+                                        report_send_failure(
+                                            &app_clone,
+                                            &peer_id,
+                                            &peer_hostname,
+                                            peer_version.as_deref(),
+                                            addr,
+                                            &e.to_string(),
+                                        );
+                                    }
                                 });
                             }
 

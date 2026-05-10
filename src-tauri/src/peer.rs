@@ -22,4 +22,11 @@ pub struct Peer {
     // (Phase 4 surfaces this in the UI).
     #[serde(default)]
     pub fingerprint: Option<Vec<u8>>,
+    /// Protocol-compatibility version advertised by the peer in mDNS
+    /// (TXT property `proto`). Used to flag peers running pre-mTLS
+    /// builds that can't talk to this device. None when the property
+    /// is absent (older builds didn't set it). Not persisted to
+    /// `known_peers.json` — refreshed from mDNS each time.
+    #[serde(default, skip_serializing)]
+    pub protocol_version: Option<String>,
 }

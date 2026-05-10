@@ -901,9 +901,20 @@ pub fn broadcast_clipboard(
         let addr = std::net::SocketAddr::new(peer.ip, peer.port);
         let transport_clone = transport.clone();
         let data_vec = data.clone();
+        let app_clone = app_handle.clone();
+        let peer_id = peer.id.clone();
+        let peer_hostname = peer.hostname.clone();
+        let peer_version = peer.protocol_version.clone();
         tauri::async_runtime::spawn(async move {
             if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
-                tracing::error!("Failed to send to {}: {}", addr, e);
+                crate::report_send_failure(
+                    &app_clone,
+                    &peer_id,
+                    &peer_hostname,
+                    peer_version.as_deref(),
+                    addr,
+                    &e.to_string(),
+                );
             } else {
                 tracing::info!("Sent clipboard to {}", addr);
             }

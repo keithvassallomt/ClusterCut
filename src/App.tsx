@@ -41,13 +41,50 @@ interface Peer {
   is_manual?: boolean;
   network_name?: string;
   platform?: string; // Backend doesn't send this yet, will mock or infer
+  /// Protocol-compatibility version advertised via mDNS. Missing or below
+  /// `MIN_COMPATIBLE_PROTOCOL` means the peer is on a pre-mTLS build and
+  /// can't talk to us — surfaced as a yellow warning indicator.
+  protocol_version?: string | null;
+}
+
+const MIN_COMPATIBLE_PROTOCOL: [number, number, number] = [0, 3, 0];
+
+function parseProtocolVersion(v: string | null | undefined): [number, number, number] | null {
+  if (!v) return null;
+  const parts = v.split(".");
+  if (parts.length < 2) return null;
+  const head = (s: string) => {
+    const m = s.match(/^(\d+)/);
+    return m ? parseInt(m[1], 10) : NaN;
+  };
+  const major = head(parts[0]);
+  const minor = head(parts[1]);
+  const patch = parts.length >= 3 ? head(parts[2]) : 0;
+  if (Number.isNaN(major) || Number.isNaN(minor) || Number.isNaN(patch)) return null;
+  return [major, minor, patch];
+}
+
+function isPeerProtocolCompatible(peer: Peer): boolean {
+  const parsed = parseProtocolVersion(peer.protocol_version);
+  if (!parsed) return false;
+  for (let i = 0; i < 3; i++) {
+    if (parsed[i] !== MIN_COMPATIBLE_PROTOCOL[i]) {
+      return parsed[i] > MIN_COMPATIBLE_PROTOCOL[i];
+    }
+  }
+  return true;
 }
 
 type View = "devices" | "history" | "settings";
 
 type NearbyNetwork = {
   networkName: string;
-  devices: { id: string; hostname?: string; status: "online" | "offline" }[];
+  devices: {
+    id: string;
+    hostname?: string;
+    status: "online" | "offline";
+    incompatible: boolean;
+  }[];
 };
 
 type ClipboardBlobPreview = {
@@ -432,6 +469,16 @@ export default function App() {
   // Those peers are unreachable under v0.3 and need to be re-paired.
   const [legacyPeers, setLegacyPeers] = useState<{ id: string; hostname: string }[]>([]);
 
+  // Incompatibility modal: fires when the backend's `peer-incompatible`
+  // event arrives (a clipboard send failed and the destination peer's
+  // mDNS-advertised proto version is missing or below the minimum).
+  // Deduped per peer ID for the session so retrying doesn't re-pop.
+  const [incompatibleModal, setIncompatibleModal] = useState<{
+    open: boolean;
+    hostname: string;
+  }>({ open: false, hostname: "" });
+  const incompatibleShownRef = useRef<Set<string>>(new Set());
+
   const [unsavedChanges, setUnsavedChanges] = useState(false);
   const [dialog, setDialog] = useState<{
     open: boolean;
@@ -784,6 +831,19 @@ export default function App() {
       invoke<string>("get_network_pin").then(pin => setNetworkPin(pin));
     });
 
+    // Incompatible-peer modal: backend emits this when a user-triggered
+    // send (clipboard) fails AND the destination peer's mDNS-advertised
+    // proto version is missing or older than this build's minimum.
+    const unlistenIncompatible = listen<{ id: string; hostname: string }>(
+      "peer-incompatible",
+      (event) => {
+        const { id, hostname } = event.payload;
+        if (incompatibleShownRef.current.has(id)) return;
+        incompatibleShownRef.current.add(id);
+        setIncompatibleModal({ open: true, hostname });
+      },
+    );
+
     // Listen for Monitor Updates (When Auto-Send is OFF)
     const unlistenMonitor = listen<any>("clipboard-monitor-update", (event) => {
       console.log("Monitor Update (Auto-Send OFF):", event.payload);
@@ -933,6 +993,7 @@ export default function App() {
       unlistenDelete.then((f) => f());
       unlistenPairingFailed.then((f) => f());
       unlistenPairingSuccess.then((f) => f());
+      unlistenIncompatible.then((f) => f());
       unlistenNotification.then((f) => f());
       unlistenSettingsChanged.then((f) => f());
     };
@@ -1050,7 +1111,8 @@ export default function App() {
         id: d.id,
         hostname: d.hostname,
         // Map backend 'last_seen' to status? current backend removes ancient peers so assume online if present
-        status: "online"
+        status: "online",
+        incompatible: !isPeerProtocolCompatible(d),
       }))
     });
   });
@@ -1168,6 +1230,34 @@ export default function App() {
             >
               Dismiss
             </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Incompatible-peer modal — fires when a clipboard send hits a
+          peer that's advertising a pre-mTLS protocol version (or none). */}
+      {incompatibleModal.open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-sm overflow-hidden rounded-2xl bg-white shadow-2xl ring-1 ring-zinc-900/10 dark:bg-zinc-900 dark:ring-white/10">
+            <div className="p-6">
+              <div className="flex items-center gap-3">
+                <AlertTriangle className="h-5 w-5 shrink-0 text-amber-500" />
+                <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
+                  Peer needs updating
+                </h3>
+              </div>
+              <p className="mt-3 text-sm text-zinc-600 dark:text-zinc-400">
+                <strong>{incompatibleModal.hostname}</strong> is running an older version of ClusterCut and cannot receive this data. Please upgrade it to the latest version.
+              </p>
+            </div>
+            <div className="flex justify-end gap-2 bg-zinc-50 px-6 py-4 dark:bg-zinc-800/50">
+              <Button
+                variant="primary"
+                onClick={() => setIncompatibleModal({ open: false, hostname: "" })}
+              >
+                OK
+              </Button>
+            </div>
           </div>
         </div>
       )}
@@ -1654,7 +1744,18 @@ function DevicesView({
                         <Wifi className="h-5 w-5 text-emerald-600 dark:text-emerald-300" />
                       </div>
                       <div className="min-w-0">
-                        <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">{p.hostname || p.id}</div>
+                        <div className="flex items-center gap-1.5 text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                          <span className="truncate">{p.hostname || p.id}</span>
+                          {!isPeerProtocolCompatible(p) && (
+                            <span
+                              className="inline-flex"
+                              title={`${p.hostname || p.id} is running an older version of ClusterCut and won't be able to send or receive clipboard data. Please upgrade it.`}
+                              aria-label="Incompatible version"
+                            >
+                              <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" />
+                            </span>
+                          )}
+                        </div>
                         <div className="text-xs text-zinc-600 dark:text-zinc-400">{p.ip}</div>
                       </div>
                     </div>
@@ -1726,6 +1827,15 @@ function DevicesView({
                                 <span className="truncate text-xs font-medium text-zinc-700 dark:text-zinc-300">
                                   {d.hostname || d.id}
                                 </span>
+                                {d.incompatible && (
+                                  <span
+                                    className="inline-flex"
+                                    title={`${d.hostname || d.id} is running an older version of ClusterCut and can't pair with this device. Please upgrade it.`}
+                                    aria-label="Incompatible version"
+                                  >
+                                    <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+                                  </span>
+                                )}
                               </div>
                             ))}
                           </div>
