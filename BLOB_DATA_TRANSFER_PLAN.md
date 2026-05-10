@@ -120,7 +120,8 @@ NSPasteboard supports lazy/promise-based pasteboard owners (`NSPasteboardWriting
 |---|---|---|
 | 3.1 | SVG (vector image) clipboard sync — verbatim pass-through | ✅ complete (test plan: T-3.1.x) |
 | 3.2 | Animated GIF preservation — verbatim pass-through | ✅ complete (test plan: T-3.2.x) |
-| 3.3 | Streaming/deferred-download for large blobs | ⬜ not started |
+| 3.3 v1 | Inline cap raised to 60 MB + large-blob notification | ✅ complete (test plan: T-3.3.1–T-3.3.5) |
+| 3.3 v2 | Descriptor + auto-fetch over `clustercut-file` ALPN, race protection, Tier 3 file-fallback | ⏸ deferred (test plan: T-3.3.6) |
 
 ### Release polish (after Parts 1 + 2 + 3 are in)
 
@@ -224,3 +225,73 @@ Expected:
 - Wire MIME is `image/png` (browsers rasterise static images at copy time, not GIF — confirmed earlier).
 - The existing raster-PNG path handles the receive; no regression from the GIF passthrough work.
 - `mime=image/png` in the receive log, with `width`/`height` populated as before.
+
+---
+
+### §3.3 — Large-blob inline transfer (v1 — cap raised to 60 MB)
+
+> **Scope note**: §3.3 ships in two phases. **v1 (this commit)** raises the inline cap from 10 MB to 60 MB and adds a "Large Image Received" notification. Big blobs ride the same `Message::Clipboard` path as small ones — no descriptor, no fetch indirection. Test cases below validate the v1 path.
+>
+> **v2 (deferred)** is the descriptor + auto-fetch design from earlier in this document — separate `clustercut-file` ALPN stream, "Downloading data…" → "Data available to paste" UX, race protection (newest copy wins), and Tier 3 file-fallback for >50 MB. Test cases below labeled **(v2 — deferred)** describe what *should* be tested once that lands; they're not actionable yet.
+
+#### T-3.3.1 — 11–60 MB image transfers cleanly
+
+1. Find or generate a high-resolution PNG that encodes to 15–25 MB (e.g. a screenshot of a 4K display, a photo edited at maximum quality). Verify the PNG file size on disk first.
+2. Open the image in any clipboard-aware app and Copy.
+3. Wait a few seconds for the transfer to complete; observe receiver logs and notifications.
+4. Paste into a destination app on the receiver.
+
+Expected:
+- Sender log: `send_message: connecting … for <N> byte payload` where N is roughly 1.04× the encoded size.
+- Receiver log: `Received clipboard image from <peer>: mime=image/png, decoded=<size> bytes, WxH`.
+- A "Large Image Received" notification fires on the receiver with the size in MB.
+- Paste produces the original image. No truncation, no corruption.
+
+#### T-3.3.2 — Above the 60 MB cap, sender silently drops
+
+1. Generate or find a PNG that encodes to >60 MB (rare in practice — typically requires uncompressed-style PNG of a very large image).
+2. Copy on the sender.
+
+Expected:
+- Sender log: `Clipboard image PNG (<N> bytes) exceeds <60 MB> byte wire cap; skipping.`
+- Receiver sees nothing. No bounce, no error to user.
+- **TODO when v2 lands**: this case should route to Tier 3 file-fallback instead of silently dropping.
+
+#### T-3.3.3 — Existing ≤10 MB path is unchanged
+
+1. Copy a small image (a few hundred KB).
+2. Observe normal behaviour.
+
+Expected:
+- Receiver log: `Received clipboard image from <peer>: …` as before.
+- Notification text is the *original* "Image Received" / "Image copied to clipboard" — **not** "Large Image Received". Confirms the >10 MB threshold gate works.
+- No latency change vs. the pre-§3.3 behaviour.
+
+#### T-3.3.4 — Network strain / throughput sanity
+
+1. Copy a 30 MB encoded image on the sender.
+2. While transfer is in flight, copy a small text snippet on a *different* peer (so two clipboard events compete on the cluster bus).
+3. Observe both arrive.
+
+Expected:
+- Both events propagate to all peers eventually. The big blob doesn't block the message bus indefinitely. (Each `Message::Clipboard` is its own QUIC stream, so this should hold even under inline transfer.)
+- If you observe one stalling behind the other for >5 s on a healthy LAN, file an issue — that's a transport problem worth digging into.
+
+#### T-3.3.5 — Encryption + transport sanity for large blobs
+
+1. Copy a 50 MB encoded image.
+2. On the receiver, watch for any `quinn::ReadToEndError::TooLong` or decrypt-failure log lines.
+
+Expected:
+- No errors. ChaCha20Poly1305 handles 50 MB without trouble; QUIC stream `read_to_end` cap is 64 MB so 50 MB raw + ~28 byte AEAD overhead + JSON wrapping (≈1.04× = ~52 MB) fits cleanly.
+
+#### T-3.3.6 (v2 — deferred) — Descriptor + auto-fetch path
+
+When the §3.3 v2 work lands, run:
+
+1. Configure `max_auto_download_size = 50 MB` (default).
+2. Copy a 25 MB image. Verify the receive UX is **"Downloading data… 12 MB / 25 MB"** progress notification, then **"Data available to paste"** — paste works after the second notification.
+3. Copy a 30 MB image while the previous download is still in flight on the receiver. Verify the older download is abandoned (newest-copy-wins race rule), the new descriptor is fetched, and the second image ends up on the clipboard.
+4. Configure `max_auto_download_size = 20 MB` and copy a 25 MB image. Verify the receiver routes through the file-transfer path (Tier 3) — the bytes land as a file in the configured download dir, **not** on the clipboard. Notification text reflects this.
+
+Expected: all three Tier 2 / Tier 3 / race scenarios behave as described in §3.3.

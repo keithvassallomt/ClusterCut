@@ -56,7 +56,9 @@ static WORKER_CMD_TX: OnceLock<mpsc::Sender<WorkerCommand>> = OnceLock::new();
 /// covers up to ~7K screenshots without risking absurd allocations.
 const MAX_CLIPBOARD_IMAGE_RGBA_BYTES: usize = 200 * 1024 * 1024;
 /// Wire-format size cap. PNG-encoded blobs over this are dropped on send.
-const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
+/// Sourced from the shared cap in `common.rs` so all backends drop at the
+/// same threshold.
+use super::common::MAX_CLIPBOARD_IMAGE_WIRE_BYTES;
 
 /// Try to pull an image from the clipboard via arboard, encode to PNG, and
 /// return it as a `ClipboardBlob`. Returns `None` for any failure mode —

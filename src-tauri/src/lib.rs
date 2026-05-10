@@ -3189,11 +3189,12 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
 
                             // BLOB HANDLING (image clipboard data)
                             if let Some(blob) = payload_obj.blob.clone() {
+                                let blob_size = blob.decoded_len();
                                 tracing::info!(
                                     "Received clipboard image from {}: mime={}, decoded={} bytes{}",
                                     sender,
                                     blob.mime_type,
-                                    blob.decoded_len(),
+                                    blob_size,
                                     match (blob.width, blob.height) {
                                         (Some(w), Some(h)) => format!(", {}x{}", w, h),
                                         _ => String::new(),
@@ -3214,7 +3215,25 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
 
                                 let notifications = listener_state.settings.lock().unwrap().notifications.clone();
                                 if notifications.data_received {
-                                    send_notification(&listener_handle, "Image Received", "Image copied to clipboard", false, Some(2), "history", NotificationPayload::None);
+                                    // Large blobs (§3.3 v1) get a more specific
+                                    // notification with the size, so users know
+                                    // the (potentially many MB) image is now
+                                    // available to paste even if there was a
+                                    // perceptible transfer delay.
+                                    if blob_size > clipboard::common::LARGE_CLIPBOARD_BLOB_NOTIFY_THRESHOLD {
+                                        let mb = blob_size as f64 / (1024.0 * 1024.0);
+                                        send_notification(
+                                            &listener_handle,
+                                            "Large Image Received",
+                                            &format!("{:.1} MB image from {} is now on the clipboard.", mb, sender),
+                                            false,
+                                            Some(3),
+                                            "history",
+                                            NotificationPayload::None,
+                                        );
+                                    } else {
+                                        send_notification(&listener_handle, "Image Received", "Image copied to clipboard", false, Some(2), "history", NotificationPayload::None);
+                                    }
                                 }
                             }
 

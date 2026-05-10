@@ -8,9 +8,25 @@ use tauri::{AppHandle, Emitter};
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
 
-/// Wire-format size cap for clipboard image blobs. Sender drops anything over.
-#[cfg(target_os = "linux")]
-pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
+/// Wire-format size cap for clipboard image blobs (encoded). Sender drops
+/// anything over.
+///
+/// Raised from the original 10 MB to 60 MB as a v1 take on §3.3 large-blob
+/// support: the per-message transport cap is 64 MB (`MESSAGE_BYTE_CAP` in
+/// `transport.rs`), and empirical wire-vs-raw inflation is ≈1.04× (base64
+/// + JSON + ChaCha20Poly1305 + serde_json wrapping), so 60 MB raw lands at
+/// ~62 MB on the wire — comfortably under the cap.
+///
+/// **Future work** (descriptor + auto-fetch over `clustercut-file` ALPN with
+/// race protection and Tier 3 file-fallback) is documented in
+/// `BLOB_DATA_TRANSFER_PLAN.md` §3.3 — not yet implemented. This v1 trades
+/// off the descriptor's nicer UX for a much smaller diff.
+pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 60 * 1024 * 1024;
+
+/// Threshold above which a "Receiving large clipboard…" notification fires on
+/// the receiver side. A multi-MB inline transfer takes a perceptible amount
+/// of time on the network and the user might paste mid-transfer otherwise.
+pub const LARGE_CLIPBOARD_BLOB_NOTIFY_THRESHOLD: usize = 10 * 1024 * 1024;
 
 /// MIME types whose bytes pass through verbatim instead of being decoded
 /// and re-encoded to PNG. Two reasons to preserve a source MIME:
