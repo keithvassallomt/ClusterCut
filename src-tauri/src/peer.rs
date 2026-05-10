@@ -25,8 +25,11 @@ pub struct Peer {
     /// Protocol-compatibility version advertised by the peer in mDNS
     /// (TXT property `proto`). Used to flag peers running pre-mTLS
     /// builds that can't talk to this device. None when the property
-    /// is absent (older builds didn't set it). Not persisted to
-    /// `known_peers.json` — refreshed from mDNS each time.
-    #[serde(default, skip_serializing)]
+    /// is absent (older builds didn't set it). May get persisted to
+    /// `known_peers.json` as a side effect of save calls — that's
+    /// harmless since the field is refreshed from mDNS at every
+    /// resolution. Must serialize so the Tauri→JS bridge carries it
+    /// to the frontend's compatibility-check.
+    #[serde(default)]
     pub protocol_version: Option<String>,
 }
