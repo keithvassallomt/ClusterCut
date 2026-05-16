@@ -84,6 +84,9 @@ release output_dir="~/Downloads":
     OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
     mkdir -p "${OUTPUT_DIR}"
 
+    # Cross-platform in-place sed (BSD sed on macOS requires an extension arg after -i)
+    sedi() { if [[ "$(uname -s)" == "Darwin" ]]; then sed -i '' "$@"; else sed -i "$@"; fi; }
+
     # 1. Sync version
     echo "==> Syncing version..."
     npm run sync-version
@@ -103,7 +106,7 @@ release output_dir="~/Downloads":
     echo "==> Updating CHANGELOG.md..."
     if grep -q '## \[Unreleased\]' CHANGELOG.md; then
         TODAY=$(date +%Y-%m-%d)
-        sed -i "s/## \[Unreleased\]/## [${VERSION}] - ${TODAY}/" CHANGELOG.md
+        sedi "s/## \[Unreleased\]/## [${VERSION}] - ${TODAY}/" CHANGELOG.md
     elif ! grep -q "## \[${VERSION}\]" CHANGELOG.md; then
         echo "ERROR: CHANGELOG.md has no [Unreleased] or [${VERSION}] section. Add release notes before releasing."
         exit 1
@@ -111,8 +114,8 @@ release output_dir="~/Downloads":
 
     # 4. Update yml tag, commit all changes, tag
     echo "==> Committing release..."
-    sed -i "s/tag: v.*/tag: ${TAG}/" src-tauri/flatpak/app.clustercut.clustercut.yml
-    sed -i "/^        commit:/d" src-tauri/flatpak/app.clustercut.clustercut.yml
+    sedi "s/tag: v.*/tag: ${TAG}/" src-tauri/flatpak/app.clustercut.clustercut.yml
+    sedi "/^        commit:/d" src-tauri/flatpak/app.clustercut.clustercut.yml
     git add -A
     if [ "${AMEND}" = true ]; then
         git commit --amend -m "v${VERSION}"
