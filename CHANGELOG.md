@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — wire-protocol 0.3.1
+## [0.3.1] — 2026-05-16
 
 ### Security
 - Pairing-channel hardening (round-4 review with @mdunphy, see `WIRE-PROTOCOL-0.3.1.md`). Each pairing frame after SPAKE2 is now a single AEAD ciphertext under a role-distinct sub-key derived via HKDF from the SPAKE2 session key and the role-labelled transcript hash — no plaintext identity fields on the pairing channel, no separate confirm tag, AEAD decryption is the only thing that authenticates the inner payload. A wire-byte rewrite by an active MITM diverges each side's reconstructed transcript, diverges the sub-keys, and the next AEAD verify fails closed before any cert fingerprint is pinned.
