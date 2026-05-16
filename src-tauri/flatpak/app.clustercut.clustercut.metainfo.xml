@@ -64,7 +64,17 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
-    <release version="0.3.1" date="2026-05-16" />
+    <release version="0.3.1" date="2026-05-16">
+      <description>
+        <p>Stronger pairing security and clearer handling of failed pairing attempts.</p>
+        <ul>
+          <li>Pairing security has been strengthened — someone else on your network can no longer interfere with the pairing handshake, even if they observe the messages going back and forth</li>
+          <li>After several failed pairing attempts in a row, your device pauses incoming pairing and shows a notification so you can re-enable it when you're ready</li>
+          <li>New "Verbose pairing logs" option under Settings → Diagnostics, useful if you ever need to troubleshoot why a pairing isn't completing</li>
+          <li>All your devices need to be on 0.3.1 or later — devices running 0.3.0 cannot talk to this release</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-05-10">
       <description>
         <p>Image and rich-text clipboard sync, plus stronger security.</p>

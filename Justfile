@@ -278,9 +278,18 @@ friendlyhub-update submission_dir="/home/keith/LocalCode/keithvassallomt/app.clu
         exit 1
     fi
     echo "Tag ${TAG} found."
-    # Verify the release has a description in metainfo
+    # Verify the release has a description in metainfo. The previous
+    # grep -A2 check was scoped to "any <description> within 2 lines", which
+    # silently inherited the next-older release's notes when the current
+    # entry was a self-closing <release ... /> — so missing notes slipped
+    # through unnoticed. xmllint scopes the check to the actual release node.
     METAINFO="src-tauri/flatpak/app.clustercut.clustercut.metainfo.xml"
-    if ! grep -A2 "version=\"${VERSION}\"" "${METAINFO}" | grep -q "<description>"; then
+    if ! command -v xmllint >/dev/null 2>&1; then
+        echo "ERROR: xmllint (libxml2) is required to verify release notes. Install libxml2 and re-run."
+        exit 1
+    fi
+    DESC_COUNT=$(xmllint --xpath "count(//release[@version=\"${VERSION}\"]/description)" "${METAINFO}" 2>/dev/null || echo 0)
+    if [ "${DESC_COUNT}" != "1" ]; then
         echo "ERROR: Release ${VERSION} in ${METAINFO} has no <description>. Add release notes before updating."
         exit 1
     fi
