@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — wire-protocol 0.3.1
+
+### Security
+- Pairing-channel hardening (round-4 review with @mdunphy, see `WIRE-PROTOCOL-0.3.1.md`). Each pairing frame after SPAKE2 is now a single AEAD ciphertext under a role-distinct sub-key derived via HKDF from the SPAKE2 session key and the role-labelled transcript hash — no plaintext identity fields on the pairing channel, no separate confirm tag, AEAD decryption is the only thing that authenticates the inner payload. A wire-byte rewrite by an active MITM diverges each side's reconstructed transcript, diverges the sub-keys, and the next AEAD verify fails closed before any cert fingerprint is pinned.
+- `Welcome` is gone from the pairing channel. Cluster bootstrap state (`cluster_id`, `known_peers`, `network_name`) now travels post-pairing over the already-authenticated QUIC/mTLS channel as `Message::ClusterInfoRequest` → `Message::ClusterInfo`. The pairing channel does one job now — pin cert fingerprints — and one job only.
+- Global brute-force lockout on the pairing listener. After `PAIRING_FAILURE_LOCKOUT_THRESHOLD` (10) AEAD-decrypt failures aggregated across all source IPs, the responder shuts down inbound pairing entirely until the user re-arms via the new "Re-enable pairing" banner. The lockout also fires an urgent OS-level notification so the user notices immediately rather than only on next Settings open.
+- `device_id` is now capped at 256 bytes with deterministic UTF-8-safe truncation on both ends, sizing the maximum pairing frame to a small fixed constant (`PAIRING_FRAME_CAP = 8 KB`, down from 256 KB).
+- Single-flight pairing (cap = 1 concurrent inbound exchange) with a 10-second server-side idle timeout — an accepted-but-idle socket can no longer block other pairing attempts indefinitely.
+- Pairing-log secrecy. The responder logs only a generic "Pairing failed from …" line on AEAD failure by default, so a passive log observer can't tell a wrong-PIN attempt apart from any other framing error. A new opt-in "Verbose pairing logs" toggle in Settings → Diagnostics surfaces the underlying diagnostic when needed.
+- **Wire-format break.** The pairing channel is incompatible with 0.3.0 peers (no plaintext `device_id` at T0/T1, AEAD-wrapped `ResponderId`/`InitiatorId` at T2/T3, no `Welcome`). The mDNS `proto` floor moves to `0.3.1`; 0.3.0 peers get the same "please upgrade" UI we built for the 0.2.x → 0.3.0 break.
 
 ### Changed
 - Rejected inbound QUIC handshakes now log the remote address alongside the failure reason. Previously the error line was anonymous, so a "fingerprint not in known peers" rejection gave no clue which host on the LAN was attempting to connect.

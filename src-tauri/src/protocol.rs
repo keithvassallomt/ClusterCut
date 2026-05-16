@@ -239,33 +239,57 @@ pub struct FileStreamHeader {
     pub delivery_target: DeliveryTarget,
 }
 
+/// Wire-protocol 0.3.1: the inner struct of an AEAD-wrapped pairing frame
+/// (T2 ResponderId, T3 InitiatorId). Carries the identity bytes that a peer
+/// commits to during pairing. Decryption of the surrounding ciphertext under
+/// the role-distinct sub-key is the *only* thing that authenticates these
+/// fields — there is no separate confirm tag, and the bytes are not trusted
+/// until the AEAD tag verifies.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PairIdInner {
+    /// Caller-supplied stable device identifier. Capped at
+    /// `MAX_DEVICE_ID_BYTES` on serialise (deterministic UTF-8-safe truncation)
+    /// so both ends derive the same identifier from the same source string
+    /// without burdening framing with variable-length growth.
+    pub device_id: String,
+    /// SHA-256 of the peer's TLS cert DER. The receiver pins this as the
+    /// expected fingerprint for the peer's `device_id` for all future QUIC
+    /// mTLS handshakes.
+    pub fingerprint: Vec<u8>,
+}
+
+/// Hard cap on `device_id` length, enforced via deterministic UTF-8-safe
+/// truncation at both ends of the pairing channel. Picked to be comfortably
+/// larger than any device_id we generate today (UUIDs are 36 bytes) while
+/// keeping the maximum pairing-frame size a small, fixed constant.
+pub const MAX_DEVICE_ID_BYTES: usize = 256;
+
+/// Deterministically truncate a `device_id` to at most `MAX_DEVICE_ID_BYTES`
+/// bytes without splitting a UTF-8 codepoint. Both initiator and responder
+/// run identifiers through this before serialising, so a long source string
+/// produces the same truncated form on both sides.
+pub fn truncate_device_id(s: &str) -> String {
+    if s.len() <= MAX_DEVICE_ID_BYTES {
+        return s.to_string();
+    }
+    let mut end = MAX_DEVICE_ID_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Cluster bootstrap payload delivered post-pairing over QUIC/mTLS (T7).
+/// In 0.3.0 this lived inside the pairing-channel `Welcome` frame; 0.3.1
+/// moves it onto the already-authenticated QUIC channel so the pairing
+/// channel does one job and one job only — pin cert fingerprints.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct WelcomePayload {
-    /// Stable cluster identifier (UUID). Replaces the v0.2 `cluster_key`
-    /// shared secret — the secret role is now provided by mTLS, and we
-    /// only need a non-secret handle for grouping in the UI and for
-    /// gossip-loop suppression.
+pub struct ClusterInfo {
+    /// Stable cluster identifier (UUID). Non-secret handle for grouping in
+    /// the UI and gossip-loop suppression.
     pub cluster_id: String,
     pub known_peers: Vec<crate::peer::Peer>,
     pub network_name: String,
-    /// SHA-256 of the responder's TLS cert DER. The initiator pins this
-    /// for all future QUIC connections to the responder.
-    pub responder_fingerprint: Vec<u8>,
-    /// SAS-confirm tag binding this payload to the SPAKE2 session key.
-    /// Computed via `crypto::encrypt(session_key, PAIR_CONFIRM_PLAINTEXT)`.
-    /// Receiver decrypts; success implies both sides derived the same key
-    /// from the same PIN, so the payload can be trusted. See
-    /// [`crypto::PAIR_CONFIRM_PLAINTEXT`].
-    pub confirm: Vec<u8>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PairFingerprintPayload {
-    pub device_id: String,
-    pub fingerprint: Vec<u8>,
-    /// SAS-confirm tag — same construction as `WelcomePayload.confirm`,
-    /// in the opposite direction.
-    pub confirm: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -287,6 +311,14 @@ pub enum Message {
     // Liveness Check
     Ping,
     Pong,
+    /// 0.3.1: initiator → responder over QUIC/mTLS immediately after pairing
+    /// completes, asking for the cluster bootstrap state that 0.3.0 used to
+    /// ship inside the pairing-channel `Welcome`.
+    ClusterInfoRequest,
+    /// 0.3.1: responder → initiator over QUIC/mTLS in reply to
+    /// `ClusterInfoRequest`. mTLS authenticates both ends, so no extra
+    /// per-payload tag is needed.
+    ClusterInfo(ClusterInfo),
 }
 
 /// Messages exchanged on the dedicated plaintext-TCP pairing channel.
@@ -295,25 +327,32 @@ pub enum Message {
 /// adds complexity without security. Once pairing completes, all further
 /// traffic moves to mutually-authenticated QUIC (steady-state `Message`).
 ///
-/// Welcome and PairFingerprint travel plaintext; their `confirm` fields
-/// carry a SAS tag that lets each side prove it derived the same SPAKE2
-/// session key (i.e. matching PIN) before trusting the payload. A wrong-
-/// PIN MITM gets a different key and the SAS check fails closed.
+/// Wire-protocol 0.3.1 (see `WIRE-PROTOCOL-0.3.1.md`):
+///
+/// ```text
+/// T0  Initiator → Responder   PairRequest  { spake_msg }
+/// T1  Responder → Initiator   PairResponse { spake_msg }
+/// T2  Responder → Initiator   ResponderId  { nonce, ciphertext = AEAD(k_r2i, nonce, inner) }
+/// T3  Initiator → Responder   InitiatorId  { nonce, ciphertext = AEAD(k_i2r, nonce, inner) }
+/// ```
+///
+/// No plaintext identity fields on the pairing channel: `device_id` and
+/// fingerprint appear only inside the AEAD-protected `inner` (see
+/// [`PairIdInner`]). A wrong-PIN MITM derives a different `k_{i2r,r2i}`
+/// and AEAD decryption fails closed before either side trusts a byte of
+/// the payload. The cluster bootstrap state (`cluster_id`, `known_peers`,
+/// `network_name`) is deferred to a post-pairing exchange over QUIC/mTLS
+/// — see [`Message::ClusterInfoRequest`] / [`Message::ClusterInfo`].
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum PairingMessage {
-    PairRequest {
-        msg: Vec<u8>,
-        device_id: String,
-    },
-    PairResponse {
-        msg: Vec<u8>,
-        device_id: String,
-    },
-    /// Responder → Initiator after the SPAKE2 handshake completes.
-    Welcome(WelcomePayload),
-    /// Initiator → Responder after Welcome, completing the bidirectional
-    /// fingerprint exchange.
-    PairFingerprint(PairFingerprintPayload),
+    /// T0 — opening SPAKE2 element from the initiator. No identity bytes.
+    PairRequest { spake_msg: Vec<u8> },
+    /// T1 — answering SPAKE2 element from the responder. No identity bytes.
+    PairResponse { spake_msg: Vec<u8> },
+    /// T2 — responder's AEAD-wrapped identity, decryptable under `k_r2i`.
+    ResponderId { nonce: Vec<u8>, ciphertext: Vec<u8> },
+    /// T3 — initiator's AEAD-wrapped identity, decryptable under `k_i2r`.
+    InitiatorId { nonce: Vec<u8>, ciphertext: Vec<u8> },
 }
 
 #[cfg(test)]
@@ -512,6 +551,90 @@ mod tests {
         assert!(parsed.fetch_id.is_none());
         assert!(parsed.total_size.is_none());
         assert_eq!(parsed.raw_bytes().unwrap(), vec![1, 2, 3]);
+    }
+
+    // ─── §0.3.1 — device_id truncation and pairing inner round-trip ───
+
+    #[test]
+    fn truncate_device_id_keeps_short_ids_unchanged() {
+        let id = "550e8400-e29b-41d4-a716-446655440000"; // 36-byte UUID
+        assert_eq!(truncate_device_id(id), id);
+    }
+
+    #[test]
+    fn truncate_device_id_caps_at_max_bytes() {
+        let long = "a".repeat(MAX_DEVICE_ID_BYTES * 4);
+        let out = truncate_device_id(&long);
+        assert!(out.len() <= MAX_DEVICE_ID_BYTES);
+        assert_eq!(out.len(), MAX_DEVICE_ID_BYTES);
+    }
+
+    #[test]
+    fn truncate_device_id_respects_utf8_boundaries() {
+        // 4-byte UTF-8 codepoints; ensure we never split mid-codepoint.
+        let unit = "𠮷"; // 4 bytes in UTF-8
+        let s = unit.repeat(MAX_DEVICE_ID_BYTES); // way past the cap
+        let out = truncate_device_id(&s);
+        assert!(out.len() <= MAX_DEVICE_ID_BYTES);
+        // Must still be valid UTF-8 — round-tripping through a String is the
+        // de-facto check (String would panic on invalid UTF-8 construction).
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn pairing_message_variants_have_no_cluster_state() {
+        // Wire-protocol 0.3.1 invariant: cluster bootstrap state
+        // (`cluster_id`, `known_peers`, `network_name`) MUST NOT travel on
+        // the pairing channel — it now rides post-pairing QUIC/mTLS as
+        // `Message::ClusterInfo`. Asserting via serialised representations
+        // here so an accidental future re-introduction of a Welcome-style
+        // variant is caught by this test.
+        let t0 = PairingMessage::PairRequest { spake_msg: vec![1, 2, 3] };
+        let t1 = PairingMessage::PairResponse { spake_msg: vec![4, 5, 6] };
+        let t2 = PairingMessage::ResponderId { nonce: vec![0; 12], ciphertext: vec![7, 8, 9] };
+        let t3 = PairingMessage::InitiatorId { nonce: vec![0; 12], ciphertext: vec![10, 11, 12] };
+        for msg in [t0, t1, t2, t3] {
+            let s = serde_json::to_string(&msg).unwrap();
+            for forbidden in ["cluster_id", "known_peers", "network_name", "Welcome", "PairFingerprint"] {
+                assert!(
+                    !s.contains(forbidden),
+                    "PairingMessage serialisation must not contain {:?}; got {}",
+                    forbidden, s
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cluster_info_lives_on_the_message_enum_only() {
+        // Companion check to the above: ClusterInfo MUST be a `Message`
+        // variant (so it rides QUIC/mTLS) and not reachable via
+        // `PairingMessage`. Rejecting a hand-crafted "Welcome"-tagged
+        // PairingMessage proves the variant is gone.
+        let info = ClusterInfo {
+            cluster_id: "c".to_string(),
+            known_peers: vec![],
+            network_name: "n".to_string(),
+        };
+        let wrapped = Message::ClusterInfo(info);
+        let s = serde_json::to_string(&wrapped).unwrap();
+        let _: Message = serde_json::from_str(&s).expect("ClusterInfo round-trips via Message");
+
+        // A legacy 0.3.0 "Welcome" tag in PairingMessage must no longer parse.
+        let legacy = r#"{"Welcome":{"cluster_id":"x","known_peers":[],"network_name":"y","responder_fingerprint":[],"confirm":[]}}"#;
+        let parsed: Result<PairingMessage, _> = serde_json::from_str(legacy);
+        assert!(parsed.is_err(), "Welcome variant must no longer deserialise on the pairing channel");
+    }
+
+    #[test]
+    fn pair_id_inner_round_trips_through_json() {
+        let inner = PairIdInner {
+            device_id: "device-a".to_string(),
+            fingerprint: vec![0xAA, 0xBB, 0xCC, 0xDD],
+        };
+        let bytes = serde_json::to_vec(&inner).unwrap();
+        let parsed: PairIdInner = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed, inner);
     }
 
     #[test]

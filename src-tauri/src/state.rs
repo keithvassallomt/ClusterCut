@@ -95,7 +95,40 @@ pub struct AppState {
     pub pending_join_notifications: Arc<Mutex<HashSet<String>>>,
     // Heartbeat fallback counter (consecutive rounds where all sends failed)
     pub consecutive_heartbeat_failures: Arc<AtomicU32>,
+
+    // ─── Wire-protocol 0.3.1 pairing hardening (H1, H6) ─────────────────────
+    /// Count of AEAD-decrypt failures on the pairing channel since the last
+    /// `pairing_locked_out` re-arm. Per WIRE-PROTOCOL-0.3.1 §H1, after
+    /// `PAIRING_FAILURE_LOCKOUT_THRESHOLD` failures (aggregated across all
+    /// source IPs — there is no per-IP state) the responder flips
+    /// `pairing_locked_out = true` and refuses further pairing connections
+    /// until the user manually re-arms via the UI.
+    pub pairing_failure_count: Arc<AtomicU32>,
+    /// Sticky lockout flag. When true, the pairing TCP listener accepts and
+    /// immediately closes any inbound connection. Cleared via the
+    /// `rearm_pairing` Tauri command.
+    pub pairing_locked_out: Arc<AtomicBool>,
+    /// Single-flight pairing capacity (cap = 1). Per WIRE-PROTOCOL-0.3.1 §H6,
+    /// the responder accepts exactly one in-flight pairing exchange at a time;
+    /// a second concurrent connection is refused at the handler edge. A
+    /// `Semaphore` (rather than an `AtomicUsize`) gives clean RAII permit
+    /// handling and `try_acquire_owned` returns immediately when full.
+    pub pairing_slot: Arc<tokio::sync::Semaphore>,
+    /// One-shot inbox for the next `Message::ClusterInfo` reply expected by
+    /// an in-progress `start_pairing` call. Populated by the initiator before
+    /// it sends `Message::ClusterInfoRequest`, consumed by the QUIC message
+    /// handler when the reply arrives. A `Mutex<Option<...>>` is enough since
+    /// only one pairing flow runs at a time (matches the cap=1 invariant on
+    /// the responder side, plus our typical "one user, one device joining at
+    /// a time" workflow on the initiator side).
+    pub pending_cluster_info: Arc<Mutex<Option<tokio::sync::oneshot::Sender<crate::protocol::ClusterInfo>>>>,
 }
+
+/// Lockout threshold per WIRE-PROTOCOL-0.3.1 §H1 (picked from Michael's 10–20
+/// range). Once `pairing_failure_count` reaches this value, the responder
+/// flips `pairing_locked_out` and refuses further connections until manually
+/// re-armed via the UI.
+pub const PAIRING_FAILURE_LOCKOUT_THRESHOLD: u32 = 10;
 
 impl AppState {
     pub fn new() -> Self {
@@ -126,7 +159,43 @@ impl AppState {
             last_known_local_ip: Arc::new(Mutex::new(None)),
             pending_join_notifications: Arc::new(Mutex::new(HashSet::new())),
             consecutive_heartbeat_failures: Arc::new(AtomicU32::new(0)),
+            pairing_failure_count: Arc::new(AtomicU32::new(0)),
+            pairing_locked_out: Arc::new(AtomicBool::new(false)),
+            pairing_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            pending_cluster_info: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Bump the pairing-channel AEAD-failure counter. Returns true iff this
+    /// failure tripped the lockout threshold (i.e. the caller should fire
+    /// the lockout UI surface). Once tripped, further AEAD failures keep
+    /// counting but don't re-fire the trip signal.
+    pub fn record_pairing_failure(&self) -> bool {
+        let prior = self
+            .pairing_failure_count
+            .fetch_add(1, Ordering::SeqCst);
+        let new = prior.saturating_add(1);
+        if new >= PAIRING_FAILURE_LOCKOUT_THRESHOLD {
+            // Use compare_exchange so only the first failure to cross the
+            // threshold returns `true` — subsequent failures don't double-fire.
+            self
+                .pairing_locked_out
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Clear the lockout and reset the failure counter — called by the
+    /// `rearm_pairing` Tauri command after the user explicitly re-arms.
+    pub fn rearm_pairing(&self) {
+        self.pairing_failure_count.store(0, Ordering::SeqCst);
+        self.pairing_locked_out.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_pairing_locked_out(&self) -> bool {
+        self.pairing_locked_out.load(Ordering::SeqCst)
     }
 
     pub fn request_shutdown(&self) {

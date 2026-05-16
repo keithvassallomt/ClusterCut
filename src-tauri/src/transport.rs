@@ -578,14 +578,40 @@ fn hex_short(bytes: &[u8]) -> String {
 // traffic moves to the QUIC endpoint with cert pinning enforced.
 //
 // Wire framing: 4-byte big-endian length prefix followed by JSON-serialised
-// `PairingMessage`. The cap is generous enough for a Welcome carrying a
-// hundred peers but bounded so a misbehaving peer can't OOM us.
+// `PairingMessage`. Per WIRE-PROTOCOL-0.3.1 §H4, the cap is sized for the
+// largest legitimate frame and nothing larger — no forward-compatibility
+// headroom, since the pairing protocol is intentionally not backwards-
+// compatible.
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Maximum size of one pairing frame on the wire. Welcome is the largest
-/// payload (cluster identity + known_peers + fingerprint), and even a
-/// pathological cluster sits well under this bound.
-pub const PAIRING_FRAME_CAP: usize = 256 * 1024;
+/// Maximum size of one pairing frame on the wire (0.3.1).
+///
+/// Size budget for the largest frame (T2/T3, AEAD-wrapped identity):
+/// - PairingMessage enum tag + JSON wrapper: ~30 B
+/// - nonce (12 B)  → JSON int-array: ~48 B
+/// - ciphertext = AEAD(plaintext) + 16 B tag
+///     - plaintext = JSON of `PairIdInner{device_id (≤256 B), fingerprint (32 B)}`
+///         worst-case device_id with full JSON escaping (`\u00xx`): ~6×256 = ~1536 B
+///         fingerprint 32 B → JSON int-array: ~128 B
+///         JSON wrapper / field names: ~60 B
+///         plaintext total: ~1.8 KB
+///     - ciphertext = plaintext + 16 B tag → ~1.8 KB
+///     - ciphertext → JSON int-array on the wire: ~4× → ~7.5 KB
+/// - 4-byte length prefix lives outside the cap (consumed before the cap
+///   check), so the cap bounds the JSON body only.
+///
+/// 8 KB rounds up cleanly above that ceiling. T0/T1 frames are far smaller
+/// (a single Ed25519 SPAKE2 element ~32 B, encoded ~128 B JSON), and easily
+/// fit under the same cap.
+pub const PAIRING_FRAME_CAP: usize = 8 * 1024;
+
+/// Idle/protocol timeout applied around the responder's `handle_pairing_connection`.
+/// Per WIRE-PROTOCOL-0.3.1 §H6, the responder must not let an accepted-but-idle
+/// pairing connection block the cap=1 single-flight slot indefinitely. The
+/// expected end-to-end pairing exchange completes in well under a second on a
+/// LAN; the wall-clock budget here covers TCP slowness + JSON encode/decode
+/// + a stray re-transmit, not human input.
+pub const PAIRING_PROTOCOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn read_pairing_frame(
     stream: &mut TcpStream,

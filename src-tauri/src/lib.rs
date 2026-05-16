@@ -1082,7 +1082,12 @@ fn parse_protocol_version(s: &str) -> Option<(u32, u32, u32)> {
 /// false for peers that don't advertise the property at all (older builds).
 pub fn is_protocol_compatible(version: Option<&str>) -> bool {
     let Some(v) = version else { return false };
-    parse_protocol_version(v).map_or(false, |parsed| parsed >= (0, 3, 0))
+    // 0.3.1 break: the pairing-channel wire format is wholly incompatible
+    // with 0.3.0 (no plaintext device_id at T0/T1, AEAD-wrapped identity
+    // at T2/T3, no Welcome — see WIRE-PROTOCOL-0.3.1.md). Bumping the
+    // floor surfaces 0.3.0 peers as incompatible in the same UI flow we
+    // built for the 0.2.x → 0.3.0 break.
+    parse_protocol_version(v).map_or(false, |parsed| parsed >= (0, 3, 1))
 }
 
 /// Log a send failure and, if the destination peer is on an incompatible
@@ -1709,6 +1714,24 @@ async fn delete_peer(
     Ok(())
 }
 
+/// True if the pairing listener has tripped its global AEAD-failure
+/// lockout and is refusing inbound pairing connections until manually
+/// re-armed. See WIRE-PROTOCOL-0.3.1 §H1.
+#[tauri::command]
+fn is_pairing_locked_out(state: tauri::State<'_, AppState>) -> bool {
+    state.is_pairing_locked_out()
+}
+
+/// Clear the pairing lockout and reset the failure counter. Invoked by the
+/// frontend when the user explicitly re-arms via the lockout banner / modal.
+#[tauri::command]
+fn rearm_pairing(state: tauri::State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<(), String> {
+    state.rearm_pairing();
+    let _ = app_handle.emit("pairing-rearmed", ());
+    tracing::info!("Pairing listener re-armed by user.");
+    Ok(())
+}
+
 #[tauri::command]
 async fn start_pairing(
     peer_id: String,
@@ -1718,6 +1741,8 @@ async fn start_pairing(
     transport: tauri::State<'_, Transport>,
 ) -> Result<(), String> {
     use crate::protocol::PairingMessage;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
 
     let peer_addr = {
         let peers = state.get_peers();
@@ -1728,22 +1753,28 @@ async fn start_pairing(
         }
     };
 
-    let local_id = { state.local_device_id.lock().unwrap().clone() };
-    let (spake_state, my_msg) =
+    let local_id_raw = { state.local_device_id.lock().unwrap().clone() };
+    let local_id = crate::protocol::truncate_device_id(&local_id_raw);
+    let (spake_state, spake_msg_i) =
         crypto::start_spake2(&pin, &local_id, &peer_id).map_err(|e| e.to_string())?;
 
+    // Per WIRE-PROTOCOL-0.3.1 §H6: the TCP socket is not opened until the
+    // user has entered the PIN and pressed OK (i.e. until this function is
+    // invoked) — so the responder's single-flight slot is only ever held
+    // during the SPAKE2 + AEAD round trips, not during human input.
     let mut stream = crate::transport::pairing_connect(peer_addr)
         .await
         .map_err(|e| format!("Failed to connect to peer: {}", e))?;
 
-    let req = PairingMessage::PairRequest { msg: my_msg, device_id: local_id.clone() };
+    // T0 — opening SPAKE2 element. No identity bytes on the wire.
+    let req = PairingMessage::PairRequest { spake_msg: spake_msg_i.clone() };
     crate::transport::write_pairing_frame(&mut stream, &req)
         .await
         .map_err(|e| format!("Failed to send PairRequest: {}", e))?;
 
-    // Read PairResponse
-    let (peer_msg, _peer_device_id) = match crate::transport::read_pairing_frame(&mut stream).await {
-        Ok(PairingMessage::PairResponse { msg, device_id }) => (msg, device_id),
+    // T1 — answering SPAKE2 element from the responder.
+    let spake_msg_r = match crate::transport::read_pairing_frame(&mut stream).await {
+        Ok(PairingMessage::PairResponse { spake_msg }) => spake_msg,
         Ok(other) => {
             return Err(format!("Pairing protocol error: expected PairResponse, got {:?}", other));
         }
@@ -1753,11 +1784,11 @@ async fn start_pairing(
         }
     };
 
-    // Finish SPAKE2
-    let session_key = match crypto::finish_spake2(spake_state, &peer_msg) {
+    // Finish SPAKE2 → shared 32-byte session key.
+    let session_key = match crypto::finish_spake2(spake_state, &spake_msg_r) {
         Ok(k) => k,
         Err(e) => {
-            tracing::error!("Auth Failed: {}", e);
+            tracing::error!("SPAKE2 finish failed (initiator): {}", e);
             let _ = app_handle.emit("pairing-failed", "Authentication failed. Check the PIN and try again.");
             return Err(e.to_string());
         }
@@ -1765,38 +1796,145 @@ async fn start_pairing(
     if session_key.len() != 32 {
         return Err("Invalid SPAKE2 session key length".to_string());
     }
-    let mut sk_arr = [0u8; 32];
-    sk_arr.copy_from_slice(&session_key);
-    tracing::info!("Auth Success (Initiator)! Waiting for Welcome...");
 
-    // Read Welcome
-    let welcome_payload = match crate::transport::read_pairing_frame(&mut stream).await {
-        Ok(PairingMessage::Welcome(p)) => p,
+    // Derive role-distinct AEAD sub-keys from the SPAKE2 key + the role-
+    // labelled transcript. Any wire-byte rewrite between T0 and T1 produces
+    // a different transcript here than the responder reconstructed, the
+    // sub-keys diverge, and the T2 decrypt below fails closed.
+    let transcript = crypto::pairing_transcript(&spake_msg_i, &spake_msg_r);
+    let (k_i2r, k_r2i) = crypto::derive_pair_subkeys(&session_key, &transcript)
+        .map_err(|e| format!("HKDF sub-key derivation failed: {}", e))?;
+    tracing::info!("SPAKE2 complete (initiator); awaiting ResponderId (T2).");
+
+    // T2 — responder's AEAD-wrapped identity (device_id + cert fingerprint).
+    let (nonce_r, ciphertext_r) = match crate::transport::read_pairing_frame(&mut stream).await {
+        Ok(PairingMessage::ResponderId { nonce, ciphertext }) => (nonce, ciphertext),
         Ok(other) => {
-            return Err(format!("Pairing protocol error: expected Welcome, got {:?}", other));
+            return Err(format!("Pairing protocol error: expected ResponderId, got {:?}", other));
         }
         Err(e) => {
             let _ = app_handle.emit("pairing-failed", "Pairing session expired. Please try again.");
-            return Err(format!("Failed to read Welcome: {}", e));
+            return Err(format!("Failed to read ResponderId: {}", e));
+        }
+    };
+    let nonce_r_arr: [u8; 12] = nonce_r.as_slice().try_into().map_err(|_| {
+        let _ = app_handle.emit("pairing-failed", "Pairing protocol error (bad nonce). Please try again.");
+        "ResponderId nonce must be 12 bytes".to_string()
+    })?;
+    let r_inner_bytes = match crypto::pair_aead_decrypt(&k_r2i, &nonce_r_arr, &ciphertext_r) {
+        Ok(b) => b,
+        Err(e) => {
+            // Wrong PIN or active MITM. Generic UI message; no detail leaked.
+            tracing::warn!("ResponderId AEAD decrypt failed (initiator): {}", e);
+            let _ = app_handle.emit("pairing-failed", "Failed to join network. The PIN may be incorrect.");
+            return Err("ResponderId AEAD decrypt failed".to_string());
+        }
+    };
+    let r_inner: crate::protocol::PairIdInner = serde_json::from_slice(&r_inner_bytes)
+        .map_err(|e| format!("Malformed ResponderId inner payload: {}", e))?;
+    let crate::protocol::PairIdInner { device_id: responder_device_id, fingerprint: responder_fingerprint } = r_inner;
+    tracing::info!(
+        "Authenticated responder identity (initiator). Pinning fingerprint for {}.",
+        responder_device_id
+    );
+
+    // T3 — initiator's AEAD-wrapped identity. Build, encrypt, send.
+    let local_fp = transport.local_fingerprint();
+    let i_inner = crate::protocol::PairIdInner {
+        device_id: local_id.clone(),
+        fingerprint: local_fp,
+    };
+    let i_inner_bytes = serde_json::to_vec(&i_inner)
+        .map_err(|e| format!("Failed to serialise InitiatorId inner: {}", e))?;
+    let nonce_i = crypto::fresh_pair_nonce();
+    let ciphertext_i = crypto::pair_aead_encrypt(&k_i2r, &nonce_i, &i_inner_bytes)
+        .map_err(|e| format!("InitiatorId AEAD encrypt failed: {}", e))?;
+    let t3 = PairingMessage::InitiatorId {
+        nonce: nonce_i.to_vec(),
+        ciphertext: ciphertext_i,
+    };
+    if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &t3).await {
+        let _ = app_handle.emit("pairing-failed", "Failed to complete pairing. Please try again.");
+        return Err(format!("Failed to send InitiatorId: {}", e));
+    }
+
+    // Pin the responder's fingerprint locally NOW (after sending T3, before
+    // the QUIC step that depends on it). Touching state in this order keeps
+    // the pinning visible to a concurrent inbound mTLS verifier on this side.
+    {
+        let mut kp_lock = state.known_peers.lock().unwrap();
+        let mut runtime_peers = state.peers.lock().unwrap();
+        let hostname = runtime_peers
+            .get(&peer_id)
+            .map(|p| p.hostname.clone())
+            .unwrap_or_else(|| format!("Peer ({})", peer_addr.ip()));
+        let pinned = crate::peer::Peer {
+            id: peer_id.clone(),
+            ip: peer_addr.ip(),
+            port: peer_addr.port(),
+            hostname,
+            last_seen: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            is_trusted: true,
+            is_manual: runtime_peers.get(&peer_id).map(|p| p.is_manual).unwrap_or(false),
+            // network_name filled in once ClusterInfo arrives.
+            network_name: None,
+            signature: None,
+            fingerprint: Some(responder_fingerprint.clone()),
+            protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
+        };
+        runtime_peers.insert(peer_id.clone(), pinned.clone());
+        kp_lock.insert(peer_id.clone(), pinned.clone());
+        save_known_peers(&app_handle, &kp_lock);
+        let _ = app_handle.emit("peer-update", &pinned);
+    }
+
+    // T4 — wait for the responder to finish processing T3 (pinning our
+    // fingerprint) and close its side of the TCP socket. Reading to EOF on
+    // a connection whose write half we've shut down gives the initiator a
+    // deterministic "responder is ready to accept our QUIC" signal, which
+    // is what unblocks the post-pairing mTLS handshake at T5.
+    let _ = stream.shutdown().await;
+    let mut sink = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut sink),
+    )
+    .await;
+
+    // T5–T7 — post-pairing cluster bootstrap over QUIC/mTLS. The pairing
+    // channel did one job (pin fingerprints); cluster_id / known_peers /
+    // network_name now ride the already-authenticated QUIC channel.
+    let (info_tx, info_rx) = tokio::sync::oneshot::channel::<crate::protocol::ClusterInfo>();
+    {
+        let mut slot = state.pending_cluster_info.lock().unwrap();
+        *slot = Some(info_tx);
+    }
+    let req_bytes = serde_json::to_vec(&Message::ClusterInfoRequest)
+        .map_err(|e| format!("Failed to serialise ClusterInfoRequest: {}", e))?;
+    if let Err(e) = transport.send_message(peer_addr, &req_bytes).await {
+        // Clear the slot so a stray ClusterInfo doesn't sit in it forever.
+        let _ = state.pending_cluster_info.lock().unwrap().take();
+        let _ = app_handle.emit("pairing-failed", "Failed to fetch cluster info after pairing. Please try again.");
+        return Err(format!("Failed to send ClusterInfoRequest: {}", e));
+    }
+    let cluster_info = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        info_rx,
+    )
+    .await
+    {
+        Ok(Ok(info)) => info,
+        _ => {
+            let _ = state.pending_cluster_info.lock().unwrap().take();
+            let _ = app_handle.emit("pairing-failed", "Timed out waiting for cluster info. Please try again.");
+            return Err("ClusterInfo response timed out".to_string());
         }
     };
 
-    // Validate the SAS-confirm tag before trusting any field of the
-    // Welcome — a wrong-PIN MITM would have a different SPAKE2 key and
-    // the decryption inside `verify_pair_confirm` will fail.
-    if let Err(e) = crypto::verify_pair_confirm(&sk_arr, &welcome_payload.confirm) {
-        let _ = app_handle.emit("pairing-failed", "Failed to join network. The PIN may be incorrect.");
-        return Err(format!("Welcome confirm verification failed: {}", e));
-    }
-
-    let crate::protocol::WelcomePayload {
-        cluster_id,
-        known_peers,
-        network_name,
-        responder_fingerprint,
-        confirm: _,
-    } = welcome_payload;
-
+    let crate::protocol::ClusterInfo { cluster_id, known_peers, network_name } = cluster_info;
     tracing::info!("Joined Network: {} (cluster {})", network_name, cluster_id);
     {
         let mut cid = state.cluster_id.lock().unwrap();
@@ -1821,41 +1959,15 @@ async fn start_pairing(
             runtime_peers.insert(peer.id.clone(), peer.clone());
             let _ = app_handle.emit("peer-update", &peer);
         }
-        save_known_peers(&app_handle, &kp_lock);
-
-        for (id, peer) in runtime_peers.iter_mut() {
-            if peer.ip == peer_addr.ip() {
-                peer.is_trusted = true;
-                peer.network_name = Some(network_name.clone());
-                // Pin the responder's TLS fingerprint — the SAS-confirm
-                // bound this payload to the PIN-authenticated session.
-                peer.fingerprint = Some(responder_fingerprint.clone());
-                let _ = app_handle.emit("peer-update", &*peer);
-                kp_lock.insert(id.clone(), peer.clone());
-                break;
-            }
+        // Tag the responder's record with the cluster's network_name now
+        // that we have it.
+        if let Some(peer) = runtime_peers.get_mut(&peer_id) {
+            peer.network_name = Some(network_name.clone());
+            kp_lock.insert(peer_id.clone(), peer.clone());
+            let _ = app_handle.emit("peer-update", &*peer);
         }
         save_known_peers(&app_handle, &kp_lock);
     }
-
-    // Send PairFingerprint with our local fingerprint, completing the
-    // bidirectional fingerprint exchange. The `confirm` field proves to
-    // the responder that we derived the same SPAKE2 key.
-    let local_fp = transport.local_fingerprint();
-    let confirm = crypto::make_pair_confirm(&sk_arr).map_err(|e| e.to_string())?;
-    let fp_payload = crate::protocol::PairFingerprintPayload {
-        device_id: local_id,
-        fingerprint: local_fp,
-        confirm,
-    };
-    let pf_msg = PairingMessage::PairFingerprint(fp_payload);
-    if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &pf_msg).await {
-        // Non-fatal: we've already joined the cluster. Responder will retry
-        // pinning on next contact.
-        tracing::warn!("Failed to send PairFingerprint: {}", e);
-    }
-
-    let _ = stream.shutdown().await;
 
     // Signal pairing completion to the UI. Distinct from `peer-update`
     // (which also fires on mDNS rediscovery and would race the PIN dialog).
@@ -1863,9 +1975,63 @@ async fn start_pairing(
     Ok(())
 }
 
-/// Responder side of the TCP pairing flow. Owns one accepted TCP stream and
-/// drives it through PairRequest → PairResponse → Welcome → PairFingerprint
-/// to completion before closing.
+/// Log every pairing-channel failure with a single generic message at WARN
+/// level when `pairing_debug_logs` is off — per WIRE-PROTOCOL-0.3.1 §H7, the
+/// log channel must not leak whether a failure was a wrong-PIN attempt vs.
+/// any other framing/decrypt error. When the user toggles the debug switch
+/// on, the same call site emits the underlying diagnostic.
+fn log_pairing_failure(state: &AppState, peer_addr: std::net::SocketAddr, detail: &str) {
+    let verbose = state
+        .settings
+        .lock()
+        .map(|s| s.pairing_debug_logs)
+        .unwrap_or(false);
+    if verbose {
+        tracing::warn!("Pairing failed from {}: {}", peer_addr, detail);
+    } else {
+        tracing::warn!("Pairing failed from {}.", peer_addr);
+    }
+}
+
+/// Treat an AEAD-decrypt failure as a brute-force attempt: bump the global
+/// counter, and if it crosses `PAIRING_FAILURE_LOCKOUT_THRESHOLD`, lock the
+/// pairing listener and surface an urgent, user-actionable notification +
+/// frontend event. See WIRE-PROTOCOL-0.3.1 §H1.
+fn record_pairing_aead_failure(
+    state: &AppState,
+    app_handle: &tauri::AppHandle,
+    peer_addr: std::net::SocketAddr,
+    detail: &str,
+) {
+    log_pairing_failure(state, peer_addr, detail);
+    if state.record_pairing_failure() {
+        tracing::error!(
+            "Pairing listener LOCKED OUT after {} AEAD failures — user must re-arm via the UI.",
+            crate::state::PAIRING_FAILURE_LOCKOUT_THRESHOLD,
+        );
+        let _ = app_handle.emit("pairing-locked-out", ());
+        // Urgent OS-level notification so the user actually sees the lockout
+        // rather than only spotting it the next time they open Settings.
+        send_notification(
+            app_handle,
+            "ClusterCut pairing locked",
+            "Too many failed PIN attempts. Pairing is paused — open ClusterCut to re-enable it.",
+            true, // urgent
+            None,
+            "pairing",
+            NotificationPayload::None,
+        );
+    }
+}
+
+/// Responder side of the TCP pairing flow (WIRE-PROTOCOL-0.3.1).
+///
+/// Drives T0 (PairRequest) → T1 (PairResponse) → T2 (ResponderId, AEAD) →
+/// T3 (InitiatorId, AEAD) to completion. After T3 decrypts cleanly, the
+/// responder pins the initiator's fingerprint and gossips the new peer to
+/// the rest of the cluster. The TCP socket then closes — the initiator
+/// uses the close as its signal to open QUIC for the post-pairing
+/// `ClusterInfo` exchange (T5–T7).
 async fn handle_pairing_connection(
     mut stream: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
@@ -1875,105 +2041,174 @@ async fn handle_pairing_connection(
 ) {
     use crate::protocol::PairingMessage;
 
-    // Step 1: read PairRequest
-    let (peer_msg, peer_device_id) = match crate::transport::read_pairing_frame(&mut stream).await {
-        Ok(PairingMessage::PairRequest { msg, device_id }) => (msg, device_id),
+    // T0 — opening SPAKE2 element from the initiator. No identity bytes.
+    let spake_msg_i = match crate::transport::read_pairing_frame(&mut stream).await {
+        Ok(PairingMessage::PairRequest { spake_msg }) => spake_msg,
         Ok(other) => {
-            tracing::warn!("Pairing handler from {}: expected PairRequest, got {:?}", peer_addr, other);
+            log_pairing_failure(&state, peer_addr, &format!("expected PairRequest, got {:?}", other));
             return;
         }
         Err(e) => {
-            tracing::warn!("Pairing handler from {}: read PairRequest failed: {}", peer_addr, e);
+            log_pairing_failure(&state, peer_addr, &format!("read PairRequest failed: {}", e));
             return;
         }
     };
-    tracing::info!("Received PairRequest from {} ({}). Authenticating...", peer_addr, peer_device_id);
+    tracing::info!("Received PairRequest from {}; running SPAKE2.", peer_addr);
 
-    // Step 2: SPAKE2 init + send PairResponse
-    let local_id = state.local_device_id.lock().unwrap().clone();
+    // T1 — responder's SPAKE2 element. The PIN comes from local state.
+    let local_id_raw = state.local_device_id.lock().unwrap().clone();
+    let local_id = crate::protocol::truncate_device_id(&local_id_raw);
     let pin = state.network_pin.lock().unwrap().clone();
-    let (spake_state, response_msg) = match crypto::start_spake2(&pin, &local_id, &peer_device_id) {
+    let (spake_state, spake_msg_r) = match crypto::start_spake2(&pin, &local_id, "initiator") {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("SPAKE2 init error for {}: {}", peer_addr, e);
+            log_pairing_failure(&state, peer_addr, &format!("SPAKE2 init error: {}", e));
             return;
         }
     };
-    let resp = PairingMessage::PairResponse {
-        msg: response_msg,
-        device_id: local_id.clone(),
-    };
+    let resp = PairingMessage::PairResponse { spake_msg: spake_msg_r.clone() };
     if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &resp).await {
-        tracing::error!("Failed to send PairResponse to {}: {}", peer_addr, e);
+        log_pairing_failure(&state, peer_addr, &format!("send PairResponse failed: {}", e));
         return;
     }
 
-    // Step 3: finish SPAKE2
-    let session_key = match crypto::finish_spake2(spake_state, &peer_msg) {
+    // Finish SPAKE2 → shared 32-byte session key.
+    let session_key = match crypto::finish_spake2(spake_state, &spake_msg_i) {
         Ok(k) => k,
         Err(e) => {
-            tracing::error!("Auth Failed for {}: {}", peer_device_id, e);
+            // SPAKE2.finish() doesn't actually fail on PIN mismatch — wrong
+            // PINs still produce a (different) 32-byte key. So this branch
+            // is more about malformed inbound bytes. Treat as a generic
+            // pairing failure (counter not bumped — only AEAD-tag failures
+            // count toward lockout per §H1).
+            log_pairing_failure(&state, peer_addr, &format!("SPAKE2 finish failed: {}", e));
             return;
         }
     };
     if session_key.len() != 32 {
-        tracing::error!("Invalid SPAKE2 session key length for {}", peer_addr);
+        log_pairing_failure(&state, peer_addr, "SPAKE2 produced wrong key length");
         return;
     }
-    let mut session_key_arr = [0u8; 32];
-    session_key_arr.copy_from_slice(&session_key);
-    tracing::info!("Authentication Success for {}!", peer_device_id);
-
-    // Step 4: build WelcomePayload (plaintext + SAS confirm) and send.
-    let cluster_id = state.cluster_id.lock().unwrap().clone();
-    if cluster_id.is_empty() {
-        tracing::error!("Cannot Welcome {}: no cluster_id on responder", peer_device_id);
-        return;
-    }
-
-    let known_peers_vec: Vec<_> = state
-        .known_peers
-        .lock()
-        .unwrap()
-        .values()
-        .cloned()
-        .collect();
-    let network_name = state.network_name.lock().unwrap().clone();
-    let confirm = match crypto::make_pair_confirm(&session_key_arr) {
-        Ok(c) => c,
+    let transcript = crypto::pairing_transcript(&spake_msg_i, &spake_msg_r);
+    let (k_i2r, k_r2i) = match crypto::derive_pair_subkeys(&session_key, &transcript) {
+        Ok(pair) => pair,
         Err(e) => {
-            tracing::error!("Failed to build pair-confirm for {}: {}", peer_addr, e);
+            log_pairing_failure(&state, peer_addr, &format!("HKDF derive failed: {}", e));
             return;
         }
     };
-    let payload = crate::protocol::WelcomePayload {
-        cluster_id,
-        known_peers: known_peers_vec,
-        network_name: network_name.clone(),
-        responder_fingerprint: transport.local_fingerprint(),
-        confirm,
-    };
+    tracing::info!("SPAKE2 complete (responder) for {}; sending ResponderId (T2).", peer_addr);
 
-    // Insert peer record before sending Welcome, mirroring the previous
-    // ordering: the initiator may fire PairFingerprint back immediately,
-    // racing the responder's lookup. Prefer the hostname mDNS already
-    // discovered; fall back to a placeholder.
+    // Refuse to advance to T2 if we have no cluster identity to bind to.
+    // Responding here would leak a valid ResponderId for a half-built
+    // cluster; better to abort early.
+    if state.cluster_id.lock().unwrap().is_empty() {
+        log_pairing_failure(&state, peer_addr, "responder has no cluster_id");
+        return;
+    }
+
+    // T2 — responder's AEAD-wrapped identity, decryptable by the initiator
+    // only if it derived the same SPAKE2 key (i.e. correct PIN).
+    let r_inner = crate::protocol::PairIdInner {
+        device_id: local_id.clone(),
+        fingerprint: transport.local_fingerprint(),
+    };
+    let r_inner_bytes = match serde_json::to_vec(&r_inner) {
+        Ok(b) => b,
+        Err(e) => {
+            log_pairing_failure(&state, peer_addr, &format!("serialise ResponderId failed: {}", e));
+            return;
+        }
+    };
+    let nonce_r = crypto::fresh_pair_nonce();
+    let ciphertext_r = match crypto::pair_aead_encrypt(&k_r2i, &nonce_r, &r_inner_bytes) {
+        Ok(ct) => ct,
+        Err(e) => {
+            log_pairing_failure(&state, peer_addr, &format!("ResponderId AEAD encrypt failed: {}", e));
+            return;
+        }
+    };
+    let t2 = PairingMessage::ResponderId {
+        nonce: nonce_r.to_vec(),
+        ciphertext: ciphertext_r,
+    };
+    if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &t2).await {
+        log_pairing_failure(&state, peer_addr, &format!("send ResponderId failed: {}", e));
+        return;
+    }
+
+    // T3 — initiator's AEAD-wrapped identity.
+    let (nonce_i_vec, ciphertext_i) = match crate::transport::read_pairing_frame(&mut stream).await {
+        Ok(PairingMessage::InitiatorId { nonce, ciphertext }) => (nonce, ciphertext),
+        Ok(other) => {
+            log_pairing_failure(&state, peer_addr, &format!("expected InitiatorId, got {:?}", other));
+            return;
+        }
+        Err(e) => {
+            log_pairing_failure(&state, peer_addr, &format!("read InitiatorId failed: {}", e));
+            return;
+        }
+    };
+    let nonce_i_arr: [u8; 12] = match nonce_i_vec.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            // Malformed nonce — treat as a tampered/garbage frame and
+            // count it toward the lockout, same as any AEAD failure.
+            record_pairing_aead_failure(&state, &app_handle, peer_addr, "InitiatorId nonce length");
+            return;
+        }
+    };
+    let i_inner_bytes = match crypto::pair_aead_decrypt(&k_i2r, &nonce_i_arr, &ciphertext_i) {
+        Ok(b) => b,
+        Err(e) => {
+            // The big one: AEAD-tag verify failed. Either the PIN was wrong
+            // (online brute force) or an active MITM tried to forge T3. Bump
+            // the global lockout counter — see §H1.
+            record_pairing_aead_failure(&state, &app_handle, peer_addr, &format!("InitiatorId AEAD decrypt failed: {}", e));
+            return;
+        }
+    };
+    let i_inner: crate::protocol::PairIdInner = match serde_json::from_slice(&i_inner_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            log_pairing_failure(&state, peer_addr, &format!("malformed InitiatorId inner: {}", e));
+            return;
+        }
+    };
+    let crate::protocol::PairIdInner {
+        device_id: initiator_device_id,
+        fingerprint: initiator_fingerprint,
+    } = i_inner;
+
+    // Apply truncation defensively on the receive side too — the spec
+    // requires both ends to apply the same canonicalisation so the pinned
+    // identifier matches what the initiator believes its device_id to be.
+    let initiator_device_id = crate::protocol::truncate_device_id(&initiator_device_id);
+    tracing::info!(
+        "Authenticated initiator identity ({}) from {}; pinning fingerprint.",
+        initiator_device_id,
+        peer_addr
+    );
+
+    // Insert / refresh the peer record with the pinned fingerprint. Pull
+    // the hostname from any prior mDNS observation; otherwise placeholder.
     let prior_hostname = {
         let runtime_peers = state.peers.lock().unwrap();
         runtime_peers
-            .get(&peer_device_id)
+            .get(&initiator_device_id)
             .map(|p| p.hostname.clone())
             .or_else(|| {
                 state
                     .known_peers
                     .lock()
                     .unwrap()
-                    .get(&peer_device_id)
+                    .get(&initiator_device_id)
                     .map(|p| p.hostname.clone())
             })
     };
-    let p = crate::peer::Peer {
-        id: peer_device_id.clone(),
+    let network_name = state.network_name.lock().unwrap().clone();
+    let pinned = crate::peer::Peer {
+        id: initiator_device_id.clone(),
         ip: peer_addr.ip(),
         port: peer_addr.port(),
         hostname: prior_hostname.unwrap_or_else(|| format!("Peer ({})", peer_addr.ip())),
@@ -1985,68 +2220,25 @@ async fn handle_pairing_connection(
         is_manual: false,
         network_name: Some(network_name.clone()),
         signature: None,
-        fingerprint: None, // filled in by PairFingerprint below
+        fingerprint: Some(initiator_fingerprint),
         protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
     };
     {
         let mut kp_lock = state.known_peers.lock().unwrap();
-        kp_lock.insert(peer_device_id.clone(), p.clone());
+        kp_lock.insert(initiator_device_id.clone(), pinned.clone());
         save_known_peers(&app_handle, &kp_lock);
     }
-    state.add_peer(p.clone());
-    let _ = app_handle.emit("peer-update", &p);
+    state.add_peer(pinned.clone());
+    let _ = app_handle.emit("peer-update", &pinned);
 
-    let welcome_msg = PairingMessage::Welcome(payload);
-    if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &welcome_msg).await {
-        tracing::error!("Failed to send Welcome to {}: {}", peer_addr, e);
-        return;
-    }
+    // Gossip the new peer to the rest of the cluster ONLY after T3 succeeds —
+    // existing mTLS peers need the new fingerprint to accept its inbound
+    // connections.
+    gossip_peer(&pinned, &state, &transport, Some(peer_addr));
 
-    // Step 5: read PairFingerprint and validate its SAS-confirm tag.
-    let fp_payload = match crate::transport::read_pairing_frame(&mut stream).await {
-        Ok(PairingMessage::PairFingerprint(p)) => p,
-        Ok(other) => {
-            tracing::warn!("Expected PairFingerprint from {}, got {:?}", peer_addr, other);
-            return;
-        }
-        Err(e) => {
-            tracing::warn!("Failed to read PairFingerprint from {}: {}", peer_addr, e);
-            return;
-        }
-    };
-    if let Err(e) = crypto::verify_pair_confirm(&session_key_arr, &fp_payload.confirm) {
-        tracing::error!(
-            "PairFingerprint confirm verification failed for {}: {} — aborting pairing",
-            peer_addr,
-            e
-        );
-        return;
-    }
-    let crate::protocol::PairFingerprintPayload { device_id, fingerprint, confirm: _ } = fp_payload;
-    let fully_paired_peer = {
-        let mut kp_lock = state.known_peers.lock().unwrap();
-        if let Some(peer) = kp_lock.get_mut(&device_id) {
-            peer.fingerprint = Some(fingerprint);
-            let updated = peer.clone();
-            save_known_peers(&app_handle, &kp_lock);
-            drop(kp_lock);
-            let _ = app_handle.emit("peer-update", &updated);
-            tracing::info!("Pinned fingerprint for paired peer {}", device_id);
-            Some(updated)
-        } else {
-            tracing::warn!("PairFingerprint for unknown peer id {}", device_id);
-            None
-        }
-    };
-
-    // Gossip the new peer ONLY after PairFingerprint completes — under the
-    // strict mTLS model, other peers in the cluster need the new peer's
-    // fingerprint to accept its inbound connections. Gossiping with
-    // `fingerprint=None` (as we did before mTLS landed) would leave the
-    // new peer unable to talk to anyone except the responder.
-    if let Some(updated_peer) = fully_paired_peer {
-        gossip_peer(&updated_peer, &state, &transport, Some(peer_addr));
-    }
+    // T4 — drop the stream. The kernel closes the TCP connection, which
+    // the initiator reads as the "responder is ready for QUIC" signal.
+    drop(stream);
 }
 
 // Helper to wipe state and restart network identity
@@ -2972,6 +3164,16 @@ pub fn run() {
             // Start the dedicated plaintext-TCP pairing listener on the same
             // numeric port as the QUIC endpoint (UDP/QUIC and TCP/pairing
             // cohabit on a single port number).
+            //
+            // The accept closure enforces three WIRE-PROTOCOL-0.3.1 hardening
+            // requirements before spawning the handler:
+            //   §H1 — refuse outright while the responder is locked out
+            //         (drop the TCP socket immediately).
+            //   §H6 — cap = 1 concurrent pairing; refuse anything else with
+            //         no permit available.
+            //   §H6 — wrap the handler in `PAIRING_PROTOCOL_TIMEOUT` so an
+            //         accepted-but-idle socket can't hold the single-flight
+            //         slot indefinitely.
             {
                 let pairing_state = listener_state.clone();
                 let pairing_handle = listener_handle.clone();
@@ -2980,8 +3182,42 @@ pub fn run() {
                     let state = pairing_state.clone();
                     let app = pairing_handle.clone();
                     let t = pairing_transport.clone();
+                    if state.is_pairing_locked_out() {
+                        tracing::warn!(
+                            "Pairing TCP accept from {} refused: listener locked out (§H1).",
+                            peer_addr
+                        );
+                        drop(stream);
+                        return;
+                    }
+                    let permit = match state.pairing_slot.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            tracing::warn!(
+                                "Pairing TCP accept from {} refused: another pairing in flight (cap = 1, §H6).",
+                                peer_addr
+                            );
+                            drop(stream);
+                            return;
+                        }
+                    };
                     tauri::async_runtime::spawn(async move {
-                        handle_pairing_connection(stream, peer_addr, state, app, t).await;
+                        let _permit = permit; // released on drop
+                        match tokio::time::timeout(
+                            crate::transport::PAIRING_PROTOCOL_TIMEOUT,
+                            handle_pairing_connection(stream, peer_addr, state, app, t),
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    "Pairing from {} aborted: exceeded {:?} idle timeout (§H6).",
+                                    peer_addr,
+                                    crate::transport::PAIRING_PROTOCOL_TIMEOUT,
+                                );
+                            }
+                        }
                     });
                 }) {
                     tracing::error!("Failed to bind pairing TCP listener on port {}: {}", port, e);
@@ -3181,6 +3417,8 @@ pub fn run() {
             get_current_theme,
             get_legacy_peers,
             dismiss_legacy_peer_banner,
+            is_pairing_locked_out,
+            rearm_pairing,
         ])
 
         .on_window_event(|window, event| {
@@ -4447,6 +4685,54 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
             tracing::debug!("Received Ping from {}. Sending Pong.", addr);
             if let Ok(pong_data) = serde_json::to_vec(&Message::Pong) {
                 let _ = transport_inside.send_message(addr, &pong_data).await;
+            }
+        }
+        Message::ClusterInfoRequest => {
+            // Post-pairing bootstrap reply (T6 → T7). The sender has already
+            // passed our mTLS client-cert verifier (we just pinned its cert
+            // in `handle_pairing_connection`), so the request is authenticated
+            // and we can hand over our cluster state without further checks.
+            let cluster_id = listener_state.cluster_id.lock().unwrap().clone();
+            if cluster_id.is_empty() {
+                tracing::warn!("ClusterInfoRequest from {} but we have no cluster_id", addr);
+                return;
+            }
+            let known_peers_vec: Vec<_> = listener_state
+                .known_peers
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect();
+            let network_name = listener_state.network_name.lock().unwrap().clone();
+            let info = crate::protocol::ClusterInfo {
+                cluster_id,
+                known_peers: known_peers_vec,
+                network_name,
+            };
+            tracing::debug!("Replying to ClusterInfoRequest from {}", addr);
+            match serde_json::to_vec(&Message::ClusterInfo(info)) {
+                Ok(bytes) => {
+                    if let Err(e) = transport_inside.send_message(addr, &bytes).await {
+                        tracing::warn!("Failed to send ClusterInfo to {}: {}", addr, e);
+                    }
+                }
+                Err(e) => tracing::error!("Failed to serialise ClusterInfo: {}", e),
+            }
+        }
+        Message::ClusterInfo(info) => {
+            // T7 reply to an in-progress `start_pairing`. mTLS already
+            // authenticated the responder; we just hand off into the
+            // pending oneshot. A stray ClusterInfo with no waiter is a
+            // protocol-level no-op (logged + dropped).
+            let waiter = listener_state.pending_cluster_info.lock().unwrap().take();
+            match waiter {
+                Some(tx) => {
+                    let _ = tx.send(info);
+                }
+                None => {
+                    tracing::warn!("Received unsolicited ClusterInfo from {}; ignoring", addr);
+                }
             }
         }
         Message::Pong => {
