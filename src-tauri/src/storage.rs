@@ -388,6 +388,12 @@ pub struct AppSettings {
     pub flatpak_autostart: bool,
     #[serde(default)]
     pub compress_file_transfers: bool,
+    /// Per WIRE-PROTOCOL-0.3.1 §H7: when off, the responder logs only a
+    /// generic "pairing failed" line on AEAD-decrypt failures, so a
+    /// passive observer can't tell a wrong-PIN attempt apart from any
+    /// other framing/decrypt error. Flip on for verbose pairing diagnostics.
+    #[serde(default)]
+    pub pairing_debug_logs: bool,
 }
 
 impl Default for AppSettings {
@@ -406,6 +412,7 @@ impl Default for AppSettings {
             ignore_extension_missing: false,
             flatpak_autostart: false,
             compress_file_transfers: false,
+            pairing_debug_logs: false,
         }
     }
 }

@@ -244,6 +244,7 @@ interface AppSettings {
   notify_large_files: boolean;
   ignore_extension_missing: boolean;
   compress_file_transfers: boolean;
+  pairing_debug_logs: boolean;
 }
 
 /* --- Helper Components (from Design) --- */
@@ -468,6 +469,12 @@ export default function App() {
   // without a stored cert fingerprint (i.e. paired before mTLS landed).
   // Those peers are unreachable under v0.3 and need to be re-paired.
   const [legacyPeers, setLegacyPeers] = useState<{ id: string; hostname: string }[]>([]);
+
+  // Pairing-lockout banner: surfaced when the backend's pairing listener
+  // tripped its global AEAD-failure threshold (WIRE-PROTOCOL-0.3.1 §H1).
+  // The listener refuses inbound pairing attempts until the user clicks
+  // "Re-enable pairing", which calls `rearm_pairing` on the backend.
+  const [pairingLockedOut, setPairingLockedOut] = useState(false);
 
   // Incompatibility modal: fires when the backend's `peer-incompatible`
   // event arrives (a clipboard send failed and the destination peer's
@@ -791,6 +798,13 @@ export default function App() {
       .then(setLegacyPeers)
       .catch(() => {});
 
+    // 2c. Pairing-lockout banner — initial fetch. The backend retains
+    // the locked-out state across the session (and across a UI reload
+    // within the same process lifetime), so we surface it on mount.
+    invoke<boolean>("is_pairing_locked_out")
+      .then(setPairingLockedOut)
+      .catch(() => {});
+
     // 3. Settings
     fetchSettings();
 
@@ -843,6 +857,17 @@ export default function App() {
         setIncompatibleModal({ open: true, hostname });
       },
     );
+
+    // Pairing lockout (WIRE-PROTOCOL-0.3.1 §H1). The backend already fires
+    // an urgent OS notification when the threshold trips; this listener
+    // also raises an in-app banner so the lockout is visible the next time
+    // the user looks at the window.
+    const unlistenPairingLocked = listen<void>("pairing-locked-out", () => {
+      setPairingLockedOut(true);
+    });
+    const unlistenPairingRearmed = listen<void>("pairing-rearmed", () => {
+      setPairingLockedOut(false);
+    });
 
     // Listen for Monitor Updates (When Auto-Send is OFF)
     const unlistenMonitor = listen<any>("clipboard-monitor-update", (event) => {
@@ -996,6 +1021,8 @@ export default function App() {
       unlistenIncompatible.then((f) => f());
       unlistenNotification.then((f) => f());
       unlistenSettingsChanged.then((f) => f());
+      unlistenPairingLocked.then((f) => f());
+      unlistenPairingRearmed.then((f) => f());
     };
   }, [myHostname]); // Re-bind if hostname loads (needed for sender check)
 
@@ -1229,6 +1256,40 @@ export default function App() {
               }}
             >
               Dismiss
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Pairing-lockout banner — fires when the responder's global
+          AEAD-failure threshold trips per WIRE-PROTOCOL-0.3.1 §H1. The
+          pairing TCP listener refuses inbound connections until the user
+          explicitly re-arms via the button below. Red (not amber) because
+          the cause is genuinely adversarial (or a misbehaving peer), not
+          a benign configuration drift. */}
+      {pairingLockedOut && (
+        <div className="fixed inset-x-0 top-0 z-40 border-b border-rose-300 bg-rose-50 px-4 py-3 shadow-sm dark:border-rose-700 dark:bg-rose-950/80">
+          <div className="mx-auto flex max-w-5xl items-start gap-3">
+            <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-rose-600 dark:text-rose-400" />
+            <div className="flex-1 text-sm">
+              <div className="font-medium text-rose-900 dark:text-rose-100">
+                Pairing paused — too many failed attempts
+              </div>
+              <div className="mt-1 text-rose-800 dark:text-rose-200">
+                Another device tried to pair with this one too many times with the wrong PIN. Pairing is disabled until you re-enable it. If you didn't expect this, check that no one else on your network is trying to join.
+              </div>
+            </div>
+            <Button
+              variant="primary"
+              onClick={() => {
+                invoke("rearm_pairing")
+                  .then(() => setPairingLockedOut(false))
+                  .catch((err) => {
+                    logToBackend("rearm_pairing failed", err);
+                  });
+              }}
+            >
+              Re-enable pairing
             </Button>
           </div>
         </div>
@@ -2548,6 +2609,47 @@ function SettingsView({
               className={clsx("relative h-5 w-9 rounded-full transition-colors", settings.notify_large_files ? "bg-emerald-500" : "bg-zinc-200 dark:bg-zinc-700")}
             >
               <span className={clsx("block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform", settings.notify_large_files ? "translate-x-5" : "translate-x-1")} />
+            </button>
+          </div>
+        </div>
+      </Card>
+
+      {/* Diagnostics — opt-in verbose logging for the pairing channel. Per
+          WIRE-PROTOCOL-0.3.1 §H7, the responder logs only a generic
+          "pairing failure" line when this is off so observers can't tell a
+          wrong-PIN attempt from any other framing/decrypt error. */}
+      <Card className="p-4">
+        <SectionHeader
+          icon={<ShieldCheck className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />}
+          title="Diagnostics"
+          subtitle="Logging controls for the pairing channel."
+        />
+        <div className="mt-4 space-y-4 px-1">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-sm font-medium text-zinc-800 dark:text-zinc-200">
+                Verbose pairing logs
+              </div>
+              <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                Write detailed pairing-channel diagnostics to the log instead of a generic "pairing failed" line. Off by default to avoid leaking whether a failure was a wrong-PIN attempt or a different protocol error.
+              </div>
+            </div>
+            <button
+              onClick={() => setSettings({
+                ...settings,
+                pairing_debug_logs: !settings.pairing_debug_logs,
+              })}
+              className={clsx(
+                "relative h-6 w-11 shrink-0 rounded-full transition-colors",
+                settings.pairing_debug_logs ? "bg-emerald-500" : "bg-zinc-200 dark:bg-zinc-700"
+              )}
+            >
+              <span
+                className={clsx(
+                  "block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform",
+                  settings.pairing_debug_logs ? "translate-x-6" : "translate-x-1"
+                )}
+              />
             </button>
           </div>
         </div>
