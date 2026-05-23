@@ -38,7 +38,12 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri` and flatpak build dirs
+      // 3. tell Vite to ignore watching `src-tauri` and flatpak build dirs.
+      // followSymlinks: false stops chokidar from traversing the symlink
+      // `build-dir/var/run -> /run` (left by flatpak-builder) into gvfs
+      // mounts under /run/user/*/gvfs/, which would hang vite's libuv
+      // workers on slow SMB shares.
+      followSymlinks: false,
       ignored: ["**/src-tauri/**", "**/.flatpak-builder/**", "**/build-dir/**"],
     },
   },

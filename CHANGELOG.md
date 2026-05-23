@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- "Clear" button on the Clipboard History view that wipes every entry from this device's history in one go, guarded by a confirmation dialog. The clear is local-only — other devices in the cluster keep their own history — so it's safe to use as a quick tidy-up without affecting peers. The existing per-item "Delete Everywhere" button still covers cluster-wide deletion when you need it.
+
 ## [0.3.1] — 2026-05-16
 
 ### Security

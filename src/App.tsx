@@ -1513,7 +1513,23 @@ export default function App() {
                 onAddManual={() => setAddManualOpen(true)}
               />
             ) : activeView === "history" ? (
-              <HistoryView items={clipboardHistory} />
+              <HistoryView
+                items={clipboardHistory}
+                onClearHistory={() => {
+                  setDialog({
+                    open: true,
+                    title: "Clear clipboard history?",
+                    description: "This removes every entry from this device's history view. Other devices in the cluster keep their own history.",
+                    type: "danger",
+                    confirmLabel: "Clear History",
+                    onConfirm: () => {
+                      setClipboardHistory([]);
+                      setDialog(d => ({ ...d, open: false }));
+                    },
+                    onCancel: () => setDialog(d => ({ ...d, open: false })),
+                  });
+                }}
+              />
             ) : (
               <SettingsView onSettingsRefreshed={fetchSettings} />
             )}
@@ -1915,7 +1931,7 @@ function DevicesView({
   );
 }
 
-function HistoryView({ items }: { items: HistoryItem[] }) {
+function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; onClearHistory: () => void }) {
   const [myHostname, setMyHostname] = useState<string>("");
   const [progress, setProgress] = useState<Record<string, { transferred: number, total: number }>>({});
   const [downloadedFiles, setDownloadedFiles] = useState<Record<string, string[]>>({});
@@ -2011,6 +2027,18 @@ function HistoryView({ items }: { items: HistoryItem[] }) {
           icon={<Copy className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />}
           title="Clipboard history"
           subtitle="Recent entries."
+          right={
+            items.length > 0 ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                iconLeft={<Trash2 className="h-4 w-4" />}
+                onClick={onClearHistory}
+              >
+                Clear
+              </Button>
+            ) : undefined
+          }
         />
 
         <div className="mt-4 space-y-2">
