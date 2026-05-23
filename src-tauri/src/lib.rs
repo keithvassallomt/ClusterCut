@@ -1736,6 +1736,7 @@ fn rearm_pairing(state: tauri::State<'_, AppState>, app_handle: tauri::AppHandle
 async fn start_pairing(
     peer_id: String,
     pin: String,
+    peer_addr: Option<String>,
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transport: tauri::State<'_, Transport>,
@@ -1744,7 +1745,22 @@ async fn start_pairing(
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
-    let peer_addr = {
+    // Two entry points: discovered peers (looked up by peer_id in the runtime
+    // peers map) and manually-added remotes (caller passes the IP[:port]
+    // directly, because no mDNS observation has populated the map). When
+    // peer_addr is supplied, peer_id is informational only — the SPAKE2-
+    // authenticated responder identity from T2 is the canonical id used for
+    // storage below.
+    let is_manual_pair = peer_addr.is_some();
+    let peer_addr = if let Some(addr_str) = peer_addr {
+        if let Ok(sock) = addr_str.parse::<std::net::SocketAddr>() {
+            sock
+        } else if let Ok(ip) = addr_str.parse::<std::net::IpAddr>() {
+            std::net::SocketAddr::new(ip, 4654)
+        } else {
+            return Err(format!("Invalid peer address: {}", addr_str));
+        }
+    } else {
         let peers = state.get_peers();
         if let Some(peer) = peers.get(&peer_id) {
             std::net::SocketAddr::new(peer.ip, peer.port)
@@ -1833,6 +1849,9 @@ async fn start_pairing(
     let r_inner: crate::protocol::PairIdInner = serde_json::from_slice(&r_inner_bytes)
         .map_err(|e| format!("Malformed ResponderId inner payload: {}", e))?;
     let crate::protocol::PairIdInner { device_id: responder_device_id, fingerprint: responder_fingerprint } = r_inner;
+    // Apply the same canonicalisation the responder uses on its T3 receive
+    // path, so both sides key on identical bytes.
+    let responder_device_id = crate::protocol::truncate_device_id(&responder_device_id);
     tracing::info!(
         "Authenticated responder identity (initiator). Pinning fingerprint for {}.",
         responder_device_id
@@ -1861,15 +1880,26 @@ async fn start_pairing(
     // Pin the responder's fingerprint locally NOW (after sending T3, before
     // the QUIC step that depends on it). Touching state in this order keeps
     // the pinning visible to a concurrent inbound mTLS verifier on this side.
+    //
+    // We key on `responder_device_id` (the SPAKE2-authenticated id from T2),
+    // not the caller-supplied `peer_id`. For mDNS-discovered peers the two
+    // are equal because mDNS announces the same device_id; for the manual
+    // remote-add path `peer_id` is unknown ahead of time, so the authenticated
+    // value is the only correct key. If a prior mDNS observation already
+    // populated a runtime entry under a different key (or under the same key
+    // with stale data), inherit its hostname; otherwise fall back to the IP.
     {
         let mut kp_lock = state.known_peers.lock().unwrap();
         let mut runtime_peers = state.peers.lock().unwrap();
-        let hostname = runtime_peers
-            .get(&peer_id)
+        let prior = runtime_peers
+            .get(&responder_device_id)
+            .or_else(|| runtime_peers.get(&peer_id));
+        let hostname = prior
             .map(|p| p.hostname.clone())
             .unwrap_or_else(|| format!("Peer ({})", peer_addr.ip()));
+        let inherited_is_manual = prior.map(|p| p.is_manual).unwrap_or(false);
         let pinned = crate::peer::Peer {
-            id: peer_id.clone(),
+            id: responder_device_id.clone(),
             ip: peer_addr.ip(),
             port: peer_addr.port(),
             hostname,
@@ -1878,15 +1908,15 @@ async fn start_pairing(
                 .unwrap()
                 .as_secs(),
             is_trusted: true,
-            is_manual: runtime_peers.get(&peer_id).map(|p| p.is_manual).unwrap_or(false),
+            is_manual: is_manual_pair || inherited_is_manual,
             // network_name filled in once ClusterInfo arrives.
             network_name: None,
             signature: None,
             fingerprint: Some(responder_fingerprint.clone()),
             protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
         };
-        runtime_peers.insert(peer_id.clone(), pinned.clone());
-        kp_lock.insert(peer_id.clone(), pinned.clone());
+        runtime_peers.insert(responder_device_id.clone(), pinned.clone());
+        kp_lock.insert(responder_device_id.clone(), pinned.clone());
         save_known_peers(&app_handle, &kp_lock);
         let _ = app_handle.emit("peer-update", &pinned);
     }
@@ -1955,15 +1985,30 @@ async fn start_pairing(
         let mut kp_lock = state.known_peers.lock().unwrap();
         let mut runtime_peers = state.peers.lock().unwrap();
         for peer in known_peers {
+            // The cluster's view of the responder shouldn't clobber the
+            // local pinned record we just wrote (which carries our pinned
+            // fingerprint and any is_manual flag).
+            if peer.id == responder_device_id {
+                continue;
+            }
+            // The responder added us during T3 and includes our own record
+            // in its known_peers snapshot — but from the responder's vantage
+            // point we live at whatever source IP they saw (e.g. a WireGuard
+            // tunnel address), with a placeholder hostname. Re-importing that
+            // would surface us as a peer of ourselves in the UI. Always drop
+            // any entry matching our local device_id.
+            if peer.id == local_id {
+                continue;
+            }
             kp_lock.insert(peer.id.clone(), peer.clone());
             runtime_peers.insert(peer.id.clone(), peer.clone());
             let _ = app_handle.emit("peer-update", &peer);
         }
         // Tag the responder's record with the cluster's network_name now
         // that we have it.
-        if let Some(peer) = runtime_peers.get_mut(&peer_id) {
+        if let Some(peer) = runtime_peers.get_mut(&responder_device_id) {
             peer.network_name = Some(network_name.clone());
-            kp_lock.insert(peer_id.clone(), peer.clone());
+            kp_lock.insert(responder_device_id.clone(), peer.clone());
             let _ = app_handle.emit("peer-update", &*peer);
         }
         save_known_peers(&app_handle, &kp_lock);
@@ -1971,7 +2016,7 @@ async fn start_pairing(
 
     // Signal pairing completion to the UI. Distinct from `peer-update`
     // (which also fires on mDNS rediscovery and would race the PIN dialog).
-    let _ = app_handle.emit("pairing-success", &peer_id);
+    let _ = app_handle.emit("pairing-success", &responder_device_id);
     Ok(())
 }
 

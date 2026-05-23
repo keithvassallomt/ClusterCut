@@ -5,10 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.2] — 2026-05-23
 
 ### Added
-- "Clear" button on the Clipboard History view that wipes every entry from this device's history in one go, guarded by a confirmation dialog. The clear is local-only — other devices in the cluster keep their own history — so it's safe to use as a quick tidy-up without affecting peers. The existing per-item "Delete Everywhere" button still covers cluster-wide deletion when you need it.
+- "Clear" button on the Clipboard History view that wipes every entry from this device's history in one go, guarded by a confirmation dialog. The clear is local-only — other devices in the cluster keep their own history — so it's safe to use as a quick tidy-up without affecting peers. The existing per-item "Delete Everywhere" button still covers cluster-wide deletion when you need it. Thanks to @snaulh for the request.
+
+### Fixed
+- "Add Remote Peer" with a single IP now actually pairs. Previously the flow jumped straight to a QUIC/mTLS probe, which requires a cert fingerprint that only gets pinned *during* pairing — so any first-contact attempt against a peer where mDNS was blocked (firewall, VPN, restrictive LAN) failed with "no pinned fingerprint for <ip>; peer must re-pair", with no way out. Typing an IP now opens the existing PIN modal and runs the SPAKE2 pairing handshake over the plaintext-TCP pairing channel against the typed address — the same channel mDNS-discovered peers use. CIDR-range entries still trigger the existing subnet scan for rediscovering already-paired peers. As a side-effect cleanup, the locally-stored peer is now keyed on the SPAKE2-authenticated `device_id` from T2 rather than the caller-supplied id, matching what the responder already does on its T3 receive path. No wire-protocol change — an unmodified 0.3.x responder pairs correctly with a patched initiator. Thanks to @mdunphy for the report (#14).
+- After joining a cluster you no longer appear as a peer of yourself. The responder generates its `ClusterInfo` reply *after* T3 has added you to its `known_peers`, so the snapshot it sends back included a record for you as seen from the responder's vantage point (whatever source IP the responder saw — e.g. a WireGuard tunnel address — with a placeholder hostname). The post-pairing import loop now drops any entry matching the local `device_id`, alongside the existing skip of the responder's own entry. Gossip and mDNS already filter self, so this only affected the immediate post-join window.
+
+### Changed
+- Renamed the "Cluster PIN" label to "My Cluster PIN" in the main cluster-info card and the Settings → Provisioned-mode editor, and added a one-line note under the provisioned-mode PIN field explaining that the PIN is local to the current device. Since v0.3.0, pairing imports cluster identity (`cluster_id`, `network_name`) but never the responder's PIN — each device keeps its own — and the old "Cluster PIN" wording implied a cluster-wide shared secret that doesn't exist. The Join modal's PIN field (which asks for the *target's* PIN, not yours) is unchanged for now.
+- "My Cluster PIN" on the main screen is now hidden behind bullets by default; a new eye toggle next to the existing copy button reveals it on demand. The copy button still copies the real PIN regardless of whether it's currently revealed, so the muscle-memory "click copy, paste into the other device" flow is unchanged. Keeps the PIN off-screen during screen shares, screenshots, and over-the-shoulder glances by default — pairing flows where the PIN actually needs to be read out are still one click away.
 
 ## [0.3.1] — 2026-05-16
 

@@ -8,7 +8,8 @@ import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import {
   Monitor, Copy, History, ShieldCheck, PlusCircle, Trash2, LogOut,
   Settings, Wifi, Lock, Unlock, AlertTriangle, Info, CheckCircle2,
-  ChevronDown, ChevronRight, ArrowUp, ArrowDown, Send, Download, Puzzle, Loader2, Unplug
+  ChevronDown, ChevronRight, ArrowUp, ArrowDown, Send, Download, Puzzle, Loader2, Unplug,
+  Eye, EyeOff
 } from "lucide-react";
 import clsx from "clsx";
 import { ShortcutRecorder } from "./components/ShortcutRecorder";
@@ -504,6 +505,10 @@ export default function App() {
   const [joinPin, setJoinPin] = useState("");
   const [joinBusy, setJoinBusy] = useState(false);
   const [pairingPeerId, setPairingPeerId] = useState<string | null>(null);
+  // Set when the join modal is opened from "Add Remote Peer" — the user-typed
+  // IP[:port] is passed straight to start_pairing as the address override
+  // because no mDNS-discovered peer record exists yet.
+  const [pairingPeerAddr, setPairingPeerAddr] = useState<string | null>(null);
 
   const [leaveOpen, setLeaveOpen] = useState(false);
 
@@ -1031,6 +1036,19 @@ export default function App() {
   const startJoinFlow = (networkName: string, targetPeerId: string) => {
     setJoinTarget(networkName);
     setPairingPeerId(targetPeerId);
+    setPairingPeerAddr(null);
+    setJoinPin("");
+    setJoinError("");
+    setJoinBusy(false);
+    setJoinOpen(true);
+  };
+
+  // Manual-remote variant: no mDNS-observed peer exists yet, so we pass the
+  // user-typed address straight through to start_pairing as the override.
+  const startManualPairFlow = (addr: string) => {
+    setJoinTarget(addr);
+    setPairingPeerId(null);
+    setPairingPeerAddr(addr);
     setJoinPin("");
     setJoinError("");
     setJoinBusy(false);
@@ -1038,12 +1056,17 @@ export default function App() {
   };
 
   const submitJoin = async () => {
-    if (!joinPin || !pairingPeerId) return;
+    if (!joinPin) return;
+    if (!pairingPeerId && !pairingPeerAddr) return;
     setJoinBusy(true);
     setJoinError("");
 
     try {
-      await invoke("start_pairing", { peerId: pairingPeerId, pin: joinPin });
+      await invoke("start_pairing", {
+        peerId: pairingPeerId ?? "",
+        pin: joinPin,
+        peerAddr: pairingPeerAddr,
+      });
       // Note: Backend handles the rest. We wait for peer-update event to close modal.
       // Timeout safety
       setTimeout(() => {
@@ -1101,15 +1124,27 @@ export default function App() {
 
   const submitManualPeer = async () => {
     if (!manualIp) return;
-    setManualBusy(true);
-    try {
-      await invoke("add_manual_peer", { ip: manualIp });
+    const input = manualIp.trim();
+    // CIDR scans existing peers on a subnet and still relies on pinned
+    // fingerprints — it's a re-discovery tool, not a first-pair entry point.
+    // A single IP[:port] is the "Add Remote Peer" first-pair case: hand it
+    // to the existing PIN modal, which will run start_pairing over the
+    // plaintext-TCP pairing channel against the typed address.
+    if (input.includes("/")) {
+      setManualBusy(true);
+      try {
+        await invoke("add_manual_peer", { ip: input });
+        setAddManualOpen(false);
+        setManualIp("");
+      } catch (e) {
+        alert("Failed: " + e);
+      } finally {
+        setManualBusy(false);
+      }
+    } else {
       setAddManualOpen(false);
       setManualIp("");
-    } catch (e) {
-      alert("Failed: " + e);
-    } finally {
-      setManualBusy(false);
+      startManualPairFlow(input);
     }
   };
 
@@ -1644,7 +1679,7 @@ export default function App() {
           open={addManualOpen}
           onClose={() => setAddManualOpen(false)}
           title="Add Remote Peer"
-          subtitle="Enter an IP address or CIDR range (e.g. 192.168.1.0/24) to scan."
+          subtitle="Enter an IP address to pair with a remote peer, or a CIDR range (e.g. 192.168.1.0/24) to rediscover already-paired peers."
           footer={
             <>
               <Button variant="ghost" onClick={() => setAddManualOpen(false)}>
@@ -1742,6 +1777,7 @@ function DevicesView({
   onDeletePeer: (id: string) => void;
   onAddManual: () => void;
 }) {
+  const [showPin, setShowPin] = useState(false);
 
   return (
     <div className="flex h-full flex-col gap-3">
@@ -1769,13 +1805,24 @@ function DevicesView({
         <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
           <Field label="My Cluster" value={myNetworkName} mono action={<CopyMini text={myNetworkName} />} />
           <Field
-            label="Cluster PIN"
-            value={networkPin}
+            label="My Cluster PIN"
+            value={showPin ? networkPin : "•".repeat(Math.max(networkPin.length, 6))}
             mono
             action={
-              <IconButton label="Copy PIN" onClick={() => navigator.clipboard.writeText(networkPin)} variant="default">
-                <Copy className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />
-              </IconButton>
+              <div className="flex items-center gap-1">
+                <IconButton
+                  label={showPin ? "Hide PIN" : "Show PIN"}
+                  onClick={() => setShowPin(v => !v)}
+                  variant="default"
+                >
+                  {showPin
+                    ? <EyeOff className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />
+                    : <Eye className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />}
+                </IconButton>
+                <IconButton label="Copy PIN" onClick={() => navigator.clipboard.writeText(networkPin)} variant="default">
+                  <Copy className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />
+                </IconButton>
+              </div>
             }
           />
         </div>
@@ -2432,13 +2479,16 @@ function SettingsView({
                 {provName.trim().includes(" ") && <span className="text-[10px] text-rose-500">Spaces not allowed.</span>}
               </div>
               <div className="flex flex-col gap-1">
-                <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Cluster PIN (Min 6 chars)</label>
+                <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">My Cluster PIN (Min 6 chars)</label>
                 <input
                   className="h-10 rounded-xl border border-zinc-900/10 bg-white px-3 font-mono text-sm text-zinc-900 outline-none focus:ring-2 focus:ring-emerald-500/40 dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-50"
                   value={provPin}
                   onChange={(e) => setProvPin(e.target.value)}
                 />
                 {provPin.length > 0 && provPin.length < 6 && <span className="text-[10px] text-rose-500">PIN must be at least 6 characters.</span>}
+                <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                  This PIN is local to this device — it's what other devices enter to pair <em>with</em> this one. Each device in a cluster keeps its own PIN; pairing doesn't share it.
+                </span>
               </div>
             </div>
           )}
