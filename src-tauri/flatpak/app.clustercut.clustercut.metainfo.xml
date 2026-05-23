@@ -64,6 +64,18 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.2" date="2026-05-23">
+      <description>
+        <p>Easier pairing over VPN / restrictive networks, a clearer PIN, and a one-click history wipe.</p>
+        <ul>
+          <li>"Add Remote Peer" now actually works when local discovery is blocked (e.g. you're connecting over a VPN, or your firewall is filtering multicast). Type the peer's IP and you'll be asked for its PIN — same as pairing a device you found nearby</li>
+          <li>Your own PIN is now hidden behind dots on the main screen by default, with a new eye button next to the copy button to reveal it. The copy button still works whether it's revealed or not — handy if you're showing your screen to someone</li>
+          <li>The PIN label is now "My Cluster PIN" and Settings explains that each device keeps its own PIN; pairing never shares it</li>
+          <li>New "Clear" button on the Clipboard History view wipes every entry from this device in one go, with a confirmation. Other devices in the cluster keep their own history</li>
+          <li>Fixed: after joining a cluster you no longer briefly appear in the peer list as a peer of yourself</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.1" date="2026-05-16">
       <description>
         <p>Stronger pairing security and clearer handling of failed pairing attempts.</p>
