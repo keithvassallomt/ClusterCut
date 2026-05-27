@@ -3255,6 +3255,14 @@ pub fn run() {
                     let state = pairing_state.clone();
                     let app = pairing_handle.clone();
                     let t = pairing_transport.clone();
+                    if !state.settings.lock().unwrap().pairing_accept_enabled {
+                        tracing::debug!(
+                            "Pairing TCP accept from {} dropped: pairing paused by user (issue #16).",
+                            peer_addr
+                        );
+                        drop(stream);
+                        return;
+                    }
                     if state.is_pairing_locked_out() {
                         tracing::warn!(
                             "Pairing TCP accept from {} refused: listener locked out (§H1).",
