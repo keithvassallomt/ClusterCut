@@ -43,12 +43,13 @@ interface Peer {
   network_name?: string;
   platform?: string; // Backend doesn't send this yet, will mock or infer
   /// Protocol-compatibility version advertised via mDNS. Missing or below
-  /// `MIN_COMPATIBLE_PROTOCOL` means the peer is on a pre-mTLS build and
-  /// can't talk to us — surfaced as a yellow warning indicator.
+  /// `MIN_COMPATIBLE_PROTOCOL` means the peer is on a wire-protocol
+  /// version this build can't talk to — surfaced as a yellow warning
+  /// indicator and (on user-triggered sends) a "Peer needs updating" modal.
   protocol_version?: string | null;
 }
 
-const MIN_COMPATIBLE_PROTOCOL: [number, number, number] = [0, 3, 0];
+const MIN_COMPATIBLE_PROTOCOL: [number, number, number] = [0, 3, 3];
 
 function parseProtocolVersion(v: string | null | undefined): [number, number, number] | null {
   if (!v) return null;
@@ -873,6 +874,11 @@ export default function App() {
         if (incompatibleShownRef.current.has(id)) return;
         incompatibleShownRef.current.add(id);
         setIncompatibleModal({ open: true, hostname });
+        // If the join-cluster modal is mid-flight (pre-flight version
+        // check fired by start_pairing), close it so the upgrade prompt
+        // isn't stacked on top of a spinner / inline error.
+        setJoinOpen(false);
+        setJoinBusy(false);
       },
     );
 

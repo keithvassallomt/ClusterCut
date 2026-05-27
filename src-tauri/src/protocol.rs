@@ -327,14 +327,22 @@ pub enum Message {
 /// adds complexity without security. Once pairing completes, all further
 /// traffic moves to mutually-authenticated QUIC (steady-state `Message`).
 ///
-/// Wire-protocol 0.3.1 (see `WIRE-PROTOCOL-0.3.1.md`):
+/// Wire-protocol 0.3.3 (this file is the sole spec):
 ///
 /// ```text
 /// T0  Initiator → Responder   PairRequest  { spake_msg }
 /// T1  Responder → Initiator   PairResponse { spake_msg }
-/// T2  Responder → Initiator   ResponderId  { nonce, ciphertext = AEAD(k_r2i, nonce, inner) }
-/// T3  Initiator → Responder   InitiatorId  { nonce, ciphertext = AEAD(k_i2r, nonce, inner) }
+/// T2  Initiator → Responder   InitiatorKC  { nonce, ciphertext = AEAD(k_i2r, nonce, INITIATOR_KC_PLAINTEXT) }
+/// T3  Responder → Initiator   ResponderId  { nonce, ciphertext = AEAD(k_r2i, nonce, inner) }
+/// T4  Initiator → Responder   InitiatorId  { nonce, ciphertext = AEAD(k_i2r, nonce, inner) }
 /// ```
+///
+/// 0.3.3 diff from 0.3.1: T2 `InitiatorKC` is new. It forces the initiator
+/// to prove possession of the SPAKE2-derived `k_i2r` (i.e. correct PIN)
+/// *before* the responder sends its AEAD-encrypted identity. This closes
+/// the online brute-force budget-bypass where a 0.3.1 attacker could
+/// disconnect after T2 and brute-force the captured ResponderId offline
+/// without ever triggering an AEAD-failure counter increment.
 ///
 /// No plaintext identity fields on the pairing channel: `device_id` and
 /// fingerprint appear only inside the AEAD-protected `inner` (see
@@ -349,9 +357,14 @@ pub enum PairingMessage {
     PairRequest { spake_msg: Vec<u8> },
     /// T1 — answering SPAKE2 element from the responder. No identity bytes.
     PairResponse { spake_msg: Vec<u8> },
-    /// T2 — responder's AEAD-wrapped identity, decryptable under `k_r2i`.
+    /// T2 (wire 0.3.3) — initiator's AEAD-wrapped key-confirmation frame.
+    /// Plaintext is the fixed `INITIATOR_KC_PLAINTEXT` constant; the tag
+    /// authenticates the (k_i2r, nonce, plaintext) triple. Responder bumps
+    /// the H1 AEAD-failure counter on tag failure.
+    InitiatorKC { nonce: Vec<u8>, ciphertext: Vec<u8> },
+    /// T3 — responder's AEAD-wrapped identity, decryptable under `k_r2i`.
     ResponderId { nonce: Vec<u8>, ciphertext: Vec<u8> },
-    /// T3 — initiator's AEAD-wrapped identity, decryptable under `k_i2r`.
+    /// T4 — initiator's AEAD-wrapped identity, decryptable under `k_i2r`.
     InitiatorId { nonce: Vec<u8>, ciphertext: Vec<u8> },
 }
 

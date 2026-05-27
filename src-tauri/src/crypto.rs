@@ -56,6 +56,19 @@ const RESPONDER_LABEL: &[u8] = b"responder";
 const HKDF_INFO_I2R: &[u8] = b"clustercut-pair-v1 i2r";
 const HKDF_INFO_R2I: &[u8] = b"clustercut-pair-v1 r2i";
 
+/// Fixed plaintext for the T2 `InitiatorKC` AEAD frame (wire 0.3.3). The
+/// initiator encrypts this byte string under `k_i2r`; the responder
+/// decrypts under its own `k_i2r` and treats a tag failure as a wrong-PIN
+/// or active-MITM event (`record_pairing_aead_failure`). The plaintext
+/// itself is not a secret — the security comes from the AEAD tag binding
+/// the (sub-key, nonce, plaintext) triple.
+///
+/// The `v2` in the byte string is the *KC-generation* tag (v1 = pre-KC
+/// wire 0.3.0/0.3.1; v2 = this and any future KC-bearing wire); it is
+/// *not* the dotted wire version, so a future minor wire bump that keeps
+/// the same KC shape can leave it unchanged.
+pub const INITIATOR_KC_PLAINTEXT: &[u8] = b"clustercut-pair-v2-init-kc";
+
 /// SHA-256 of `domain || "initiator" || spake_msg_i || "responder" || spake_msg_r`.
 /// The fixed labels act as both role tags and component separators.
 pub fn pairing_transcript(spake_msg_i: &[u8], spake_msg_r: &[u8]) -> [u8; 32] {
@@ -195,6 +208,37 @@ mod tests {
         let ct = pair_aead_encrypt(&key, &nonce, plaintext).unwrap();
         let pt = pair_aead_decrypt(&key, &nonce, &ct).unwrap();
         assert_eq!(pt, plaintext);
+    }
+
+    #[test]
+    fn initiator_kc_round_trip_with_matching_pin() {
+        let (msg_i, msg_r, k_init, k_resp) = run_spake2_pair("hello", "hello");
+        assert_eq!(k_init, k_resp);
+        let t = pairing_transcript(&msg_i, &msg_r);
+        let (k_i2r_init, _) = derive_pair_subkeys(&k_init, &t).unwrap();
+        let (k_i2r_resp, _) = derive_pair_subkeys(&k_resp, &t).unwrap();
+
+        let nonce = fresh_pair_nonce();
+        let ct = pair_aead_encrypt(&k_i2r_init, &nonce, INITIATOR_KC_PLAINTEXT).unwrap();
+        let pt = pair_aead_decrypt(&k_i2r_resp, &nonce, &ct).unwrap();
+        assert_eq!(pt, INITIATOR_KC_PLAINTEXT);
+    }
+
+    #[test]
+    fn initiator_kc_fails_closed_under_wrong_pin() {
+        // The whole point of T2 InitiatorKC: a wrong-PIN attacker must not be
+        // able to produce a ciphertext the responder will accept. Decrypt MUST
+        // fail before the responder reveals its T3 ResponderId.
+        let (msg_i, msg_r, k_init, k_resp) = run_spake2_pair("attacker-pin", "real-pin");
+        let t = pairing_transcript(&msg_i, &msg_r);
+        let (k_i2r_init, _) = derive_pair_subkeys(&k_init, &t).unwrap();
+        let (k_i2r_resp, _) = derive_pair_subkeys(&k_resp, &t).unwrap();
+        assert_ne!(k_i2r_init, k_i2r_resp);
+
+        let nonce = fresh_pair_nonce();
+        let ct = pair_aead_encrypt(&k_i2r_init, &nonce, INITIATOR_KC_PLAINTEXT).unwrap();
+        let result = pair_aead_decrypt(&k_i2r_resp, &nonce, &ct);
+        assert!(result.is_err(), "wrong-PIN InitiatorKC must AEAD-fail closed");
     }
 
     #[test]
