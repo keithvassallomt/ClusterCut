@@ -1780,22 +1780,62 @@ async fn start_pairing(
     // authenticated responder identity from T3 is the canonical id used for
     // storage below.
     let is_manual_pair = peer_addr.is_some();
-    let peer_addr = if let Some(addr_str) = peer_addr {
-        if let Ok(sock) = addr_str.parse::<std::net::SocketAddr>() {
+    let (peer_addr, discovered_proto_version, discovered_hostname) = if let Some(addr_str) = peer_addr {
+        let sock = if let Ok(sock) = addr_str.parse::<std::net::SocketAddr>() {
             sock
         } else if let Ok(ip) = addr_str.parse::<std::net::IpAddr>() {
             std::net::SocketAddr::new(ip, 4654)
         } else {
             return Err(format!("Invalid peer address: {}", addr_str));
-        }
+        };
+        // Add-Remote path: no mDNS data, so we can't pre-check the proto.
+        // Fall through to the wire-level failure if the remote is incompatible.
+        (sock, None, None)
     } else {
         let peers = state.get_peers();
         if let Some(peer) = peers.get(&peer_id) {
-            std::net::SocketAddr::new(peer.ip, peer.port)
+            (
+                std::net::SocketAddr::new(peer.ip, peer.port),
+                peer.protocol_version.clone(),
+                Some(peer.hostname.clone()),
+            )
         } else {
             return Err("Peer not found".to_string());
         }
     };
+
+    // Pre-flight version check for mDNS-discovered peers. If the peer's
+    // advertised proto is missing or below the floor this build can talk
+    // to, emit `peer-incompatible` so the existing "Peer needs updating"
+    // modal fires and abort before opening the TCP socket. For the manual
+    // Add-Remote path (no discovered proto), we fall through and let the
+    // wire-level failure handle it — the user explicitly typed the address
+    // and we have no advance signal.
+    if !is_manual_pair {
+        if !is_protocol_compatible(discovered_proto_version.as_deref()) {
+            let hostname = discovered_hostname.unwrap_or_else(|| peer_id.clone());
+            tracing::warn!(
+                "Refusing to pair with {} ({}): proto {:?} below floor.",
+                hostname,
+                peer_id,
+                discovered_proto_version
+            );
+            let _ = app_handle.emit(
+                "peer-incompatible",
+                serde_json::json!({
+                    "id": peer_id,
+                    "hostname": hostname,
+                }),
+            );
+            // Also surface to the pair-flow modal so the in-progress join
+            // doesn't sit on a spinner forever waiting for ClusterInfo.
+            let _ = app_handle.emit(
+                "pairing-failed",
+                format!("{} is running an older version of ClusterCut and can't pair with this device. Please upgrade it.", hostname),
+            );
+            return Err("Peer protocol version is below the minimum compatible floor.".to_string());
+        }
+    }
 
     let local_id_raw = { state.local_device_id.lock().unwrap().clone() };
     let local_id = crate::protocol::truncate_device_id(&local_id_raw);
