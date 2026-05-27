@@ -1777,7 +1777,7 @@ async fn start_pairing(
     // peers map) and manually-added remotes (caller passes the IP[:port]
     // directly, because no mDNS observation has populated the map). When
     // peer_addr is supplied, peer_id is informational only — the SPAKE2-
-    // authenticated responder identity from T2 is the canonical id used for
+    // authenticated responder identity from T3 is the canonical id used for
     // storage below.
     let is_manual_pair = peer_addr.is_some();
     let peer_addr = if let Some(addr_str) = peer_addr {
@@ -1848,9 +1848,32 @@ async fn start_pairing(
     let transcript = crypto::pairing_transcript(&spake_msg_i, &spake_msg_r);
     let (k_i2r, k_r2i) = crypto::derive_pair_subkeys(&session_key, &transcript)
         .map_err(|e| format!("HKDF sub-key derivation failed: {}", e))?;
-    tracing::info!("SPAKE2 complete (initiator); awaiting ResponderId (T2).");
+    tracing::info!("SPAKE2 complete (initiator); sending InitiatorKC (T2).");
 
-    // T2 — responder's AEAD-wrapped identity (device_id + cert fingerprint).
+    // T2 (wire 0.3.2) — explicit key-confirmation under k_i2r. The responder
+    // refuses to send T3 (ResponderId) until this AEAD-verifies. Encrypting
+    // the fixed KC_PLAINTEXT here is what proves to the responder that we
+    // derived the same SPAKE2 key (i.e. we have the right PIN); a wrong-PIN
+    // attacker can't forge a tag that decrypts under the responder's k_i2r.
+    let nonce_kc = crypto::fresh_pair_nonce();
+    let ciphertext_kc = crypto::pair_aead_encrypt(
+        &k_i2r,
+        &nonce_kc,
+        crypto::INITIATOR_KC_PLAINTEXT,
+    )
+    .map_err(|e| format!("InitiatorKC AEAD encrypt failed: {}", e))?;
+    let t2 = PairingMessage::InitiatorKC {
+        nonce: nonce_kc.to_vec(),
+        ciphertext: ciphertext_kc,
+    };
+    if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &t2).await {
+        let _ = app_handle.emit("pairing-failed", "Pairing connection failed. Please try again.");
+        return Err(format!("Failed to send InitiatorKC: {}", e));
+    }
+    tracing::info!("InitiatorKC sent (initiator); awaiting ResponderId (T3).");
+
+    // T3 (wire 0.3.2) — responder's AEAD-wrapped identity (device_id + cert
+    // fingerprint). Sent only after the responder verifies our T2 KC frame.
     let (nonce_r, ciphertext_r) = match crate::transport::read_pairing_frame(&mut stream).await {
         Ok(PairingMessage::ResponderId { nonce, ciphertext }) => (nonce, ciphertext),
         Ok(other) => {
@@ -1877,7 +1900,7 @@ async fn start_pairing(
     let r_inner: crate::protocol::PairIdInner = serde_json::from_slice(&r_inner_bytes)
         .map_err(|e| format!("Malformed ResponderId inner payload: {}", e))?;
     let crate::protocol::PairIdInner { device_id: responder_device_id, fingerprint: responder_fingerprint } = r_inner;
-    // Apply the same canonicalisation the responder uses on its T3 receive
+    // Apply the same canonicalisation the responder uses on its T4 receive
     // path, so both sides key on identical bytes.
     let responder_device_id = crate::protocol::truncate_device_id(&responder_device_id);
     tracing::info!(
@@ -1885,7 +1908,7 @@ async fn start_pairing(
         responder_device_id
     );
 
-    // T3 — initiator's AEAD-wrapped identity. Build, encrypt, send.
+    // T4 (wire 0.3.2) — initiator's AEAD-wrapped identity. Build, encrypt, send.
     let local_fp = transport.local_fingerprint();
     let i_inner = crate::protocol::PairIdInner {
         device_id: local_id.clone(),
@@ -1896,20 +1919,20 @@ async fn start_pairing(
     let nonce_i = crypto::fresh_pair_nonce();
     let ciphertext_i = crypto::pair_aead_encrypt(&k_i2r, &nonce_i, &i_inner_bytes)
         .map_err(|e| format!("InitiatorId AEAD encrypt failed: {}", e))?;
-    let t3 = PairingMessage::InitiatorId {
+    let t4 = PairingMessage::InitiatorId {
         nonce: nonce_i.to_vec(),
         ciphertext: ciphertext_i,
     };
-    if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &t3).await {
+    if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &t4).await {
         let _ = app_handle.emit("pairing-failed", "Failed to complete pairing. Please try again.");
         return Err(format!("Failed to send InitiatorId: {}", e));
     }
 
-    // Pin the responder's fingerprint locally NOW (after sending T3, before
+    // Pin the responder's fingerprint locally NOW (after sending T4, before
     // the QUIC step that depends on it). Touching state in this order keeps
     // the pinning visible to a concurrent inbound mTLS verifier on this side.
     //
-    // We key on `responder_device_id` (the SPAKE2-authenticated id from T2),
+    // We key on `responder_device_id` (the SPAKE2-authenticated id from T3),
     // not the caller-supplied `peer_id`. For mDNS-discovered peers the two
     // are equal because mDNS announces the same device_id; for the manual
     // remote-add path `peer_id` is unknown ahead of time, so the authenticated
@@ -1949,11 +1972,11 @@ async fn start_pairing(
         let _ = app_handle.emit("peer-update", &pinned);
     }
 
-    // T4 — wait for the responder to finish processing T3 (pinning our
-    // fingerprint) and close its side of the TCP socket. Reading to EOF on
-    // a connection whose write half we've shut down gives the initiator a
-    // deterministic "responder is ready to accept our QUIC" signal, which
-    // is what unblocks the post-pairing mTLS handshake at T5.
+    // T5 (wire 0.3.2) — wait for the responder to finish processing T4
+    // (pinning our fingerprint) and close its side of the TCP socket.
+    // Reading to EOF on a connection whose write half we've shut down gives
+    // the initiator a deterministic "responder is ready to accept our QUIC"
+    // signal, which is what unblocks the post-pairing mTLS handshake.
     let _ = stream.shutdown().await;
     let mut sink = Vec::new();
     let _ = tokio::time::timeout(
@@ -1962,9 +1985,9 @@ async fn start_pairing(
     )
     .await;
 
-    // T5–T7 — post-pairing cluster bootstrap over QUIC/mTLS. The pairing
-    // channel did one job (pin fingerprints); cluster_id / known_peers /
-    // network_name now ride the already-authenticated QUIC channel.
+    // Post-pairing cluster bootstrap over QUIC/mTLS. The pairing channel did
+    // one job (pin fingerprints); cluster_id / known_peers / network_name now
+    // ride the already-authenticated QUIC channel.
     let (info_tx, info_rx) = tokio::sync::oneshot::channel::<crate::protocol::ClusterInfo>();
     {
         let mut slot = state.pending_cluster_info.lock().unwrap();
@@ -2019,7 +2042,7 @@ async fn start_pairing(
             if peer.id == responder_device_id {
                 continue;
             }
-            // The responder added us during T3 and includes our own record
+            // The responder added us during T4 and includes our own record
             // in its known_peers snapshot — but from the responder's vantage
             // point we live at whatever source IP they saw (e.g. a WireGuard
             // tunnel address), with a placeholder hostname. Re-importing that
