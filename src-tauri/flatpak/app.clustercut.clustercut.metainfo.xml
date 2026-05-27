@@ -64,6 +64,18 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.3" date="2026-05-27">
+      <description>
+        <p>Stronger pairing security, an on-demand pause button for pairing, and clearer feedback when a peer is on an older version.</p>
+        <ul>
+          <li>New pairing-pause button in the toolbar — click it to stop accepting new pairing requests when you don't want anyone joining your cluster. The same button also lights up red when pairing has been automatically paused after too many failed attempts in a row</li>
+          <li>Pairing security has been further strengthened — a device trying to join your cluster must now prove it knows the right PIN before your device sends any encrypted reply, so someone trying random PINs can no longer gather data from your device to crack them later</li>
+          <li>Trying to pair with a device on an older version of ClusterCut now shows the "please upgrade" message right away instead of waiting for the pairing attempt to time out. The amber warning indicator next to a peer's name also now correctly fires for any peer running an older release</li>
+          <li>Fixed: the Settings tab was quietly saving the same settings once per second in the background even when nothing had changed</li>
+          <li>Pairing new devices requires both sides to be on 0.3.3 or later — already-paired devices continue to work as before, even if some are still on older versions</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.2" date="2026-05-23">
       <description>
         <p>Easier pairing over VPN / restrictive networks, a clearer PIN, and a one-click history wipe.</p>
