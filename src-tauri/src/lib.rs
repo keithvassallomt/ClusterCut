@@ -2170,9 +2170,70 @@ async fn handle_pairing_connection(
             return;
         }
     };
-    tracing::info!("SPAKE2 complete (responder) for {}; sending ResponderId (T2).", peer_addr);
+    tracing::info!(
+        "SPAKE2 complete (responder) for {}; awaiting InitiatorKC (T2).",
+        peer_addr
+    );
 
-    // Refuse to advance to T2 if we have no cluster identity to bind to.
+    // T2 (wire 0.3.2) — initiator's key-confirmation frame. Must AEAD-verify
+    // under our k_i2r before we reveal any encrypted identity material.
+    // A wrong-PIN attacker can't produce a tag the responder will accept, so
+    // tag failures here count toward the H1 lockout exactly like a wrong T3
+    // would have in 0.3.1.
+    let (kc_nonce_vec, kc_ciphertext) = match crate::transport::read_pairing_frame(&mut stream).await {
+        Ok(PairingMessage::InitiatorKC { nonce, ciphertext }) => (nonce, ciphertext),
+        Ok(other) => {
+            // Wrong variant — almost certainly a 0.3.1 client sending its old
+            // `InitiatorId` at the T2 slot. Don't bump the AEAD counter, just
+            // log + close. The pre-flight version check in start_pairing will
+            // catch this for the initiator side; here we just hang up cleanly.
+            log_pairing_failure(&state, peer_addr, &format!("expected InitiatorKC, got {:?}", other));
+            return;
+        }
+        Err(e) => {
+            log_pairing_failure(&state, peer_addr, &format!("read InitiatorKC failed: {}", e));
+            return;
+        }
+    };
+    let kc_nonce_arr: [u8; 12] = match kc_nonce_vec.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            record_pairing_aead_failure(&state, &app_handle, peer_addr, "InitiatorKC nonce length");
+            return;
+        }
+    };
+    match crypto::pair_aead_decrypt(&k_i2r, &kc_nonce_arr, &kc_ciphertext) {
+        Ok(plaintext) => {
+            // Defence in depth: also require the plaintext byte string match,
+            // so a future variant of the wire that re-uses the InitiatorKC
+            // shape can't be replayed against a 0.3.2 responder.
+            if plaintext.as_slice() != crypto::INITIATOR_KC_PLAINTEXT {
+                record_pairing_aead_failure(
+                    &state,
+                    &app_handle,
+                    peer_addr,
+                    "InitiatorKC plaintext mismatch",
+                );
+                return;
+            }
+        }
+        Err(e) => {
+            // The big one: wrong PIN or active MITM forging T2. Counter++.
+            record_pairing_aead_failure(
+                &state,
+                &app_handle,
+                peer_addr,
+                &format!("InitiatorKC AEAD decrypt failed: {}", e),
+            );
+            return;
+        }
+    }
+    tracing::info!(
+        "InitiatorKC verified for {}; sending ResponderId (T3).",
+        peer_addr
+    );
+
+    // Refuse to advance to T3 if we have no cluster identity to bind to.
     // Responding here would leak a valid ResponderId for a half-built
     // cluster; better to abort early.
     if state.cluster_id.lock().unwrap().is_empty() {
@@ -2180,8 +2241,9 @@ async fn handle_pairing_connection(
         return;
     }
 
-    // T2 — responder's AEAD-wrapped identity, decryptable by the initiator
-    // only if it derived the same SPAKE2 key (i.e. correct PIN).
+    // T3 (wire 0.3.2) — responder's AEAD-wrapped identity, decryptable by
+    // the initiator only if it derived the same SPAKE2 key (i.e. correct
+    // PIN). Sent only after T2 InitiatorKC has been verified.
     let r_inner = crate::protocol::PairIdInner {
         device_id: local_id.clone(),
         fingerprint: transport.local_fingerprint(),
@@ -2210,7 +2272,7 @@ async fn handle_pairing_connection(
         return;
     }
 
-    // T3 — initiator's AEAD-wrapped identity.
+    // T4 (wire 0.3.2) — initiator's AEAD-wrapped identity.
     let (nonce_i_vec, ciphertext_i) = match crate::transport::read_pairing_frame(&mut stream).await {
         Ok(PairingMessage::InitiatorId { nonce, ciphertext }) => (nonce, ciphertext),
         Ok(other) => {
@@ -2309,8 +2371,9 @@ async fn handle_pairing_connection(
     // connections.
     gossip_peer(&pinned, &state, &transport, Some(peer_addr));
 
-    // T4 — drop the stream. The kernel closes the TCP connection, which
-    // the initiator reads as the "responder is ready for QUIC" signal.
+    // T5 (wire 0.3.2) — drop the stream. The kernel closes the TCP
+    // connection, which the initiator reads as the "responder is ready
+    // for QUIC" signal.
     drop(stream);
 }
 
