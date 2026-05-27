@@ -1496,7 +1496,10 @@ async fn probe_ip(
 /// force-replaced via UAC on first launch instead of silently passing the
 /// "looks correct" check. v0.3 widens to include explicit outbound + scope;
 /// v0.3.1 adds TCP/4654 inbound + outbound for the new plaintext-TCP
-/// pairing channel that runs alongside QUIC on the same port.
+/// pairing channel that runs alongside QUIC on the same port. Bump this
+/// sentinel only when the firewall rule's port/protocol/scope shape
+/// changes — NOT for every app or wire-protocol bump. Wire 0.3.2 reuses
+/// the same TCP/4654 + UDP/4654 pair, so the sentinel stays at v0.3.1.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const FIREWALL_RULE_SENTINEL: &str = "ClusterCut sync v0.3.1 (UDP+TCP pair)";
 
