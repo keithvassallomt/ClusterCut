@@ -1732,6 +1732,34 @@ fn rearm_pairing(state: tauri::State<'_, AppState>, app_handle: tauri::AppHandle
     Ok(())
 }
 
+/// Read the user's "accept inbound pairing" flag. The pairing listener is
+/// gated on this flag AND on `pairing_locked_out` — both must be clear for
+/// inbound SPAKE to proceed. See issue #16.
+#[tauri::command]
+fn get_pairing_accept(state: tauri::State<'_, AppState>) -> bool {
+    state.settings.lock().unwrap().pairing_accept_enabled
+}
+
+/// Write the user's "accept inbound pairing" flag, persist the change, and
+/// emit `pairing-accept-changed` so any subscribed UI surface stays in sync.
+/// Does NOT touch `pairing_locked_out` — abuse defence and user intent are
+/// orthogonal. See issue #16.
+#[tauri::command]
+fn set_pairing_accept(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) {
+    {
+        let mut s = state.settings.lock().unwrap();
+        s.pairing_accept_enabled = enabled;
+    }
+    let snapshot = state.settings.lock().unwrap().clone();
+    crate::storage::save_settings(&app_handle, &snapshot);
+    let _ = app_handle.emit("pairing-accept-changed", enabled);
+    tracing::info!("Pairing accept set to {} by user.", enabled);
+}
+
 #[tauri::command]
 async fn start_pairing(
     peer_id: String,
@@ -3464,6 +3492,8 @@ pub fn run() {
             dismiss_legacy_peer_banner,
             is_pairing_locked_out,
             rearm_pairing,
+            get_pairing_accept,
+            set_pairing_accept,
         ])
 
         .on_window_event(|window, event| {
