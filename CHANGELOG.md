@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Header-bar toggle to pause inbound pairing on demand. Green unlock = accepting, gray lock = paused. Setting persists across restarts. The same icon also turns rose when the existing brute-force lockout trips, so the header reflects the listener's actual state. Thanks to @mdunphy for the request (#16).
+
 ### Fixed
 - Settings tab no longer spams `save_settings` once per second in the background. The autosave effect was re-firing on every post-save state sync because `initialSettings` got a fresh object reference each time, even when its value was unchanged. Now guarded by a value-based dirty check. Thanks to @mdunphy for the report (#15).
 
