@@ -2097,14 +2097,14 @@ fn record_pairing_aead_failure(
     }
 }
 
-/// Responder side of the TCP pairing flow (WIRE-PROTOCOL-0.3.1).
+/// Responder side of the TCP pairing flow (wire 0.3.2).
 ///
-/// Drives T0 (PairRequest) → T1 (PairResponse) → T2 (ResponderId, AEAD) →
-/// T3 (InitiatorId, AEAD) to completion. After T3 decrypts cleanly, the
-/// responder pins the initiator's fingerprint and gossips the new peer to
-/// the rest of the cluster. The TCP socket then closes — the initiator
-/// uses the close as its signal to open QUIC for the post-pairing
-/// `ClusterInfo` exchange (T5–T7).
+/// Drives T0 (PairRequest) → T1 (PairResponse) → T2 (InitiatorKC, AEAD) →
+/// T3 (ResponderId, AEAD) → T4 (InitiatorId, AEAD) to completion. After
+/// T4 decrypts cleanly, the responder pins the initiator's fingerprint
+/// and gossips the new peer to the rest of the cluster. The TCP socket
+/// then closes at T5 — the initiator uses the close as its signal to
+/// open QUIC for the post-pairing `ClusterInfo` exchange.
 async fn handle_pairing_connection(
     mut stream: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
@@ -2177,9 +2177,10 @@ async fn handle_pairing_connection(
 
     // T2 (wire 0.3.2) — initiator's key-confirmation frame. Must AEAD-verify
     // under our k_i2r before we reveal any encrypted identity material.
-    // A wrong-PIN attacker can't produce a tag the responder will accept, so
-    // tag failures here count toward the H1 lockout exactly like a wrong T3
-    // would have in 0.3.1.
+    // A wrong-PIN attacker can't produce a tag the responder will accept;
+    // tag failures, malformed nonces, and plaintext mismatches all count
+    // toward the H1 lockout, the same way a wrong T3 InitiatorId did in
+    // 0.3.1.
     let (kc_nonce_vec, kc_ciphertext) = match crate::transport::read_pairing_frame(&mut stream).await {
         Ok(PairingMessage::InitiatorKC { nonce, ciphertext }) => (nonce, ciphertext),
         Ok(other) => {
@@ -2198,6 +2199,8 @@ async fn handle_pairing_connection(
     let kc_nonce_arr: [u8; 12] = match kc_nonce_vec.as_slice().try_into() {
         Ok(arr) => arr,
         Err(_) => {
+            // Malformed nonce — treat as a tampered/garbage frame and
+            // count it toward the lockout, same as any AEAD failure.
             record_pairing_aead_failure(&state, &app_handle, peer_addr, "InitiatorKC nonce length");
             return;
         }
@@ -2263,11 +2266,11 @@ async fn handle_pairing_connection(
             return;
         }
     };
-    let t2 = PairingMessage::ResponderId {
+    let t3 = PairingMessage::ResponderId {
         nonce: nonce_r.to_vec(),
         ciphertext: ciphertext_r,
     };
-    if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &t2).await {
+    if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &t3).await {
         log_pairing_failure(&state, peer_addr, &format!("send ResponderId failed: {}", e));
         return;
     }
@@ -2297,7 +2300,7 @@ async fn handle_pairing_connection(
         Ok(b) => b,
         Err(e) => {
             // The big one: AEAD-tag verify failed. Either the PIN was wrong
-            // (online brute force) or an active MITM tried to forge T3. Bump
+            // (online brute force) or an active MITM tried to forge T4. Bump
             // the global lockout counter — see §H1.
             record_pairing_aead_failure(&state, &app_handle, peer_addr, &format!("InitiatorId AEAD decrypt failed: {}", e));
             return;
@@ -2366,7 +2369,7 @@ async fn handle_pairing_connection(
     state.add_peer(pinned.clone());
     let _ = app_handle.emit("peer-update", &pinned);
 
-    // Gossip the new peer to the rest of the cluster ONLY after T3 succeeds —
+    // Gossip the new peer to the rest of the cluster ONLY after T4 succeeds —
     // existing mTLS peers need the new fingerprint to accept its inbound
     // connections.
     gossip_peer(&pinned, &state, &transport, Some(peer_addr));
