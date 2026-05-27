@@ -327,7 +327,7 @@ pub enum Message {
 /// adds complexity without security. Once pairing completes, all further
 /// traffic moves to mutually-authenticated QUIC (steady-state `Message`).
 ///
-/// Wire-protocol 0.3.2 (this file is the sole spec):
+/// Wire-protocol 0.3.3 (this file is the sole spec):
 ///
 /// ```text
 /// T0  Initiator → Responder   PairRequest  { spake_msg }
@@ -337,7 +337,7 @@ pub enum Message {
 /// T4  Initiator → Responder   InitiatorId  { nonce, ciphertext = AEAD(k_i2r, nonce, inner) }
 /// ```
 ///
-/// 0.3.2 diff from 0.3.1: T2 `InitiatorKC` is new. It forces the initiator
+/// 0.3.3 diff from 0.3.1: T2 `InitiatorKC` is new. It forces the initiator
 /// to prove possession of the SPAKE2-derived `k_i2r` (i.e. correct PIN)
 /// *before* the responder sends its AEAD-encrypted identity. This closes
 /// the online brute-force budget-bypass where a 0.3.1 attacker could
@@ -357,7 +357,7 @@ pub enum PairingMessage {
     PairRequest { spake_msg: Vec<u8> },
     /// T1 — answering SPAKE2 element from the responder. No identity bytes.
     PairResponse { spake_msg: Vec<u8> },
-    /// T2 (wire 0.3.2) — initiator's AEAD-wrapped key-confirmation frame.
+    /// T2 (wire 0.3.3) — initiator's AEAD-wrapped key-confirmation frame.
     /// Plaintext is the fixed `INITIATOR_KC_PLAINTEXT` constant; the tag
     /// authenticates the (k_i2r, nonce, plaintext) triple. Responder bumps
     /// the H1 AEAD-failure counter on tag failure.

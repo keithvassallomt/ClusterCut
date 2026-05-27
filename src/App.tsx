@@ -49,7 +49,7 @@ interface Peer {
   protocol_version?: string | null;
 }
 
-const MIN_COMPATIBLE_PROTOCOL: [number, number, number] = [0, 3, 2];
+const MIN_COMPATIBLE_PROTOCOL: [number, number, number] = [0, 3, 3];
 
 function parseProtocolVersion(v: string | null | undefined): [number, number, number] | null {
   if (!v) return null;

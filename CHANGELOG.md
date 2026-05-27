@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Header-bar toggle to pause inbound pairing on demand. Green unlock = accepting, gray lock = paused. Setting persists across restarts. The same icon also turns rose when the existing brute-force lockout trips, so the header reflects the listener's actual state. Thanks to @mdunphy for the request (#16).
 
 ### Changed
-- mDNS `proto` floor moves to `0.3.2` for the new pairing wire format. 0.3.1 peers surface in the existing "please upgrade" UI flow (per-peer amber-triangle indicator + modal on send). Frontend `MIN_COMPATIBLE_PROTOCOL` brought into sync with the backend floor (was stale at 0.3.0 since the 0.3.0 → 0.3.1 break).
+- mDNS `proto` floor moves to `0.3.3` for the new pairing wire format. 0.3.1 peers surface in the existing "please upgrade" UI flow (per-peer amber-triangle indicator + modal on send). Frontend `MIN_COMPATIBLE_PROTOCOL` brought into sync with the backend floor (was stale at 0.3.0 since the 0.3.0 → 0.3.1 break). Wire and app/release versions are independent trackers — app 0.3.2 shipped with wire 0.3.1, so this is the next wire bump.
 
 ### Fixed
 - Settings tab no longer spams `save_settings` once per second in the background. The autosave effect was re-firing on every post-save state sync because `initialSettings` got a fresh object reference each time, even when its value was unchanged. Now guarded by a value-based dirty check. Thanks to @mdunphy for the report (#15).

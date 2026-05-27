@@ -56,12 +56,17 @@ const RESPONDER_LABEL: &[u8] = b"responder";
 const HKDF_INFO_I2R: &[u8] = b"clustercut-pair-v1 i2r";
 const HKDF_INFO_R2I: &[u8] = b"clustercut-pair-v1 r2i";
 
-/// Fixed plaintext for the T2 `InitiatorKC` AEAD frame (wire 0.3.2). The
+/// Fixed plaintext for the T2 `InitiatorKC` AEAD frame (wire 0.3.3). The
 /// initiator encrypts this byte string under `k_i2r`; the responder
 /// decrypts under its own `k_i2r` and treats a tag failure as a wrong-PIN
 /// or active-MITM event (`record_pairing_aead_failure`). The plaintext
 /// itself is not a secret — the security comes from the AEAD tag binding
 /// the (sub-key, nonce, plaintext) triple.
+///
+/// The `v2` in the byte string is the *KC-generation* tag (v1 = pre-KC
+/// wire 0.3.0/0.3.1; v2 = this and any future KC-bearing wire); it is
+/// *not* the dotted wire version, so a future minor wire bump that keeps
+/// the same KC shape can leave it unchanged.
 pub const INITIATOR_KC_PLAINTEXT: &[u8] = b"clustercut-pair-v2-init-kc";
 
 /// SHA-256 of `domain || "initiator" || spake_msg_i || "responder" || spake_msg_r`.

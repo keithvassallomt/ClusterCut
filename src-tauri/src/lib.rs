@@ -1082,12 +1082,12 @@ fn parse_protocol_version(s: &str) -> Option<(u32, u32, u32)> {
 /// the property at all (older builds).
 pub fn is_protocol_compatible(version: Option<&str>) -> bool {
     let Some(v) = version else { return false };
-    // 0.3.2 break: the pairing-channel wire format requires the new T2
+    // 0.3.3 break: the pairing-channel wire format requires the new T2
     // `InitiatorKC` frame; 0.3.1 initiators don't send it and 0.3.1
     // responders don't read it. Bumping the floor surfaces 0.3.1 peers
     // as incompatible in the same UI flow used for the 0.2.x → 0.3.0
     // and 0.3.0 → 0.3.1 breaks.
-    parse_protocol_version(v).map_or(false, |parsed| parsed >= (0, 3, 2))
+    parse_protocol_version(v).map_or(false, |parsed| parsed >= (0, 3, 3))
 }
 
 /// Log a send failure and, if the destination peer is on an incompatible
@@ -1498,7 +1498,7 @@ async fn probe_ip(
 /// v0.3.1 adds TCP/4654 inbound + outbound for the new plaintext-TCP
 /// pairing channel that runs alongside QUIC on the same port. Bump this
 /// sentinel only when the firewall rule's port/protocol/scope shape
-/// changes — NOT for every app or wire-protocol bump. Wire 0.3.2 reuses
+/// changes — NOT for every app or wire-protocol bump. Wire 0.3.3 reuses
 /// the same TCP/4654 + UDP/4654 pair, so the sentinel stays at v0.3.1.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const FIREWALL_RULE_SENTINEL: &str = "ClusterCut sync v0.3.1 (UDP+TCP pair)";
@@ -1889,7 +1889,7 @@ async fn start_pairing(
         .map_err(|e| format!("HKDF sub-key derivation failed: {}", e))?;
     tracing::info!("SPAKE2 complete (initiator); sending InitiatorKC (T2).");
 
-    // T2 (wire 0.3.2) — explicit key-confirmation under k_i2r. The responder
+    // T2 (wire 0.3.3) — explicit key-confirmation under k_i2r. The responder
     // refuses to send T3 (ResponderId) until this AEAD-verifies. Encrypting
     // the fixed KC_PLAINTEXT here is what proves to the responder that we
     // derived the same SPAKE2 key (i.e. we have the right PIN); a wrong-PIN
@@ -1911,7 +1911,7 @@ async fn start_pairing(
     }
     tracing::info!("InitiatorKC sent (initiator); awaiting ResponderId (T3).");
 
-    // T3 (wire 0.3.2) — responder's AEAD-wrapped identity (device_id + cert
+    // T3 (wire 0.3.3) — responder's AEAD-wrapped identity (device_id + cert
     // fingerprint). Sent only after the responder verifies our T2 KC frame.
     let (nonce_r, ciphertext_r) = match crate::transport::read_pairing_frame(&mut stream).await {
         Ok(PairingMessage::ResponderId { nonce, ciphertext }) => (nonce, ciphertext),
@@ -1947,7 +1947,7 @@ async fn start_pairing(
         responder_device_id
     );
 
-    // T4 (wire 0.3.2) — initiator's AEAD-wrapped identity. Build, encrypt, send.
+    // T4 (wire 0.3.3) — initiator's AEAD-wrapped identity. Build, encrypt, send.
     let local_fp = transport.local_fingerprint();
     let i_inner = crate::protocol::PairIdInner {
         device_id: local_id.clone(),
@@ -2011,7 +2011,7 @@ async fn start_pairing(
         let _ = app_handle.emit("peer-update", &pinned);
     }
 
-    // T5 (wire 0.3.2) — wait for the responder to finish processing T4
+    // T5 (wire 0.3.3) — wait for the responder to finish processing T4
     // (pinning our fingerprint) and close its side of the TCP socket.
     // Reading to EOF on a connection whose write half we've shut down gives
     // the initiator a deterministic "responder is ready to accept our QUIC"
@@ -2159,7 +2159,7 @@ fn record_pairing_aead_failure(
     }
 }
 
-/// Responder side of the TCP pairing flow (wire 0.3.2).
+/// Responder side of the TCP pairing flow (wire 0.3.3).
 ///
 /// Drives T0 (PairRequest) → T1 (PairResponse) → T2 (InitiatorKC, AEAD) →
 /// T3 (ResponderId, AEAD) → T4 (InitiatorId, AEAD) to completion. After
@@ -2237,7 +2237,7 @@ async fn handle_pairing_connection(
         peer_addr
     );
 
-    // T2 (wire 0.3.2) — initiator's key-confirmation frame. Must AEAD-verify
+    // T2 (wire 0.3.3) — initiator's key-confirmation frame. Must AEAD-verify
     // under our k_i2r before we reveal any encrypted identity material.
     // A wrong-PIN attacker can't produce a tag the responder will accept;
     // tag failures, malformed nonces, and plaintext mismatches all count
@@ -2271,7 +2271,7 @@ async fn handle_pairing_connection(
         Ok(plaintext) => {
             // Defence in depth: also require the plaintext byte string match,
             // so a future variant of the wire that re-uses the InitiatorKC
-            // shape can't be replayed against a 0.3.2 responder.
+            // shape can't be replayed against a 0.3.3 responder.
             if plaintext.as_slice() != crypto::INITIATOR_KC_PLAINTEXT {
                 record_pairing_aead_failure(
                     &state,
@@ -2306,7 +2306,7 @@ async fn handle_pairing_connection(
         return;
     }
 
-    // T3 (wire 0.3.2) — responder's AEAD-wrapped identity, decryptable by
+    // T3 (wire 0.3.3) — responder's AEAD-wrapped identity, decryptable by
     // the initiator only if it derived the same SPAKE2 key (i.e. correct
     // PIN). Sent only after T2 InitiatorKC has been verified.
     let r_inner = crate::protocol::PairIdInner {
@@ -2337,7 +2337,7 @@ async fn handle_pairing_connection(
         return;
     }
 
-    // T4 (wire 0.3.2) — initiator's AEAD-wrapped identity.
+    // T4 (wire 0.3.3) — initiator's AEAD-wrapped identity.
     let (nonce_i_vec, ciphertext_i) = match crate::transport::read_pairing_frame(&mut stream).await {
         Ok(PairingMessage::InitiatorId { nonce, ciphertext }) => (nonce, ciphertext),
         Ok(other) => {
@@ -2436,7 +2436,7 @@ async fn handle_pairing_connection(
     // connections.
     gossip_peer(&pinned, &state, &transport, Some(peer_addr));
 
-    // T5 (wire 0.3.2) — drop the stream. The kernel closes the TCP
+    // T5 (wire 0.3.3) — drop the stream. The kernel closes the TCP
     // connection, which the initiator reads as the "responder is ready
     // for QUIC" signal.
     drop(stream);
