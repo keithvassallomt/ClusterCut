@@ -2300,7 +2300,15 @@ function SettingsView({
 
   // Autosave Effect
   useEffect(() => {
-    if (loading || !settings) return;
+    if (loading || !settings || !initialSettings) return;
+
+    // Only save when the user has actually changed something. Without this
+    // guard, post-save state syncs (deep-cloned `initialSettings`, the
+    // `settings-changed` listener) produce new object references that retrigger
+    // this effect, causing an endless save loop while the Settings tab is open.
+    const settingsDirty = JSON.stringify(settings) !== JSON.stringify(initialSettings);
+    const identityDirty = provName !== networkName || provPin !== networkPin;
+    if (!settingsDirty && !identityDirty) return;
 
     const savePayload = {
       settings: { ...settings },
