@@ -481,6 +481,10 @@ export default function App() {
   // "Re-enable pairing", which calls `rearm_pairing` on the backend.
   const [pairingLockedOut, setPairingLockedOut] = useState(false);
 
+  // Issue #16: user-controlled pause for inbound pairing. Persists across
+  // restart via AppSettings.pairing_accept_enabled.
+  const [pairingAccepted, setPairingAccepted] = useState(true);
+
   // Incompatibility modal: fires when the backend's `peer-incompatible`
   // event arrives (a clipboard send failed and the destination peer's
   // mDNS-advertised proto version is missing or below the minimum).
@@ -814,6 +818,11 @@ export default function App() {
       .then(setPairingLockedOut)
       .catch(() => {});
 
+    // Issue #16: initial fetch for the user-controlled pairing toggle.
+    invoke<boolean>("get_pairing_accept")
+      .then(setPairingAccepted)
+      .catch(() => {});
+
     // 3. Settings
     fetchSettings();
 
@@ -876,6 +885,12 @@ export default function App() {
     });
     const unlistenPairingRearmed = listen<void>("pairing-rearmed", () => {
       setPairingLockedOut(false);
+    });
+
+    // Issue #16: keep state in sync with any other surface that might toggle
+    // the flag (tray menu in the future, etc.).
+    const unlistenPairingAcceptChanged = listen<boolean>("pairing-accept-changed", (event) => {
+      setPairingAccepted(event.payload);
     });
 
     // Listen for Monitor Updates (When Auto-Send is OFF)
@@ -1032,6 +1047,7 @@ export default function App() {
       unlistenSettingsChanged.then((f) => f());
       unlistenPairingLocked.then((f) => f());
       unlistenPairingRearmed.then((f) => f());
+      unlistenPairingAcceptChanged.then((f) => f());
     };
   }, [myHostname]); // Re-bind if hostname loads (needed for sender check)
 
@@ -1511,6 +1527,48 @@ export default function App() {
             </IconButton>
 
             <div className="mx-2 h-6 w-px bg-zinc-200 dark:bg-zinc-700" />
+
+            {/* Issue #16: pairing-accept toggle. Tri-state visual:
+                  green Unlock  = accepting
+                  gray  Lock    = user-paused
+                  rose  Lock    = abuse-locked-out (non-interactive; the
+                                  red banner remains the rearm path) */}
+            {(() => {
+              const pairingState = pairingLockedOut
+                ? "locked"
+                : pairingAccepted
+                  ? "accepting"
+                  : "paused";
+              const label =
+                pairingState === "locked"
+                  ? "Pairing locked — too many failed attempts"
+                  : pairingState === "accepting"
+                    ? "Pairing accepted"
+                    : "Pairing paused";
+              return (
+                <IconButton
+                  label={label}
+                  disabled={pairingState === "locked"}
+                  onClick={() => {
+                    if (pairingState === "locked") return;
+                    const next = !pairingAccepted;
+                    setPairingAccepted(next);
+                    invoke("set_pairing_accept", { enabled: next }).catch((err) => {
+                      logToBackend("set_pairing_accept failed", err);
+                      setPairingAccepted(!next);
+                    });
+                  }}
+                >
+                  {pairingState === "accepting" ? (
+                    <Unlock className="h-5 w-5 text-emerald-500" />
+                  ) : pairingState === "paused" ? (
+                    <Lock className="h-5 w-5 text-zinc-400" />
+                  ) : (
+                    <Lock className="h-5 w-5 text-rose-500" />
+                  )}
+                </IconButton>
+              );
+            })()}
 
             <IconButton
               danger
