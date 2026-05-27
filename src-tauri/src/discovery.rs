@@ -10,11 +10,13 @@ pub const SERVICE_TYPE: &str = "_clustercut._tcp.local.";
 ///
 /// - 0.3.0: strict-mTLS transport + plaintext-payload model (first break
 ///   from 0.2.x).
-/// - 0.3.1: pairing-channel hardening per WIRE-PROTOCOL-0.3.1.md
-///   (AEAD-wrapped identity in T2/T3, role-labelled SPAKE2 transcript,
-///   `Welcome` deferred to QUIC/mTLS `ClusterInfo` exchange). Wire-
-///   incompatible with 0.3.0; surfaced in the UI as "please upgrade".
-pub const CLUSTERCUT_PROTOCOL_VERSION: &str = "0.3.1";
+/// - 0.3.1: pairing-channel hardening (AEAD-wrapped identity in T2/T3,
+///   role-labelled SPAKE2 transcript, `Welcome` deferred to QUIC/mTLS
+///   `ClusterInfo` exchange). Wire-incompatible with 0.3.0.
+/// - 0.3.2: explicit initiator key-confirmation packet (new T2
+///   `InitiatorKC`) ahead of the responder's identity reveal, closing
+///   the online brute-force budget-bypass. Wire-incompatible with 0.3.1.
+pub const CLUSTERCUT_PROTOCOL_VERSION: &str = "0.3.2";
 
 pub struct Discovery {
     daemon: ServiceDaemon,
