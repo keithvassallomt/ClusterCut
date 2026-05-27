@@ -355,7 +355,8 @@ function IconButton({
   children,
   variant = "ghost",
   active = false,
-  danger = false
+  danger = false,
+  disabled = false,
 }: {
   label: string;
   onClick?: () => void;
@@ -363,12 +364,15 @@ function IconButton({
   variant?: "ghost" | "default";
   active?: boolean;
   danger?: boolean;
+  disabled?: boolean;
 }) {
   return (
     <button
-      onClick={onClick}
+      onClick={disabled ? undefined : onClick}
+      disabled={disabled}
       className={clsx(
         "group relative flex h-10 w-10 items-center justify-center rounded-xl transition focus:outline-none focus:ring-2 focus:ring-emerald-500/40 no-drag",
+        disabled && "cursor-not-allowed opacity-60",
         active
           ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-800 dark:text-zinc-50"
           : danger
