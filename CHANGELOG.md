@@ -10,8 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Header-bar toggle to pause inbound pairing on demand. Green unlock = accepting, gray lock = paused. Setting persists across restarts. The same icon also turns rose when the existing brute-force lockout trips, so the header reflects the listener's actual state. Thanks to @mdunphy for the request (#16).
 
+### Changed
+- mDNS `proto` floor moves to `0.3.2` for the new pairing wire format. 0.3.1 peers surface in the existing "please upgrade" UI flow (per-peer amber-triangle indicator + modal on send). Frontend `MIN_COMPATIBLE_PROTOCOL` brought into sync with the backend floor (was stale at 0.3.0 since the 0.3.0 → 0.3.1 break).
+
 ### Fixed
 - Settings tab no longer spams `save_settings` once per second in the background. The autosave effect was re-firing on every post-save state sync because `initialSettings` got a fresh object reference each time, even when its value was unchanged. Now guarded by a value-based dirty check. Thanks to @mdunphy for the report (#15).
+
+### Security
+- Pairing-channel hardening (round-5 review with @mdunphy). New T2 `InitiatorKC` AEAD frame between SPAKE2-finish and the responder's encrypted identity reveal. The responder won't release any encrypted material until it AEAD-verifies the initiator's KC tag under the SPAKE2-derived `k_i2r`, so a wrong-PIN attacker can no longer harvest a `ResponderId` ciphertext, disconnect without sending a fingerprint, and brute-force PINs offline against it without depleting the failure budget. Wire-incompatible with 0.3.1.
+- Pre-flight `proto` version check in the pair flow. mDNS-discovered peers below the compatibility floor are flagged in the existing "Peer needs updating" modal before the TCP pairing socket opens, instead of falling out as a generic timeout. Manual Add-Remote keeps the existing wire-level-failure path (no mDNS data, no advance signal).
 
 ## [0.3.2] — 2026-05-23
 
