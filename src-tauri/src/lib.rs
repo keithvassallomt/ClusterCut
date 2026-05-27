@@ -1078,16 +1078,16 @@ fn parse_protocol_version(s: &str) -> Option<(u32, u32, u32)> {
 }
 
 /// True if the peer's advertised `proto` version is at least the minimum
-/// this build can talk to (currently 0.3.0 — the strict-mTLS line). Returns
-/// false for peers that don't advertise the property at all (older builds).
+/// this build can talk to. Returns false for peers that don't advertise
+/// the property at all (older builds).
 pub fn is_protocol_compatible(version: Option<&str>) -> bool {
     let Some(v) = version else { return false };
-    // 0.3.1 break: the pairing-channel wire format is wholly incompatible
-    // with 0.3.0 (no plaintext device_id at T0/T1, AEAD-wrapped identity
-    // at T2/T3, no Welcome — see WIRE-PROTOCOL-0.3.1.md). Bumping the
-    // floor surfaces 0.3.0 peers as incompatible in the same UI flow we
-    // built for the 0.2.x → 0.3.0 break.
-    parse_protocol_version(v).map_or(false, |parsed| parsed >= (0, 3, 1))
+    // 0.3.2 break: the pairing-channel wire format requires the new T2
+    // `InitiatorKC` frame; 0.3.1 initiators don't send it and 0.3.1
+    // responders don't read it. Bumping the floor surfaces 0.3.1 peers
+    // as incompatible in the same UI flow used for the 0.2.x → 0.3.0
+    // and 0.3.0 → 0.3.1 breaks.
+    parse_protocol_version(v).map_or(false, |parsed| parsed >= (0, 3, 2))
 }
 
 /// Log a send failure and, if the destination peer is on an incompatible
