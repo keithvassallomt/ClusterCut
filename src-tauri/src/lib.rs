@@ -1807,10 +1807,12 @@ async fn start_pairing(
     // Pre-flight version check for mDNS-discovered peers. If the peer's
     // advertised proto is missing or below the floor this build can talk
     // to, emit `peer-incompatible` so the existing "Peer needs updating"
-    // modal fires and abort before opening the TCP socket. For the manual
-    // Add-Remote path (no discovered proto), we fall through and let the
-    // wire-level failure handle it — the user explicitly typed the address
-    // and we have no advance signal.
+    // modal fires and abort before opening the TCP socket. A discovered
+    // peer with no proto TXT is treated as incompatible (matches the
+    // existing send-path semantics in `report_send_failure`). For the
+    // manual Add-Remote path (no discovered proto), we fall through and
+    // let the wire-level failure handle it — the user explicitly typed
+    // the address and we have no advance signal.
     if !is_manual_pair {
         if !is_protocol_compatible(discovered_proto_version.as_deref()) {
             let hostname = discovered_hostname.unwrap_or_else(|| peer_id.clone());
@@ -1826,12 +1828,6 @@ async fn start_pairing(
                     "id": peer_id,
                     "hostname": hostname,
                 }),
-            );
-            // Also surface to the pair-flow modal so the in-progress join
-            // doesn't sit on a spinner forever waiting for ClusterInfo.
-            let _ = app_handle.emit(
-                "pairing-failed",
-                format!("{} is running an older version of ClusterCut and can't pair with this device. Please upgrade it.", hostname),
             );
             return Err("Peer protocol version is below the minimum compatible floor.".to_string());
         }
