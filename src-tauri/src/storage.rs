@@ -394,6 +394,16 @@ pub struct AppSettings {
     /// other framing/decrypt error. Flip on for verbose pairing diagnostics.
     #[serde(default)]
     pub pairing_debug_logs: bool,
+    /// User-controlled pause for the SPAKE pairing listener. When `false`,
+    /// inbound TCP pairing connections are dropped immediately at the accept
+    /// loop, alongside the existing `pairing_locked_out` brute-force defence.
+    /// Surfaced in the UI as a header-bar toggle (issue #16).
+    #[serde(default = "default_pairing_accept_enabled")]
+    pub pairing_accept_enabled: bool,
+}
+
+fn default_pairing_accept_enabled() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -413,6 +423,7 @@ impl Default for AppSettings {
             flatpak_autostart: false,
             compress_file_transfers: false,
             pairing_debug_logs: false,
+            pairing_accept_enabled: true,
         }
     }
 }
