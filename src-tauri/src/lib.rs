@@ -1844,7 +1844,7 @@ async fn start_pairing(
     // Derive role-distinct AEAD sub-keys from the SPAKE2 key + the role-
     // labelled transcript. Any wire-byte rewrite between T0 and T1 produces
     // a different transcript here than the responder reconstructed, the
-    // sub-keys diverge, and the T2 decrypt below fails closed.
+    // sub-keys diverge, and the T3 ResponderId decrypt below fails closed.
     let transcript = crypto::pairing_transcript(&spake_msg_i, &spake_msg_r);
     let (k_i2r, k_r2i) = crypto::derive_pair_subkeys(&session_key, &transcript)
         .map_err(|e| format!("HKDF sub-key derivation failed: {}", e))?;
