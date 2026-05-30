@@ -93,3 +93,50 @@ impl PeerView {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(id: &str, fingerprint: Option<Vec<u8>>) -> Peer {
+        Peer {
+            id: id.to_string(),
+            ip: "192.168.96.7".parse().unwrap(),
+            port: 4654,
+            hostname: "test".to_string(),
+            last_seen: 0,
+            is_trusted: false,
+            is_manual: false,
+            network_name: None,
+            signature: None,
+            fingerprint,
+            protocol_version: None,
+        }
+    }
+
+    #[test]
+    fn genuine_legacy_peer_needs_repair() {
+        // Real paired device (clustercut-* id) with no pinned fingerprint —
+        // exactly the pre-mTLS case the banner is for.
+        assert!(peer("clustercut-1100959039", None).needs_repair());
+    }
+
+    #[test]
+    fn pinned_peer_does_not_need_repair() {
+        assert!(!peer("clustercut-1100959039", Some(vec![1, 2, 3])).needs_repair());
+    }
+
+    #[test]
+    fn manual_placeholder_never_needs_repair() {
+        // `manual-<ip>` is a throwaway probe placeholder (e.g. a VPN gateway
+        // forwarding :4654). Fingerprint-less, but not a paired device — must
+        // NOT trigger the re-pair banner. This is the reported bug.
+        assert!(!peer("manual-192.168.96.17", None).needs_repair());
+    }
+
+    #[test]
+    fn manual_placeholder_with_fingerprint_does_not_need_repair() {
+        // Defensive: a manual id should never be flagged regardless of fingerprint.
+        assert!(!peer("manual-192.168.96.17", Some(vec![1, 2, 3])).needs_repair());
+    }
+}
