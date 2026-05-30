@@ -323,33 +323,45 @@ fn image_blob_eq_stable(a: &ClipboardBlob, b: &ClipboardBlob) -> bool {
 }
 
 /// Stable equivalence for rich-text payloads across an OS-clipboard round-
-/// trip. The `text` field round-trips byte-stably (every backend stores
-/// plain UTF-8 text verbatim — NSPasteboard, Win32 CF_UNICODETEXT, and
-/// Wayland `text/plain` all preserve bytes), but the per-format `data`
-/// strings can be normalised by the OS layer (line endings, charset
-/// declarations, etc.). Equivalence is `(text, sorted MIME set)` — drops
-/// the per-format byte length comparison that was making the receiver
-/// re-broadcast every rich-text paste it accepted.
+/// trip. The echo-guard has to cover a few different failure modes:
 ///
-/// Edge case: two distinct rich copies that happen to have the same plain
-/// text and the same MIME set would compare equal. Vanishingly unlikely
-/// in practice, and the cost of mis-suppressing one such copy is much
-/// lower than the cost of bouncing every rich copy.
+///   - macOS NSPasteboard normalising HTML/RTF line endings / charset
+///     declarations so per-format byte length differs but the text and
+///     MIME set are stable (the original TIRI fix — `(text, sorted MIME
+///     set)` equality).
+///   - The clipboard losing some MIMEs and/or the plain-text channel
+///     between our write and our read-back. Issue #17 surfaced two such
+///     paths: Windows CF_RTF write empties the clipboard, leaving the
+///     read-back as `(text="", formats=[text/rtf])`; the GNOME extension's
+///     `WriteFormats` is last-write-wins for similar reasons. In both
+///     cases the read-back's MIME set is a strict subset of what we wrote
+///     and the plain text has been dropped.
+///
+/// Rule: current matches ignored if its MIME set is a subset of ignored's
+/// AND its text is either equal to ignored's or empty (allowing for the
+/// "lost the plain-text channel" case). The check is bounded by
+/// `IGNORED_TTL` (10 s), so we only ever suppress near-write echoes — a
+/// stale guard times out before it can swallow an unrelated paste.
+///
+/// Edge case: a second copy that arrives within the TTL with empty plain
+/// text and a MIME subset of the first will be mis-suppressed as an echo.
+/// Strictly less likely than the original "same text, same MIME set"
+/// edge case, and the failure mode (one suppressed copy) is far cheaper
+/// than the bug it covers (clipboard cleared by a bounced-back truncation).
 fn rich_eq_stable(
     ign_text: &str,
     ign_formats: &[ClipboardFormat],
     curr_text: &str,
     curr_formats: &[ClipboardFormat],
 ) -> bool {
-    if ign_text != curr_text {
+    if !curr_text.is_empty() && curr_text != ign_text {
         return false;
     }
-    let mut ign_mimes: Vec<&str> = ign_formats.iter().map(|f| f.mime_type.as_str()).collect();
-    let mut curr_mimes: Vec<&str> =
-        curr_formats.iter().map(|f| f.mime_type.as_str()).collect();
-    ign_mimes.sort();
-    curr_mimes.sort();
-    ign_mimes == curr_mimes
+    let ign_mimes: std::collections::HashSet<&str> =
+        ign_formats.iter().map(|f| f.mime_type.as_str()).collect();
+    curr_formats
+        .iter()
+        .all(|f| ign_mimes.contains(f.mime_type.as_str()))
 }
 
 /// Outcome of an IGNORED-guard check. The caller uses this to decide both
@@ -567,6 +579,19 @@ pub fn process_clipboard_change(
     match content {
         ClipboardContent::Text(text) => {
             tracing::debug!("Clipboard Text Change Detected (len={})", text.len());
+
+            // Skip whitespace-only plain text. The monitors' `!is_empty()`
+            // checks pass strings like " " or "\n", but syncing those has
+            // negative information value: every peer that auto-receives
+            // would overwrite a useful clipboard with a single space. The
+            // rich path has the same shape in spirit, but defining "no
+            // meaningful content" for HTML/RTF would need markup parsing —
+            // `rich_eq_stable`'s subset rule covers the realistic bounce-
+            // back case there instead.
+            if text.trim().is_empty() {
+                tracing::debug!("Skipping broadcast — whitespace-only text");
+                return;
+            }
 
             {
                 let mut last_global = state.last_clipboard_content.lock().unwrap();
@@ -1221,5 +1246,40 @@ mod tests {
             ClipboardFormat::from_text("text/html", "<p>x</p>"),
         ];
         assert!(rich_eq_stable("hello", &order_a, "hello", &order_b));
+    }
+
+    #[test]
+    fn rich_eq_stable_matches_subset_when_text_preserved() {
+        // Issue #17 shape A: ignored had [html, rtf], current has [rtf] only
+        // (one MIME dropped on the round-trip) but plain text is intact.
+        let ign = vec![
+            ClipboardFormat::from_text("text/html", "<p>x</p>"),
+            ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}"),
+        ];
+        let curr = vec![ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}")];
+        assert!(rich_eq_stable("hello", &ign, "hello", &curr));
+    }
+
+    #[test]
+    fn rich_eq_stable_matches_subset_when_text_lost() {
+        // Issue #17 shape B: ignored had [html, rtf] with non-empty text;
+        // current has just [rtf] and empty text (Windows last-write-wins
+        // wiped CF_UNICODETEXT and CF_HTML when CF_RTF was set).
+        let ign = vec![
+            ClipboardFormat::from_text("text/html", "<p>x</p>"),
+            ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}"),
+        ];
+        let curr = vec![ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}")];
+        assert!(rich_eq_stable("hello", &ign, "", &curr));
+    }
+
+    #[test]
+    fn rich_eq_stable_rejects_non_subset_even_with_empty_text() {
+        // A genuinely-different copy that happens to land with empty plain
+        // text must still be processed — it offers a MIME the IGNORED
+        // guard never wrote, so it can't be our echo.
+        let ign = vec![ClipboardFormat::from_text("text/html", "<p>x</p>")];
+        let curr = vec![ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}")];
+        assert!(!rich_eq_stable("hello", &ign, "", &curr));
     }
 }

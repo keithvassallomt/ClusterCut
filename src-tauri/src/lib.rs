@@ -4463,8 +4463,14 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                 if notifications.data_received {
                                     send_notification(&listener_handle, "Clipboard Received", "Formatted content copied to clipboard", false, Some(2), "history", NotificationPayload::None);
                                 }
-                            } else if !text.is_empty() {
+                            } else if !text.trim().is_empty() {
                                 // TEXT HANDLING — plain text only, no rich formats present.
+                                // `trim().is_empty()` (not just `is_empty()`) drops
+                                // whitespace-only payloads — e.g. a single newline or
+                                // space bouncing around the cluster, which would
+                                // otherwise overwrite a useful clipboard on every peer.
+                                // Symmetric with the broadcast-side guard in
+                                // `clipboard::common::process_clipboard_change`.
                                 tracing::info!(
                                     "Received clipboard text from {}: {} chars",
                                     sender,

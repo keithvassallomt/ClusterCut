@@ -321,8 +321,17 @@ mod windows {
                     let id = rtf_id.ok_or_else(|| {
                         "couldn't register Rich Text Format atom".to_string()
                     })?;
-                    RawData(id)
-                        .write_clipboard(&bytes)
+                    // `RawData::write_clipboard` calls `raw::set`, which
+                    // calls `EmptyClipboard` before `SetClipboardData` — that
+                    // wipes CF_UNICODETEXT and CF_HTML we set above, leaving
+                    // only CF_RTF advertised. The receiver's monitor then
+                    // re-reads (text="", formats=[text/rtf]), the IGNORED
+                    // guard misses, and the truncated payload bounces back
+                    // to the sender and clears their clipboard (issue #17).
+                    // `Html::write_clipboard` already uses `set_html`, which
+                    // is `NoClear`; `raw::set_without_clear` is the matching
+                    // primitive for arbitrary registered atoms.
+                    raw::set_without_clear(id, &bytes)
                         .map_err(|e| format!("CF_RTF: {}", e))?;
                 }
                 other => {

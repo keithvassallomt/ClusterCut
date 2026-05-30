@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Copying rich text on GNOME and syncing to a Windows peer no longer clears the local clipboard. The CF_RTF write path on Windows was using `clipboard-win`'s `RawData::write_clipboard`, which calls `EmptyClipboard` before `SetClipboardData` — that wiped the CF_UNICODETEXT and CF_HTML formats we'd written moments earlier, so the receiver's monitor read back `(text="", formats=[text/rtf])` and broadcast the truncation back to the sender. Switched to `set_without_clear` so the RTF write joins the existing offering. As a side-effect, pasting on the Windows receiver into plain-text apps (Notepad) or HTML-aware apps (browsers) now works too. Thanks to @mdunphy for the report (#17).
+- `rich_eq_stable` echo guard now treats a read-back whose MIME set is a subset of what we wrote — with text either equal or empty — as our own echo. Covers the issue #17 shape across any backend that drops formats or the plain-text channel on the OS clipboard round-trip, not just the specific Windows path fixed above.
+- Whitespace-only plain-text copies (a single space, newline, or tab) are no longer broadcast or applied on receive. Each backend's monitor already skipped truly-empty strings; this extends that to whitespace-only payloads, which carry no information but would otherwise overwrite a useful clipboard on every peer.
+
 ## [0.3.3] — 2026-05-27
 
 ### Added
