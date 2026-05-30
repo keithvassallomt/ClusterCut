@@ -1,4 +1,5 @@
 mod clipboard;
+mod commands;
 mod compression;
 #[cfg(target_os = "linux")]
 mod dbus;
@@ -37,179 +38,6 @@ struct Args {
 
     #[arg(long)]
     theme: Option<String>,
-}
-
-#[tauri::command]
-async fn get_theme_override() -> Option<String> {
-    std::env::var("CLUSTERCUT_THEME").ok()
-}
-
-#[tauri::command]
-async fn get_current_theme(state: tauri::State<'_, AppState>) -> Result<Option<String>, ()> {
-    Ok(state.current_theme.lock().unwrap().clone())
-}
-
-#[tauri::command]
-async fn configure_autostart(app_handle: tauri::AppHandle, enable: bool) -> Result<bool, String> {
-    // Check if running in Flatpak
-    if cfg!(target_os = "linux") && std::env::var("FLATPAK_ID").is_ok() {
-        let conn = zbus::Connection::session().await
-            .map_err(|e| format!("Failed to connect to session bus: {}", e))?;
-
-        // Build a proxy for the Background portal
-        let proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(&conn)
-            .interface("org.freedesktop.portal.Background").unwrap()
-            .path("/org/freedesktop/portal/desktop").unwrap()
-            .destination("org.freedesktop.portal.Desktop").unwrap()
-            .build()
-            .await
-            .map_err(|e| format!("Failed to create Background portal proxy: {}", e))?;
-
-        // Compute a predictable handle_token from our unique bus name
-        let unique_name = conn.unique_name()
-            .ok_or("No unique bus name")?
-            .as_str()
-            .to_string();
-        let sender_part = unique_name
-            .trim_start_matches(':')
-            .replace('.', "_");
-        let handle_token = "clustercut_autostart";
-        let request_path = format!(
-            "/org/freedesktop/portal/desktop/request/{}/{}",
-            sender_part, handle_token
-        );
-
-        // Subscribe to the Response signal on the request path BEFORE calling the method
-        let response_proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(&conn)
-            .interface("org.freedesktop.portal.Request").unwrap()
-            .path(request_path.as_str()).unwrap()
-            .destination("org.freedesktop.portal.Desktop").unwrap()
-            .build()
-            .await
-            .map_err(|e| format!("Failed to create request proxy: {}", e))?;
-
-        let mut response_stream: zbus::proxy::SignalStream<'_> = response_proxy
-            .receive_signal("Response")
-            .await
-            .map_err(|e| format!("Failed to subscribe to Response signal: {}", e))?;
-
-        // Build the options dict for RequestBackground
-        let mut options = std::collections::HashMap::<&str, zbus::zvariant::Value<'_>>::new();
-        options.insert("handle_token", zbus::zvariant::Value::from(handle_token));
-        options.insert("reason", zbus::zvariant::Value::from(
-            "ClusterCut needs to start at login to sync your clipboard across devices."
-        ));
-        options.insert("autostart", zbus::zvariant::Value::from(enable));
-        if enable {
-            let cmd: Vec<String> = vec![
-                "clustercut".into(),
-                "--minimized".into(),
-            ];
-            options.insert("commandline", zbus::zvariant::Value::from(cmd));
-        }
-
-        // Call RequestBackground (parent_window = "")
-        proxy.call_method("RequestBackground", &("", options)).await
-            .map_err(|e| format!("RequestBackground call failed: {}", e))?;
-
-        // Wait for the Response signal with a 60s timeout
-        use futures::StreamExt;
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            response_stream.next(),
-        )
-        .await
-        .map_err(|_| "Portal request timed out — no response within 60 seconds".to_string())?
-        .ok_or("Response signal stream ended unexpectedly")?;
-
-        // Parse the response: (uint32 response, dict results)
-        let body: zbus::message::Body = response.body();
-        let (response_code, _results): (u32, std::collections::HashMap<String, zbus::zvariant::OwnedValue>) = body
-            .deserialize()
-            .map_err(|e| format!("Failed to deserialize portal response: {}", e))?;
-
-        if response_code == 0 {
-            // Approved — persist the state
-            let state = app_handle.state::<AppState>();
-            {
-                let mut settings = state.settings.lock().unwrap();
-                settings.flatpak_autostart = enable;
-            }
-            storage::save_settings(&app_handle, &state.settings.lock().unwrap());
-            tracing::info!("Flatpak autostart {} via Background portal", if enable { "enabled" } else { "disabled" });
-            Ok(true)
-        } else {
-            Err(format!("Autostart request was denied by the user (response code: {})", response_code))
-        }
-    } else {
-        Ok(false) // Not handled — let tauri-plugin-autostart handle it
-    }
-}
-
-#[tauri::command]
-async fn get_autostart_state(app_handle: tauri::AppHandle) -> Result<Option<bool>, String> {
-    if cfg!(target_os = "linux") && std::env::var("FLATPAK_ID").is_ok() {
-        let state = app_handle.state::<AppState>();
-        let settings = state.settings.lock().unwrap();
-        Ok(Some(settings.flatpak_autostart))
-    } else {
-        Ok(None)
-    }
-}
-
-#[tauri::command]
-async fn show_native_notification(_app_handle: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::UI::Notifications::{ToastNotificationManager, ToastNotification};
-        use windows::Data::Xml::Dom::XmlDocument;
-        use windows::core::HSTRING;
-
-        let aumid = "app.clustercut.clustercut"; 
-
-        // Raw XML for Native Actions
-        // activationType="protocol" ensures clicking invokes "clustercut://..." which SingleInstance catches.
-        let xml = format!(r#"
-<toast activationType="protocol" launch="clustercut://action/show">
-    <visual>
-        <binding template="ToastGeneric">
-            <text>{}</text>
-            <text>{}</text>
-        </binding>
-    </visual>
-</toast>
-"#, title, body);
-
-        let doc = XmlDocument::new().map_err(|e| e.to_string())?;
-        doc.LoadXml(&HSTRING::from(&xml)).map_err(|e| e.to_string())?;
-
-        let toast = ToastNotification::CreateToastNotification(&doc).map_err(|e| e.to_string())?;
-        
-        // Create Notifier and Show
-        let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(aumid))
-            .map_err(|e| e.to_string())?;
-            
-        notifier.Show(&toast).map_err(|e| e.to_string())?;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        use notify_rust::Notification;
-        let _ = Notification::new()
-            .summary(&title)
-            .body(&body)
-            .appname("ClusterCut")
-            .timeout(notify_rust::Timeout::Milliseconds(5000)) 
-            .show()
-            .map_err(|e| e.to_string());
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        send_notification(&_app_handle, &title, &body, false, None, "history", NotificationPayload::None);
-    }
-    
-    Ok(())
 }
 
 fn init_logging() -> Args {
@@ -319,7 +147,7 @@ use storage::{
     load_cluster_id, load_device_id, load_known_peers, load_network_name, load_network_pin,
     save_cluster_id, save_device_id, save_known_peers,
     wipe_legacy_cluster_key,
-    reset_network_state, load_settings, AppSettings,
+    reset_network_state, load_settings,
 };
 use tauri::{Emitter, Manager};
 use transport::Transport;
@@ -1146,358 +974,6 @@ pub fn report_send_failure(
     }
 }
 
-#[tauri::command]
-fn get_device_id(state: tauri::State<'_, AppState>) -> String {
-    state.local_device_id.lock().unwrap().clone()
-}
-
-#[tauri::command]
-fn get_network_name(state: tauri::State<'_, AppState>) -> String {
-    state.network_name.lock().unwrap().clone()
-}
-
-#[tauri::command]
-fn get_network_pin(state: tauri::State<'_, AppState>) -> String {
-    state.network_pin.lock().unwrap().clone()
-}
-
-#[tauri::command]
-fn get_hostname(state: tauri::State<'_, AppState>) -> String {
-    let settings = state.settings.lock().unwrap();
-    if let Some(custom_name) = &settings.custom_device_name {
-        if !custom_name.trim().is_empty() {
-             return custom_name.clone();
-        }
-    }
-    
-    hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "Unknown".to_string())
-}
-
-#[tauri::command]
-fn get_settings(state: tauri::State<'_, AppState>) -> AppSettings {
-    state.settings.lock().unwrap().clone()
-}
-
-#[tauri::command]
-fn save_settings(
-    mut settings: AppSettings,
-    state: tauri::State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) {
-    // Preserve backend-only fields that the frontend doesn't manage
-    settings.flatpak_autostart = state.settings.lock().unwrap().flatpak_autostart;
-    *state.settings.lock().unwrap() = settings.clone();
-    tracing::info!("Saving Settings: auto_send={}, auto_receive={}", settings.auto_send, settings.auto_receive);
-    crate::storage::save_settings(&app_handle, &settings);
-    let _ = app_handle.emit("settings-changed", settings.clone());
-    
-    #[cfg(desktop)]
-    crate::tray::update_tray_menu(&app_handle);
-    
-    // Update Shortcuts
-    register_shortcuts(&app_handle);
-    // If auto_receive is now OFF, we might want to do something?
-    // If device name changed, we should probably rebroadcast or something, 
-    // but the next heartbeat or discovery probe will pick it up.
-    // Ideally we emit an event if needed.
-    
-    // Check if network name changed via Provisioning (this function saves AppSettings, but UI might call separate commands for Network Name/PIN)
-    // Wait, the UI for Provisioned Mode will likely update NetworkName/PIN directly? 
-    // Or do we store them in AppSettings too? 
-    // The requirement says "Provisioned mode, the user can enter a cluster name and PIN". 
-    // Those are actually `state.network_name` and `state.network_pin`. 
-    // `AppSettings` stores the *mode*. 
-    // So the UI should call `save_network_identity` (new command needed?) or Update existing commands?
-    // We already have `load_network_name` but no set command exposed.
-    // I will add `set_network_identity` command.
-}
-
-#[tauri::command]
-fn set_network_identity(
-    name: String,
-    pin: String,
-    state: tauri::State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) {
-    // Validate?
-    *state.network_name.lock().unwrap() = name.clone();
-    *state.network_pin.lock().unwrap() = pin.clone();
-    
-    crate::storage::save_network_name(&app_handle, &name);
-    crate::storage::save_network_pin(&app_handle, &pin);
-    
-    // Also likely need to reset keys if we are "provisioning" a new identity? 
-    // Or do we keep the key? 
-    // If I type a new name/pin, I am essentially saying "I belong to THIS network now".
-    // I need the key for THAT network. 
-    // If I'm creating it, I generate a key. 
-    // If I'm joining it (provisioned), I usually need the Key too OR I need to Pair.
-    // But "Provisioned" usually means "I set the config manually". 
-    // The prompt says "Toggle... default behaviour applies (random)... Provisioned... user can enter".
-    // It doesn't say "User enters Key".
-    // So "Provisioned" here effectively just means "Manual valid Network Name/PIN" instead of "Random Name/PIN".
-    // It implies we are STARTING a cluster with this name/pin.
-    // So we keep our current Key (or gen a new one). 
-    // Since we are changing identity, a new Key is safer.
-    // But if we just rename the cluster, we might want to keep the key.
-    // Actually, if I just want to rename my cluster "My Home", I don't want to break existing peers if I can help it?
-    // But existing peers know me by Key? No, they pair with Spake2 using PIN.
-    // If I change PIN, they can't pair.
-    // If I change Name, they see "My Home" instead of "Fuzzy-Badger".
-    // I'll stick to just updating Name/PIN.
-    
-    // Re-register mDNS with new name
-    let device_id = state.local_device_id.lock().unwrap().clone();
-    
-    // Get actual port from transport
-    let port = if let Some(transport) = state.transport.lock().unwrap().as_ref() {
-        transport.local_addr().map(|a| a.port()).unwrap_or(4654)
-    } else {
-        4654
-    };
-
-    // Discovery usually stores port.
-    if let Some(discovery) = state.discovery.lock().unwrap().as_mut() {
-          let _ = discovery.register(&device_id, &name, port);
-    }
-    
-    let _ = app_handle.emit("network-update", ());
-}
-
-#[tauri::command]
-fn regenerate_network_identity(
-    state: tauri::State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) {
-    let (name, pin) = crate::storage::regenerate_identity(&app_handle);
-    
-    *state.network_name.lock().unwrap() = name.clone();
-    *state.network_pin.lock().unwrap() = pin.clone();
-    
-    let device_id = state.local_device_id.lock().unwrap().clone();
-    
-    // Get actual port from transport
-    let port = if let Some(transport) = state.transport.lock().unwrap().as_ref() {
-        transport.local_addr().map(|a| a.port()).unwrap_or(4654)
-    } else {
-        4654
-    };
-    
-    if let Some(discovery) = state.discovery.lock().unwrap().as_mut() {
-          let _ = discovery.register(&device_id, &name, port);
-    }
-    
-    let _ = app_handle.emit("network-update", ());
-}
-
-#[tauri::command]
-fn get_listening_port(state: tauri::State<'_, AppState>) -> u16 {
-    if let Some(transport) = state.transport.lock().unwrap().as_ref() {
-        transport.local_addr().map(|a| a.port()).unwrap_or(4654)
-    } else {
-        4654
-    }
-}
-
-#[tauri::command]
-fn get_peers(state: tauri::State<AppState>) -> std::collections::HashMap<String, Peer> {
-    state.get_peers()
-}
-
-#[tauri::command]
-fn get_known_peers(state: tauri::State<AppState>) -> std::collections::HashMap<String, Peer> {
-    state.known_peers.lock().unwrap().clone()
-}
-
-/// List of peers loaded from `known_peers.json` without a stored cert
-/// fingerprint. Returns an empty Vec for clean v0.3 installs. The frontend
-/// reads this on mount to decide whether to show the "please re-pair"
-/// banner after a v0.2 → v0.3 upgrade.
-#[tauri::command]
-fn get_legacy_peers(state: tauri::State<AppState>) -> Vec<crate::state::LegacyPeerInfo> {
-    state.legacy_peers.lock().unwrap().clone()
-}
-
-/// Dismiss the legacy-peer banner for the current run. The banner reappears
-/// on next startup if any legacy peers are still present in known_peers,
-/// so the user is reminded until they re-pair (or forget) every affected
-/// peer.
-#[tauri::command]
-fn dismiss_legacy_peer_banner(state: tauri::State<AppState>) {
-    state.legacy_peers.lock().unwrap().clear();
-}
-
-/// Returns true when the user has at least one manual peer AND none of those
-/// manual peers are on a directly-reachable subnet. This is the gate for the
-/// "having trouble connecting?" modal — show it only when we'd actually expect
-/// remote/VPN connectivity to a manual peer. If a manual peer is on the local
-/// subnet, "no peers online" just means peers are offline, not a connection
-/// problem worth surfacing.
-#[tauri::command]
-fn expects_remote_manual_peers(state: tauri::State<AppState>) -> bool {
-    let peers = state.known_peers.lock().unwrap();
-    let manual: Vec<_> = peers.values().filter(|p| p.is_manual).collect();
-    if manual.is_empty() {
-        return false;
-    }
-    !manual.iter().any(|p| net_util::is_in_local_subnet(p.ip))
-}
-
-#[tauri::command]
-fn log_frontend(message: String, level: Option<String>) {
-    match level.as_deref() {
-        Some("error") => tracing::error!("[Frontend] {}", message),
-        Some("warn") => tracing::warn!("[Frontend] {}", message),
-        Some("debug") => tracing::debug!("[Frontend] {}", message),
-        Some("trace") => tracing::trace!("[Frontend] {}", message),
-        _ => tracing::info!("[Frontend] {}", message),
-    }
-}
-
-#[tauri::command]
-fn get_local_ip() -> String {
-    local_ip_address::local_ip()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
-}
-
-use ipnetwork::IpNetwork;
-
-#[tauri::command]
-async fn add_manual_peer(
-    ip: String, // Can be IP or CIDR
-    state: tauri::State<'_, AppState>,
-    transport: tauri::State<'_, Transport>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    
-    // 1. Try parsing as CIDR
-    if let Ok(net) = ip.parse::<IpNetwork>() {
-        tracing::info!("Scanning range: {}", net);
-        let ips: Vec<std::net::IpAddr> = net.iter().collect();
-        
-        // Scan in small batches with concurrency
-        let batch_size = 50; 
-        for chunk in ips.chunks(batch_size) {
-            let mut tasks = Vec::new();
-            for ip_addr in chunk {
-                 let s = (*state).clone();
-                 let t = (*transport).clone();
-                 let a = app_handle.clone();
-                 let addr = *ip_addr;
-                 
-                 // Skip own IP
-                 if let Ok(local) = t.local_addr() {
-                     if local.ip() == addr { continue; }
-                 }
-                 
-                 tasks.push(tauri::async_runtime::spawn(async move {
-                     net_util::probe_ip(addr, 4654, s, t, a).await; // Fixed Port 4654
-                 }));
-            }
-            futures::future::join_all(tasks).await;
-        }
-        Ok(())
-    } else {
-         // 2. Try parsing as normal IP or SocketAddr
-        // If just IP, assume port 4654.
-        let (addr, port) = if let Ok(sock) = ip.parse::<std::net::SocketAddr>() {
-            (sock.ip(), sock.port())
-        } else if let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() {
-            (ip_addr, 4654)
-        } else {
-             return Err("Invalid Format. Use IP, IP:PORT, or CIDR (e.g. 192.168.1.0/24)".to_string());
-        };
-
-        // For single IP, PROBE IT.
-        net_util::probe_ip(addr, port, (*state).clone(), (*transport).clone(), app_handle).await;
-        Ok(())
-    }
-}
-
-#[tauri::command]
-async fn leave_network(
-    state: tauri::State<'_, AppState>,
-    transport: tauri::State<'_, Transport>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    let local_id = state.local_device_id.lock().unwrap().clone();
-    
-    // 1. Broadcast "Self-Removal" to Network
-    let removal_msg = Message::PeerRemoval(local_id.clone());
-    let data = serde_json::to_vec(&removal_msg).unwrap_or_default();
-    
-    let peers_snapshot = state.get_peers();
-    for (id, p) in peers_snapshot.iter() {
-         if *id == local_id { continue; }
-         
-         let addr = std::net::SocketAddr::new(p.ip, p.port);
-         let transport_clone = (*transport).clone();
-         let data_vec = data.clone();
-         
-         tauri::async_runtime::spawn(async move {
-             let _ = transport_clone.send_message(addr, &data_vec).await;
-         });
-    }
-    
-    // 2. Perform Factory Reset Locally
-    let port = transport.local_addr().map(|a| a.port()).unwrap_or(0);
-    perform_factory_reset(&app_handle, &state, port);
-    
-    Ok(())
-}
-
-#[tauri::command]
-async fn delete_peer(
-    peer_id: String,
-    state: tauri::State<'_, AppState>,
-    transport: tauri::State<'_, Transport>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    // 0. Broadcast Removal (Kick) to Network
-    let removal_msg = Message::PeerRemoval(peer_id.clone());
-    let data = serde_json::to_vec(&removal_msg).unwrap_or_default();
-    
-    // We can allow gossip_peer or manual iteration.
-    // Manual iteration is safer to ensure it hits everyone including the target.
-    let peers_snapshot = state.get_peers();
-    for (id, p) in peers_snapshot.iter() {
-         // Don't gossip to self (obv)
-         if *id == state.local_device_id.lock().unwrap().clone() {
-             continue;
-         }
-         
-         let addr = std::net::SocketAddr::new(p.ip, p.port);
-         let transport_clone = (*transport).clone();
-         let data_vec = data.clone();
-         
-         tauri::async_runtime::spawn(async move {
-             let _ = transport_clone.send_message(addr, &data_vec).await;
-         });
-    }
-
-    // 1. Remove from Known Peers
-    {
-        let mut kp = state.known_peers.lock().unwrap();
-        if kp.remove(&peer_id).is_some() {
-            save_known_peers(&app_handle, &kp);
-        }
-    }
-
-    // 2. Remove from Runtime Peers
-    {
-        let mut peers = state.peers.lock().unwrap();
-        peers.remove(&peer_id);
-    }
-
-    // 3. Emit Removal
-    let _ = app_handle.emit("peer-remove", &peer_id);
-
-    Ok(())
-}
-
 // Helper to wipe state and restart network identity
 pub(crate) fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppState, port: u16) {
     // 1. Reset Config on Disk
@@ -1555,274 +1031,6 @@ pub(crate) fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppSt
     
     // 4. Notify Frontend
     let _ = app_handle.emit("network-reset", ());
-}
-
-#[tauri::command]
-async fn send_clipboard(
-    text: String,
-    state: tauri::State<'_, AppState>,
-    transport: tauri::State<'_, Transport>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    
-    // Manual Send Command
-    clipboard::set_clipboard(&app_handle, text.clone()); // Update local clipboard too? Yes, usually.
-    
-    // Construct Payload
-    let local_id = state.local_device_id.lock().unwrap().clone();
-    let hostname = get_hostname_internal();
-    let msg_id = uuid::Uuid::new_v4().to_string();
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-
-    let payload_obj = crate::protocol::ClipboardPayload {
-        id: msg_id.clone(),
-        text: text.clone(),
-        timestamp: ts,
-        sender: hostname,
-        sender_id: local_id,
-        files: None,
-        blob: None,
-        formats: None,
-    };
-
-    // Emit local event so history updates
-    let _ = app_handle.emit("clipboard-change", &payload_obj);
-
-    // Send (mTLS provides confidentiality + sender auth; no app-layer
-    // encryption needed since v0.3 dropped cluster_key).
-    let msg = Message::Clipboard(payload_obj);
-    let data = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
-
-    let peers = state.get_peers();
-    for p in peers.values() {
-        let addr = std::net::SocketAddr::new(p.ip, p.port);
-        let transport_clone = (*transport).clone();
-        let data_vec = data.clone();
-        let app_clone = app_handle.clone();
-        let peer_id = p.id.clone();
-        let peer_hostname = p.hostname.clone();
-        let peer_version = p.protocol_version.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
-                report_send_failure(
-                    &app_clone,
-                    &peer_id,
-                    &peer_hostname,
-                    peer_version.as_deref(),
-                    addr,
-                    &e.to_string(),
-                );
-            } else {
-                tracing::debug!("[Clipboard] Sent to {}", addr);
-            }
-        });
-    }
-
-    let notifications = state.settings.lock().unwrap().notifications.clone();
-    if notifications.data_sent {
-        send_notification(
-            &app_handle,
-            "Clipboard Sent",
-            "Manual broadcast successful.",
-            false,
-            Some(2),
-            "history",
-            NotificationPayload::None,
-        );
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn delete_history_item(
-    app_handle: tauri::AppHandle,
-    id: String,
-    state: tauri::State<'_, AppState>,
-    transport: tauri::State<'_, Transport>,
-) -> Result<(), String> {
-    // 1. Emit Local Event (to update UI immediately)
-    tracing::info!("Deleting history item locally: {}", id);
-    let _ = app_handle.emit("history-delete", &id);
-
-    // 2. Broadcast to Peers
-    let msg = Message::HistoryDelete(id);
-    let data = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
-    
-    let peers = state.get_peers();
-    for p in peers.values() {
-         let addr = std::net::SocketAddr::new(p.ip, p.port);
-         let transport_clone = (*transport).clone();
-         let data_vec = data.clone();
-         tauri::async_runtime::spawn(async move {
-             let _ = transport_clone.send_message(addr, &data_vec).await;
-         });
-    }
-    Ok(())
-}
-
-#[tauri::command]
-async fn set_local_clipboard(app: tauri::AppHandle, text: String) -> Result<(), String> {
-    clipboard::set_clipboard(&app, text);
-    Ok(())
-}
-
-#[tauri::command]
-async fn exit_app(app_handle: tauri::AppHandle) {
-    app_handle.exit(0);
-}
-
-#[tauri::command]
-async fn retry_connection(
-    state: tauri::State<'_, AppState>,
-    transport: tauri::State<'_, Transport>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    // Clone inner values to own them for the async task
-    let state_owned = (*state).clone();
-    let transport_owned = (*transport).clone();
-    let app_handle_clone = app_handle.clone();
-    
-    // Re-run the startup probe logic
-    tauri::async_runtime::spawn(async move {
-         let known_peers = {
-             state_owned.known_peers.lock().unwrap().clone()
-         };
-         
-         if !known_peers.is_empty() {
-             tracing::info!("Retry Connection: Probing {} known peers...", known_peers.len());
-             for (_id, peer) in known_peers {
-                 let s = state_owned.clone();
-                 let t = transport_owned.clone();
-                 let a = app_handle_clone.clone();
-
-                 tauri::async_runtime::spawn(async move {
-                     net_util::probe_ip(peer.ip, peer.port, s, t, a).await;
-                 });
-             }
-         } else {
-             // If no known peers, maybe we should try scanning? 
-             // But for now, we only care about reconnecting to knowns.
-             tracing::warn!("Retry Connection: No known peers to probe.");
-         }
-    });
-    
-    Ok(())
-}
-
-/// User-triggered "switch to rich format" promotion (issue #17 follow-up,
-/// GNOME only). On receive, a Rich payload landed plain text on the clipboard
-/// and stashed the full payload in `pending_rich_promotion`. This command
-/// pops the stash and writes the rich formats — last-write-wins on the GNOME
-/// extension, so what survives is the final rich MIME (`text/rtf` in our
-/// current priority order). The `IGNORED_CONTENT` guard set by
-/// `set_clipboard_rich_with_ignore` combined with `rich_eq_stable`'s lenient
-/// subset rule catches the resulting truncated read-back, so the promotion
-/// doesn't echo back to the sender. Idempotent — a second call with nothing
-/// stashed returns Ok.
-#[tauri::command]
-async fn promote_pending_rich(
-    state: tauri::State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    let promoted = {
-        let mut slot = state.pending_rich_promotion.lock().unwrap();
-        slot.take()
-    };
-
-    let Some(payload) = promoted else {
-        tracing::debug!("promote_pending_rich called with nothing stashed");
-        return Ok(());
-    };
-
-    let Some(formats) = payload
-        .formats
-        .as_ref()
-        .filter(|fs| !fs.is_empty())
-        .cloned()
-    else {
-        tracing::warn!(
-            "promote_pending_rich: stashed payload had no rich formats; nothing to promote"
-        );
-        return Ok(());
-    };
-
-    tracing::info!(
-        "Promoting rich clipboard from {}: text={} chars, formats=[{}]",
-        payload.sender,
-        payload.text.len(),
-        formats.iter().map(|f| f.mime_type.as_str()).collect::<Vec<_>>().join(", ")
-    );
-
-    clipboard::set_clipboard_rich(&app_handle, payload.text.clone(), formats);
-    let _ = app_handle.emit("clipboard-change", &payload);
-    Ok(())
-}
-
-#[tauri::command]
-async fn confirm_pending_clipboard(
-    state: tauri::State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-    let pending_opt = {
-        let mut lock = state.pending_clipboard.lock().unwrap();
-        lock.take() // Take it (clearing it)
-    };
-
-    if let Some(payload) = pending_opt {
-        tracing::info!("Confirming pending clipboard from {}", payload.sender);
-
-        // §3.3 descriptor: bytes weren't carried inline. Trigger a
-        // FileRequest fetch over the `clustercut-file` ALPN; the stream
-        // listener will land them on the OS clipboard once they arrive.
-        if let Some(blob) = payload.blob.as_ref() {
-            if blob.is_descriptor() {
-                tracing::info!(
-                    "[ClipboardBlob] Confirming descriptor fetch (id={}, total={:?})",
-                    payload.id,
-                    blob.total_size
-                );
-                {
-                    let mut slot = state.in_flight_clipboard_fetch.lock().unwrap();
-                    *slot = Some(payload.id.clone());
-                }
-                let mb = blob.total_size.unwrap_or(0) as f64 / (1024.0 * 1024.0);
-                let notifications = state.settings.lock().unwrap().notifications.clone();
-                if notifications.data_received {
-                    send_notification(
-                        &app_handle,
-                        "Receiving Clipboard Image",
-                        &format!("Receiving {:.1} MB image from {}…", mb, payload.sender),
-                        false,
-                        Some(2),
-                        "history",
-                        NotificationPayload::None,
-                    );
-                }
-                return request_clipboard_blob_internal(&state, payload.id.clone(), payload.sender_id.clone()).await;
-            }
-        }
-
-        if let Some(blob) = payload.blob.clone() {
-            clipboard::set_clipboard_image(&app_handle, blob);
-        } else if let Some(formats) = payload
-            .formats
-            .as_ref()
-            .filter(|fs| !fs.is_empty())
-            .cloned()
-        {
-            clipboard::set_clipboard_rich(&app_handle, payload.text.clone(), formats);
-        } else {
-            clipboard::set_clipboard(&app_handle, payload.text.clone());
-        }
-
-        // Emit change event so history updates
-        let _ = app_handle.emit("clipboard-change", &payload);
-
-        Ok(())
-    } else {
-        Err("No pending clipboard content".to_string())
-    }
 }
 
 /// Send a `FileRequest` to the descriptor's source peer to begin fetching a
@@ -2695,43 +1903,43 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            get_local_ip,
-            get_peers,
+            commands::peers::get_local_ip,
+            commands::peers::get_peers,
 
-            add_manual_peer,
+            commands::peers::add_manual_peer,
             pairing::start_pairing,
-            delete_peer,
-            leave_network,
-            get_network_name,
-            request_file,
-            delete_history_item,
-            check_gnome_extension_status,
-            get_network_pin,
-            get_device_id,
-            get_hostname,
-            get_settings,
-            get_known_peers,
-            expects_remote_manual_peers,
-            log_frontend,
-            save_settings,
-            set_network_identity,
-            regenerate_network_identity,
-            send_clipboard,
-            set_local_clipboard,
-            set_local_clipboard_files,
-            confirm_pending_clipboard,
-            promote_pending_rich,
-            get_launch_args,
-            exit_app,
-            retry_connection,
-            configure_autostart,
-            get_autostart_state,
-            get_listening_port,
-            show_native_notification,
-            get_theme_override,
-            get_current_theme,
-            get_legacy_peers,
-            dismiss_legacy_peer_banner,
+            commands::peers::delete_peer,
+            commands::peers::leave_network,
+            commands::identity::get_network_name,
+            commands::clipboard::request_file,
+            commands::clipboard::delete_history_item,
+            commands::system::check_gnome_extension_status,
+            commands::identity::get_network_pin,
+            commands::identity::get_device_id,
+            commands::identity::get_hostname,
+            commands::settings::get_settings,
+            commands::peers::get_known_peers,
+            commands::peers::expects_remote_manual_peers,
+            commands::system::log_frontend,
+            commands::settings::save_settings,
+            commands::identity::set_network_identity,
+            commands::identity::regenerate_network_identity,
+            commands::clipboard::send_clipboard,
+            commands::clipboard::set_local_clipboard,
+            commands::clipboard::set_local_clipboard_files,
+            commands::clipboard::confirm_pending_clipboard,
+            commands::clipboard::promote_pending_rich,
+            commands::system::get_launch_args,
+            commands::system::exit_app,
+            commands::peers::retry_connection,
+            commands::system::configure_autostart,
+            commands::system::get_autostart_state,
+            commands::peers::get_listening_port,
+            commands::system::show_native_notification,
+            commands::theme::get_theme_override,
+            commands::theme::get_current_theme,
+            commands::peers::get_legacy_peers,
+            commands::peers::dismiss_legacy_peer_banner,
             pairing::is_pairing_locked_out,
             pairing::rearm_pairing,
             pairing::get_pairing_accept,
@@ -2810,8 +2018,6 @@ pub fn run() {
     });
 }
 
-
-
 fn clear_cache(app: &tauri::AppHandle) {
     if let Ok(root_cache_dir) = app.path().app_cache_dir() {
         // Use a subdirectory to avoid nuking Webview2/GTK cache
@@ -2832,12 +2038,6 @@ fn clear_cache(app: &tauri::AppHandle) {
     }
 }
 
-#[tauri::command]
-async fn set_local_clipboard_files(app: tauri::AppHandle, paths: Vec<String>) -> Result<(), String> {
-    clipboard::set_clipboard_paths(&app, paths);
-    Ok(())
-}
-
 #[derive(Clone, Debug)]
 pub enum NotificationPayload {
     None,
@@ -2847,17 +2047,6 @@ pub enum NotificationPayload {
     /// notification carries a "Switch to Rich" action that invokes
     /// `promote_pending_rich` so the user can upgrade without opening the app.
     PromoteRichClipboard,
-}
-
-#[tauri::command]
-async fn request_file(
-    _app_handle: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    file_id: String,
-    file_index: usize,
-    peer_id: String,
-) -> Result<(), String> {
-    request_file_internal(&state, file_id, file_index, peer_id).await
 }
 
 pub async fn request_file_internal(
@@ -2897,7 +2086,7 @@ pub async fn request_file_internal(
     Ok(())
 }
 
-fn register_shortcuts(app_handle: &tauri::AppHandle) {
+pub(crate) fn register_shortcuts(app_handle: &tauri::AppHandle) {
     let state = app_handle.state::<AppState>();
     let settings = state.settings.lock().unwrap().clone();
     
@@ -3064,71 +2253,5 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, event: Sh
            }
         }
     }
-}
-#[derive(serde::Serialize)]
-struct ExtensionStatus {
-    is_gnome: bool,
-    is_installed: bool,
-    /// True when on GNOME Wayland without the extension — clipboard sync will NOT work
-    clipboard_requires_extension: bool,
-}
-
-#[tauri::command]
-async fn check_gnome_extension_status() -> ExtensionStatus {
-    let xdg_current_desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    let is_gnome = xdg_current_desktop.contains("GNOME");
-
-    if !is_gnome {
-        return ExtensionStatus { is_gnome: false, is_installed: false, clipboard_requires_extension: false };
-    }
-
-    #[cfg(target_os = "linux")]
-    let is_wayland = clipboard::is_wayland();
-    #[cfg(not(target_os = "linux"))]
-    let is_wayland = false;
-
-    // Try D-Bus first (works in Flatpak if permissions are set)
-    if let Ok(connection) = zbus::Connection::session().await {
-         let proxy_result: zbus::Result<zbus::Proxy> = zbus::Proxy::new(
-             &connection,
-             "org.gnome.Shell",
-             "/org/gnome/Shell",
-             "org.gnome.Shell.Extensions"
-         ).await;
-
-         if let Ok(proxy) = proxy_result {
-              // Method: ListExtensions() -> a{sa{sv}}
-              // Returns a map where key is UUID, value is properties
-              // Use OwnedValue to avoid lifetime issues with DynamicDeserialize
-              let call_result: zbus::Result<std::collections::HashMap<String, std::collections::HashMap<String, zbus::zvariant::OwnedValue>>> = proxy.call("ListExtensions", &()).await;
-              
-              if let Ok(extensions) = call_result {
-                   let is_installed = extensions.contains_key("clustercut@keithvassallo.com");
-                   return ExtensionStatus {
-                       is_gnome: true,
-                       is_installed,
-                       clipboard_requires_extension: is_wayland && !is_installed,
-                   };
-              }
-         }
-    }
-
-    // Fallback to File Check (for native builds)
-    let home = std::env::var("HOME").unwrap_or_default();
-    let local_path = format!("{}/.local/share/gnome-shell/extensions/clustercut@keithvassallo.com", home);
-    let system_path = "/usr/share/gnome-shell/extensions/clustercut@keithvassallo.com";
-
-    let is_installed = std::path::Path::new(&local_path).exists() || std::path::Path::new(system_path).exists();
-
-    ExtensionStatus {
-        is_gnome: true,
-        is_installed,
-        clipboard_requires_extension: is_wayland && !is_installed,
-    }
-}
-
-#[tauri::command]
-fn get_launch_args() -> Vec<String> {
-    std::env::args().collect()
 }
 
