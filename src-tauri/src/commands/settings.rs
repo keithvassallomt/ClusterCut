@@ -26,7 +26,7 @@ pub(crate) fn save_settings(
     crate::tray::update_tray_menu(&app_handle);
 
     // Update Shortcuts
-    crate::register_shortcuts(&app_handle);
+    crate::shortcuts::register_shortcuts(&app_handle);
     // If auto_receive is now OFF, we might want to do something?
     // If device name changed, we should probably rebroadcast or something,
     // but the next heartbeat or discovery probe will pick it up.
