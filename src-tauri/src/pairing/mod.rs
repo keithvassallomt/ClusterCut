@@ -309,7 +309,7 @@ pub(crate) async fn start_pairing(
         runtime_peers.insert(responder_device_id.clone(), pinned.clone());
         kp_lock.insert(responder_device_id.clone(), pinned.clone());
         crate::storage::save_known_peers(&app_handle, &kp_lock);
-        let _ = app_handle.emit("peer-update", &pinned);
+        let _ = app_handle.emit("peer-update", crate::peer::PeerView::from_peer(&pinned));
     }
 
     // T5 (wire 0.3.3) — wait for the responder to finish processing T4
@@ -393,14 +393,14 @@ pub(crate) async fn start_pairing(
             }
             kp_lock.insert(peer.id.clone(), peer.clone());
             runtime_peers.insert(peer.id.clone(), peer.clone());
-            let _ = app_handle.emit("peer-update", &peer);
+            let _ = app_handle.emit("peer-update", crate::peer::PeerView::from_peer(&peer));
         }
         // Tag the responder's record with the cluster's network_name now
         // that we have it.
         if let Some(peer) = runtime_peers.get_mut(&responder_device_id) {
             peer.network_name = Some(network_name.clone());
             kp_lock.insert(responder_device_id.clone(), peer.clone());
-            let _ = app_handle.emit("peer-update", &*peer);
+            let _ = app_handle.emit("peer-update", crate::peer::PeerView::from_peer(&*peer));
         }
         crate::storage::save_known_peers(&app_handle, &kp_lock);
     }
@@ -747,7 +747,7 @@ pub(crate) async fn handle_pairing_connection(
         crate::storage::save_known_peers(&app_handle, &kp_lock);
     }
     state.add_peer(pinned.clone());
-    let _ = app_handle.emit("peer-update", &pinned);
+    let _ = app_handle.emit("peer-update", crate::peer::PeerView::from_peer(&pinned));
 
     // Gossip the new peer to the rest of the cluster ONLY after T4 succeeds —
     // existing mTLS peers need the new fingerprint to accept its inbound

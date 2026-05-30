@@ -1,6 +1,6 @@
 //! Peer management commands.
 
-use crate::peer::Peer;
+use crate::peer::{Peer, PeerView};
 use crate::state::AppState;
 use crate::{net_util, perform_factory_reset};
 use crate::protocol::Message;
@@ -10,8 +10,11 @@ use ipnetwork::IpNetwork;
 use tauri::{Emitter, State};
 
 #[tauri::command]
-pub(crate) fn get_peers(state: State<AppState>) -> std::collections::HashMap<String, Peer> {
+pub(crate) fn get_peers(state: State<AppState>) -> std::collections::HashMap<String, PeerView> {
     state.get_peers()
+        .into_iter()
+        .map(|(id, peer)| (id, PeerView::from_peer(&peer)))
+        .collect()
 }
 
 #[tauri::command]

@@ -7,7 +7,6 @@ import {
 import clsx from "clsx";
 import { Badge, SectionHeader, Card, Button, IconButton, Field } from "./ui";
 import type { Peer, NearbyNetwork } from "../types";
-import { isPeerProtocolCompatible } from "../lib/protocol";
 
 function CopyMini({ text }: { text: string }) {
   return (
@@ -135,7 +134,7 @@ function DevicesView({
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5 text-sm font-semibold text-zinc-900 dark:text-zinc-50">
                           <span className="truncate">{p.hostname || p.id}</span>
-                          {!isPeerProtocolCompatible(p) && (
+                          {!p.compatible && (
                             <span
                               className="inline-flex"
                               title={`${p.hostname || p.id} is running an older version of ClusterCut and won't be able to send or receive clipboard data. Please upgrade it.`}

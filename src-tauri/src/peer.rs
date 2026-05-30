@@ -28,8 +28,48 @@ pub struct Peer {
     /// is absent (older builds didn't set it). May get persisted to
     /// `known_peers.json` as a side effect of save calls — that's
     /// harmless since the field is refreshed from mDNS at every
-    /// resolution. Must serialize so the Tauri→JS bridge carries it
-    /// to the frontend's compatibility-check.
+    /// resolution.
     #[serde(default)]
     pub protocol_version: Option<String>,
+}
+
+/// Frontend-only view of a peer. Carries all `Peer` fields plus a
+/// `compatible` flag computed locally by Rust — never sent peer-to-peer.
+/// Emitted via `peer-update` events and returned by `get_peers` so the
+/// TypeScript UI can read `peer.compatible` directly without re-implementing
+/// the version-comparison logic.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerView {
+    pub id: String,
+    pub ip: std::net::IpAddr,
+    pub port: u16,
+    pub hostname: String,
+    pub last_seen: u64,
+    pub is_trusted: bool,
+    pub is_manual: bool,
+    pub network_name: Option<String>,
+    pub fingerprint: Option<Vec<u8>>,
+    pub protocol_version: Option<String>,
+    /// True when the peer's advertised `protocol_version` is >= the minimum
+    /// this build requires. Computed by `net_util::is_protocol_compatible`;
+    /// never travels over the peer-to-peer wire.
+    pub compatible: bool,
+}
+
+impl PeerView {
+    pub fn from_peer(peer: &Peer) -> Self {
+        Self {
+            id: peer.id.clone(),
+            ip: peer.ip,
+            port: peer.port,
+            hostname: peer.hostname.clone(),
+            last_seen: peer.last_seen,
+            is_trusted: peer.is_trusted,
+            is_manual: peer.is_manual,
+            network_name: peer.network_name.clone(),
+            fingerprint: peer.fingerprint.clone(),
+            protocol_version: peer.protocol_version.clone(),
+            compatible: crate::net_util::is_protocol_compatible(peer.protocol_version.as_deref()),
+        }
+    }
 }

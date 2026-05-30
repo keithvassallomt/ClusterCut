@@ -155,7 +155,7 @@ pub(crate) async fn probe_ip(
                              protocol_version: None,
                          };
                          peers.insert(id.clone(), peer.clone());
-                         let _ = app_handle.emit("peer-update", &peer);
+                         let _ = app_handle.emit("peer-update", crate::peer::PeerView::from_peer(&peer));
                          save_known_peers(&app_handle, &peers); // PERSIST manual placeholder
 
                           let notifications = state.settings.lock().unwrap().notifications.clone();

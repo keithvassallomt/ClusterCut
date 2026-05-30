@@ -768,7 +768,7 @@ pub(crate) fn run() {
                                     };
 
                                     d_state.add_peer(peer.clone());
-                                    let _ = d_handle.emit("peer-update", &peer);
+                                    let _ = d_handle.emit("peer-update", crate::peer::PeerView::from_peer(&peer));
 
                                     // Trigger Notification (with Layer 2 ping verification)
                                     {

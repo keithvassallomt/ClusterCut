@@ -1,33 +1,4 @@
-import type { ClipboardBlobPreview, ClipboardFormatPreview, Peer } from "../types";
-
-export const MIN_COMPATIBLE_PROTOCOL: [number, number, number] = [0, 3, 3];
-
-export function parseProtocolVersion(v: string | null | undefined): [number, number, number] | null {
-  if (!v) return null;
-  const parts = v.split(".");
-  if (parts.length < 2) return null;
-  const head = (s: string) => {
-    const m = s.match(/^(\d+)/);
-    return m ? parseInt(m[1], 10) : NaN;
-  };
-  const major = head(parts[0]);
-  const minor = head(parts[1]);
-  const patch = parts.length >= 3 ? head(parts[2]) : 0;
-  if (Number.isNaN(major) || Number.isNaN(minor) || Number.isNaN(patch)) return null;
-  return [major, minor, patch];
-}
-
-export function isPeerProtocolCompatible(peer: Peer): boolean {
-  const parsed = parseProtocolVersion(peer.protocol_version);
-  if (!parsed) return false;
-  for (let i = 0; i < 3; i++) {
-    if (parsed[i] !== MIN_COMPATIBLE_PROTOCOL[i]) {
-      return parsed[i] > MIN_COMPATIBLE_PROTOCOL[i];
-    }
-  }
-  return true;
-}
-
+import type { ClipboardBlobPreview, ClipboardFormatPreview } from "../types";
 
 // The backend ships ClipboardBlob.data as a base64 string (chosen over the
 // default Vec<u8>→JSON-int-array encoding to keep wire size manageable —

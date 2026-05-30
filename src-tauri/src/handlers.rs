@@ -936,7 +936,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                  peer.is_trusted = true;
 
                  listener_state.add_peer(peer.clone());
-                 let _ = listener_handle.emit("peer-update", &peer);
+                 let _ = listener_handle.emit("peer-update", crate::peer::PeerView::from_peer(&peer));
 
                  // Fire deferred join notification if this peer was pending verification
                  {

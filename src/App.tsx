@@ -21,7 +21,7 @@ import type {
   Peer, View, NearbyNetwork, ClipboardBlobPreview, ClipboardFormatPreview,
   HistoryItem, AppSettings,
 } from "./types";
-import { isPeerProtocolCompatible, blobFromPayload, formatsFromPayload } from "./lib/protocol";
+import { blobFromPayload, formatsFromPayload } from "./lib/protocol";
 
 // Helper for backend logging
 // Helper for backend logging
@@ -787,7 +787,7 @@ export default function App() {
         hostname: d.hostname,
         // Map backend 'last_seen' to status? current backend removes ancient peers so assume online if present
         status: "online",
-        incompatible: !isPeerProtocolCompatible(d),
+        incompatible: !d.compatible,
       }))
     });
   });

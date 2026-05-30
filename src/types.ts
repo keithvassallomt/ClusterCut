@@ -8,11 +8,12 @@ export interface Peer {
   is_manual?: boolean;
   network_name?: string;
   platform?: string; // Backend doesn't send this yet, will mock or infer
-  /// Protocol-compatibility version advertised via mDNS. Missing or below
-  /// `MIN_COMPATIBLE_PROTOCOL` means the peer is on a wire-protocol
-  /// version this build can't talk to — surfaced as a yellow warning
-  /// indicator and (on user-triggered sends) a "Peer needs updating" modal.
+  /// Protocol-compatibility version advertised via mDNS.
   protocol_version?: string | null;
+  /// True when the peer's `protocol_version` meets the minimum required by
+  /// this build. Computed by the Rust backend (net_util::is_protocol_compatible)
+  /// and injected into every frontend-bound payload; never travels peer-to-peer.
+  compatible: boolean;
 }
 
 export type View = "devices" | "history" | "settings";
