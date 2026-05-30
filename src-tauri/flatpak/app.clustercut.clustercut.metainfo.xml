@@ -64,6 +64,19 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.4" date="2026-05-30">
+      <description>
+        <p>Clipboard and pairing fixes, plus smoother formatted-text handling on GNOME.</p>
+        <ul>
+          <li>Fixed a banner that wrongly told you to re-pair a device when you were connected through a VPN</li>
+          <li>Pairing with the wrong PIN now shows a clear "the PIN may be incorrect" message instead of a confusing "session expired" error, and an accidental space in the PIN no longer silently breaks pairing</li>
+          <li>Copying formatted text to a Windows PC no longer clears the clipboard on the computer you copied from</li>
+          <li>Pasting code copied from PyCharm into Word on Windows now keeps the whole snippet instead of just the last few characters</li>
+          <li>A stray space, tab, or blank line on your clipboard is no longer pushed to your other devices</li>
+          <li>On GNOME, receiving formatted text now puts the plain text on your clipboard straight away and offers a one-click "Switch to Rich" button in a notification — so pasting into apps like Text Editor, OnlyOffice, or your browser just works</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.3" date="2026-05-27">
       <description>
         <p>Stronger pairing security, an on-demand pause button for pairing, and clearer feedback when a peer is on an older version.</p>

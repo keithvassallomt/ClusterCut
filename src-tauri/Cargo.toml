@@ -1,6 +1,6 @@
 [package]
 name = "clustercut"
-version = "0.3.3"
+version = "0.3.4"
 description = "ClusterCut Clipboard Sync"
 authors = ["Keith Vassallo"]
 edition = "2021"

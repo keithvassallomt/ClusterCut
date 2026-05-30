@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.4] — 2026-05-30
 
 ### Fixed
 - A "paired before this version's TLS upgrade — please re-pair" banner could appear for a manually-probed address that was never actually a paired device (e.g. a VPN gateway that forwards port 4654 to a real node). The startup sweep flagged any stored peer without a cert fingerprint as legacy, which also caught throwaway `manual-<ip>` probe placeholders. It now only flags genuine paired devices, so the banner can't fire for an address you can never re-pair with.
