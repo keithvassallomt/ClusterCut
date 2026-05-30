@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Receiving a rich-text payload on a **GNOME** machine now lands the plain text on the clipboard by default and fires a system notification with a one-click **"Switch to Rich"** action — no app window needed. This works around a hard GJS limitation that prevents the GNOME extension from offering multiple MIME types simultaneously (see [GJS #255](https://gitlab.gnome.org/GNOME/gjs/-/issues/255); the most-deployed [Clipboard Indicator](https://github.com/Tudmotu/gnome-shell-extension-clipboard-indicator) hits the same wall). Before this change, only the rich format reached the OS clipboard, so pastes into gedit, GNOME Text Editor, OnlyOffice, and browser inputs got nothing. Windows, macOS, and KDE/Sway/Hyprland receivers are unaffected — they write all MIME types atomically.
+- Internal code cleanup, no behavior change: the two biggest source files were split into focused modules — the Rust backend (`lib.rs`, ~5,500 → ~870 lines) and the React UI (`App.tsx`, ~3,000 → ~1,230 lines). Deciding whether a peer's protocol version is compatible now happens in the Rust backend and is sent to the UI as a flag, instead of being re-implemented in TypeScript. Nothing user-facing changed; the work is purely about making the codebase easier to navigate and maintain.
 
 ## [0.3.3] — 2026-05-27
 
