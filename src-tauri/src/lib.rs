@@ -2,7 +2,7 @@ mod clipboard;
 mod compression;
 #[cfg(target_os = "linux")]
 mod dbus;
-mod crypto;
+mod pairing;
 mod discovery;
 mod netmon;
 mod peer;
@@ -1903,7 +1903,7 @@ async fn start_pairing(
     let local_id_raw = { state.local_device_id.lock().unwrap().clone() };
     let local_id = crate::protocol::truncate_device_id(&local_id_raw);
     let (spake_state, spake_msg_i) =
-        crypto::start_spake2(&pin, &local_id, &peer_id).map_err(|e| e.to_string())?;
+        pairing::start_spake2(&pin, &local_id, &peer_id).map_err(|e| e.to_string())?;
 
     // Per WIRE-PROTOCOL-0.3.1 §H6: the TCP socket is not opened until the
     // user has entered the PIN and pressed OK (i.e. until this function is
@@ -1932,7 +1932,7 @@ async fn start_pairing(
     };
 
     // Finish SPAKE2 → shared 32-byte session key.
-    let session_key = match crypto::finish_spake2(spake_state, &spake_msg_r) {
+    let session_key = match pairing::finish_spake2(spake_state, &spake_msg_r) {
         Ok(k) => k,
         Err(e) => {
             tracing::error!("SPAKE2 finish failed (initiator): {}", e);
@@ -1948,8 +1948,8 @@ async fn start_pairing(
     // labelled transcript. Any wire-byte rewrite between T0 and T1 produces
     // a different transcript here than the responder reconstructed, the
     // sub-keys diverge, and the T3 ResponderId decrypt below fails closed.
-    let transcript = crypto::pairing_transcript(&spake_msg_i, &spake_msg_r);
-    let (k_i2r, k_r2i) = crypto::derive_pair_subkeys(&session_key, &transcript)
+    let transcript = pairing::pairing_transcript(&spake_msg_i, &spake_msg_r);
+    let (k_i2r, k_r2i) = pairing::derive_pair_subkeys(&session_key, &transcript)
         .map_err(|e| format!("HKDF sub-key derivation failed: {}", e))?;
     tracing::info!("SPAKE2 complete (initiator); sending InitiatorKC (T2).");
 
@@ -1958,11 +1958,11 @@ async fn start_pairing(
     // the fixed KC_PLAINTEXT here is what proves to the responder that we
     // derived the same SPAKE2 key (i.e. we have the right PIN); a wrong-PIN
     // attacker can't forge a tag that decrypts under the responder's k_i2r.
-    let nonce_kc = crypto::fresh_pair_nonce();
-    let ciphertext_kc = crypto::pair_aead_encrypt(
+    let nonce_kc = pairing::fresh_pair_nonce();
+    let ciphertext_kc = pairing::pair_aead_encrypt(
         &k_i2r,
         &nonce_kc,
-        crypto::INITIATOR_KC_PLAINTEXT,
+        pairing::INITIATOR_KC_PLAINTEXT,
     )
     .map_err(|e| format!("InitiatorKC AEAD encrypt failed: {}", e))?;
     let t2 = PairingMessage::InitiatorKC {
@@ -1999,7 +1999,7 @@ async fn start_pairing(
         let _ = app_handle.emit("pairing-failed", "Pairing protocol error (bad nonce). Please try again.");
         "ResponderId nonce must be 12 bytes".to_string()
     })?;
-    let r_inner_bytes = match crypto::pair_aead_decrypt(&k_r2i, &nonce_r_arr, &ciphertext_r) {
+    let r_inner_bytes = match pairing::pair_aead_decrypt(&k_r2i, &nonce_r_arr, &ciphertext_r) {
         Ok(b) => b,
         Err(e) => {
             // Wrong PIN or active MITM. Generic UI message; no detail leaked.
@@ -2027,8 +2027,8 @@ async fn start_pairing(
     };
     let i_inner_bytes = serde_json::to_vec(&i_inner)
         .map_err(|e| format!("Failed to serialise InitiatorId inner: {}", e))?;
-    let nonce_i = crypto::fresh_pair_nonce();
-    let ciphertext_i = crypto::pair_aead_encrypt(&k_i2r, &nonce_i, &i_inner_bytes)
+    let nonce_i = pairing::fresh_pair_nonce();
+    let ciphertext_i = pairing::pair_aead_encrypt(&k_i2r, &nonce_i, &i_inner_bytes)
         .map_err(|e| format!("InitiatorId AEAD encrypt failed: {}", e))?;
     let t4 = PairingMessage::InitiatorId {
         nonce: nonce_i.to_vec(),
@@ -2266,7 +2266,7 @@ async fn handle_pairing_connection(
     let local_id_raw = state.local_device_id.lock().unwrap().clone();
     let local_id = crate::protocol::truncate_device_id(&local_id_raw);
     let pin = state.network_pin.lock().unwrap().clone();
-    let (spake_state, spake_msg_r) = match crypto::start_spake2(&pin, &local_id, "initiator") {
+    let (spake_state, spake_msg_r) = match pairing::start_spake2(&pin, &local_id, "initiator") {
         Ok(v) => v,
         Err(e) => {
             log_pairing_failure(&state, peer_addr, &format!("SPAKE2 init error: {}", e));
@@ -2280,7 +2280,7 @@ async fn handle_pairing_connection(
     }
 
     // Finish SPAKE2 → shared 32-byte session key.
-    let session_key = match crypto::finish_spake2(spake_state, &spake_msg_i) {
+    let session_key = match pairing::finish_spake2(spake_state, &spake_msg_i) {
         Ok(k) => k,
         Err(e) => {
             // SPAKE2.finish() doesn't actually fail on PIN mismatch — wrong
@@ -2296,8 +2296,8 @@ async fn handle_pairing_connection(
         log_pairing_failure(&state, peer_addr, "SPAKE2 produced wrong key length");
         return;
     }
-    let transcript = crypto::pairing_transcript(&spake_msg_i, &spake_msg_r);
-    let (k_i2r, k_r2i) = match crypto::derive_pair_subkeys(&session_key, &transcript) {
+    let transcript = pairing::pairing_transcript(&spake_msg_i, &spake_msg_r);
+    let (k_i2r, k_r2i) = match pairing::derive_pair_subkeys(&session_key, &transcript) {
         Ok(pair) => pair,
         Err(e) => {
             log_pairing_failure(&state, peer_addr, &format!("HKDF derive failed: {}", e));
@@ -2339,12 +2339,12 @@ async fn handle_pairing_connection(
             return;
         }
     };
-    match crypto::pair_aead_decrypt(&k_i2r, &kc_nonce_arr, &kc_ciphertext) {
+    match pairing::pair_aead_decrypt(&k_i2r, &kc_nonce_arr, &kc_ciphertext) {
         Ok(plaintext) => {
             // Defence in depth: also require the plaintext byte string match,
             // so a future variant of the wire that re-uses the InitiatorKC
             // shape can't be replayed against a 0.3.3 responder.
-            if plaintext.as_slice() != crypto::INITIATOR_KC_PLAINTEXT {
+            if plaintext.as_slice() != pairing::INITIATOR_KC_PLAINTEXT {
                 record_pairing_aead_failure(
                     &state,
                     &app_handle,
@@ -2409,8 +2409,8 @@ async fn handle_pairing_connection(
             return;
         }
     };
-    let nonce_r = crypto::fresh_pair_nonce();
-    let ciphertext_r = match crypto::pair_aead_encrypt(&k_r2i, &nonce_r, &r_inner_bytes) {
+    let nonce_r = pairing::fresh_pair_nonce();
+    let ciphertext_r = match pairing::pair_aead_encrypt(&k_r2i, &nonce_r, &r_inner_bytes) {
         Ok(ct) => ct,
         Err(e) => {
             log_pairing_failure(&state, peer_addr, &format!("ResponderId AEAD encrypt failed: {}", e));
@@ -2447,7 +2447,7 @@ async fn handle_pairing_connection(
             return;
         }
     };
-    let i_inner_bytes = match crypto::pair_aead_decrypt(&k_i2r, &nonce_i_arr, &ciphertext_i) {
+    let i_inner_bytes = match pairing::pair_aead_decrypt(&k_i2r, &nonce_i_arr, &ciphertext_i) {
         Ok(b) => b,
         Err(e) => {
             // The big one: AEAD-tag verify failed. Either the PIN was wrong
