@@ -109,7 +109,7 @@ pub(crate) async fn start_pairing(
     // let the wire-level failure handle it — the user explicitly typed
     // the address and we have no advance signal.
     if !is_manual_pair {
-        if !crate::is_protocol_compatible(discovered_proto_version.as_deref()) {
+        if !crate::net_util::is_protocol_compatible(discovered_proto_version.as_deref()) {
             let hostname = discovered_hostname.unwrap_or_else(|| peer_id.clone());
             tracing::warn!(
                 "Refusing to pair with {} ({}): proto {:?} below floor.",
@@ -752,7 +752,7 @@ pub(crate) async fn handle_pairing_connection(
     // Gossip the new peer to the rest of the cluster ONLY after T4 succeeds —
     // existing mTLS peers need the new fingerprint to accept its inbound
     // connections.
-    crate::gossip_peer(&pinned, &state, &transport, Some(peer_addr));
+    crate::net_util::gossip_peer(&pinned, &state, &transport, Some(peer_addr));
 
     // T5 (wire 0.3.3) — drop the stream. The kernel closes the TCP
     // connection, which the initiator reads as the "responder is ready
