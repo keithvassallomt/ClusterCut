@@ -25,7 +25,12 @@ use storage::{
     save_cluster_id,
     reset_network_state,
 };
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
+// `Manager` (for `get_webview_window`) is only used in the macOS/Linux
+// notification-callback paths; on Windows those are cfg'd out, so the import
+// would be unused there.
+#[cfg(not(target_os = "windows"))]
+use tauri::Manager;
 
 // Track last notification time for macOS cleaner
 #[cfg(target_os = "macos")]
