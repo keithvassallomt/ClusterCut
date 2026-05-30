@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
-  Monitor, History, ShieldCheck, PlusCircle, LogOut,
+  Monitor, History, PlusCircle, LogOut,
   Settings, Lock, Unlock, AlertTriangle,
   Puzzle, Loader2, Unplug
 } from "lucide-react";
@@ -15,6 +15,7 @@ import { DevicesView } from "./components/DevicesView";
 import { HistoryView } from "./components/HistoryView";
 import { SettingsView } from "./components/SettingsView";
 import { ManualSyncFAB, ManualSyncModal } from "./components/ManualSync";
+import { LegacyPeerBanner, PairingLockoutBanner } from "./components/Banners";
 import type {
   Peer, View, NearbyNetwork, ClipboardBlobPreview, ClipboardFormatPreview,
   HistoryItem, AppSettings,
@@ -880,31 +881,13 @@ export default function App() {
           they can't receive clipboard data until re-paired via the PIN
           flow on the Devices tab. */}
       {legacyPeers.length > 0 && (
-        <div className="fixed inset-x-0 top-0 z-40 border-b border-amber-300 bg-amber-50 px-4 py-3 shadow-sm dark:border-amber-700 dark:bg-amber-950/80">
-          <div className="mx-auto flex max-w-5xl items-start gap-3">
-            <ShieldCheck className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-600 dark:text-amber-400" />
-            <div className="flex-1 text-sm">
-              <div className="font-medium text-amber-900 dark:text-amber-100">
-                Security upgrade — please re-pair your devices
-              </div>
-              <div className="mt-1 text-amber-800 dark:text-amber-200">
-                {legacyPeers.length === 1
-                  ? `${legacyPeers[0].hostname} was paired before this version's TLS upgrade and can no longer receive clipboard data until re-paired.`
-                  : `${legacyPeers.length} devices (${legacyPeers.map((p) => p.hostname).join(", ")}) were paired before this version's TLS upgrade and can no longer receive clipboard data until re-paired.`}{" "}
-                Re-pair using the PIN flow on the Devices tab.
-              </div>
-            </div>
-            <Button
-              variant="ghost"
-              onClick={() => {
-                invoke("dismiss_legacy_peer_banner").catch(() => {});
-                setLegacyPeers([]);
-              }}
-            >
-              Dismiss
-            </Button>
-          </div>
-        </div>
+        <LegacyPeerBanner
+          peers={legacyPeers}
+          onDismiss={() => {
+            invoke("dismiss_legacy_peer_banner").catch(() => {});
+            setLegacyPeers([]);
+          }}
+        />
       )}
 
       {/* Pairing-lockout banner — fires when the responder's global
@@ -914,31 +897,15 @@ export default function App() {
           the cause is genuinely adversarial (or a misbehaving peer), not
           a benign configuration drift. */}
       {pairingLockedOut && (
-        <div className="fixed inset-x-0 top-0 z-40 border-b border-rose-300 bg-rose-50 px-4 py-3 shadow-sm dark:border-rose-700 dark:bg-rose-950/80">
-          <div className="mx-auto flex max-w-5xl items-start gap-3">
-            <AlertTriangle className="mt-0.5 h-5 w-5 flex-shrink-0 text-rose-600 dark:text-rose-400" />
-            <div className="flex-1 text-sm">
-              <div className="font-medium text-rose-900 dark:text-rose-100">
-                Pairing paused — too many failed attempts
-              </div>
-              <div className="mt-1 text-rose-800 dark:text-rose-200">
-                Another device tried to pair with this one too many times with the wrong PIN. Pairing is disabled until you re-enable it. If you didn't expect this, check that no one else on your network is trying to join.
-              </div>
-            </div>
-            <Button
-              variant="primary"
-              onClick={() => {
-                invoke("rearm_pairing")
-                  .then(() => setPairingLockedOut(false))
-                  .catch((err) => {
-                    logToBackend("rearm_pairing failed", err);
-                  });
-              }}
-            >
-              Re-enable pairing
-            </Button>
-          </div>
-        </div>
+        <PairingLockoutBanner
+          onReEnable={() => {
+            invoke("rearm_pairing")
+              .then(() => setPairingLockedOut(false))
+              .catch((err) => {
+                logToBackend("rearm_pairing failed", err);
+              });
+          }}
+        />
       )}
 
       {/* Incompatible-peer modal — fires when a clipboard send hits a
