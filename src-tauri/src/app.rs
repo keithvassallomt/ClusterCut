@@ -556,7 +556,7 @@ pub(crate) fn run() {
 
                     let mut legacy = Vec::new();
                     for (id, peer) in kp_lock.iter_mut() {
-                        if peer.fingerprint.is_none() {
+                        if peer.needs_repair() {
                             peer.is_trusted = false;
                             legacy.push(LegacyPeerInfo {
                                 id: id.clone(),

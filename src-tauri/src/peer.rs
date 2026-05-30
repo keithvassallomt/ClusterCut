@@ -38,6 +38,26 @@ pub struct Peer {
 /// Emitted via `peer-update` events and returned by `get_peers` so the
 /// TypeScript UI can read `peer.compatible` directly without re-implementing
 /// the version-comparison logic.
+impl Peer {
+    /// True if this is a genuine peer that was paired before the v0.3 mTLS
+    /// upgrade and so has no pinned cert fingerprint — the case the "please
+    /// re-pair" banner exists for.
+    ///
+    /// A missing fingerprint alone is NOT sufficient: `probe_ip` persists
+    /// throwaway `manual-<ip>` placeholders (also fingerprint-less) for any
+    /// address that accepts a QUIC connection — e.g. a VPN gateway that
+    /// forwards :4654 through to a real node. Those placeholders are not
+    /// "paired" anything and can never be re-paired (there's nothing to pair
+    /// with at that address), so flagging them produced a banner the user
+    /// could never clear. Excluding the `manual-` id keeps the banner for
+    /// real legacy devices only — real peers always carry a `clustercut-*`
+    /// id, and a placeholder is replaced by the real peer the moment it
+    /// responds (see handlers.rs).
+    pub fn needs_repair(&self) -> bool {
+        self.fingerprint.is_none() && !self.id.starts_with("manual-")
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerView {
     pub id: String,

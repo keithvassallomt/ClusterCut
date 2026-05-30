@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A "paired before this version's TLS upgrade — please re-pair" banner could appear for a manually-probed address that was never actually a paired device (e.g. a VPN gateway that forwards port 4654 to a real node). The startup sweep flagged any stored peer without a cert fingerprint as legacy, which also caught throwaway `manual-<ip>` probe placeholders. It now only flags genuine paired devices, so the banner can't fire for an address you can never re-pair with.
 - Pairing now gives a clear "Failed to join network. The PIN may be incorrect." error when the PIN is wrong, instead of the misleading "Pairing session expired". Backend and Settings input also trim invisible trailing whitespace on the PIN, which used to silently break pairing. Enabling **Verbose pairing logs** dumps the responder's PIN bytes on failure for diagnosis.
 - Rich-text sync to a Windows peer no longer clears the sender's clipboard (#17). The Windows clipboard write was wiping its own earlier formats on each step; pasting in Notepad, browsers, etc. on the Windows side now also works.
 - Pasting a code copy from PyCharm into Word (HTML format) on a Windows peer now shows the whole snippet instead of the last few characters.
