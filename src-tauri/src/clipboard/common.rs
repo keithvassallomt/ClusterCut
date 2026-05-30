@@ -576,6 +576,23 @@ pub fn process_clipboard_change(
     state: &AppState,
     transport: &Transport,
 ) {
+    // Any non-echo clipboard change invalidates a pending GNOME "promote to
+    // rich" stash — the user copied something else on this machine, so the
+    // previously-offered promotion would clobber their new selection if the
+    // user later clicked "Switch to Rich" on a stale system notification.
+    // Cleared unconditionally here because by the time we reach
+    // `process_clipboard_change`, the echo guard in `should_process_content`
+    // has already let this through as fresh content (Process verdict).
+    {
+        let mut stash = state.pending_rich_promotion.lock().unwrap();
+        if stash.is_some() {
+            tracing::debug!(
+                "Clearing pending_rich_promotion — new clipboard change supersedes it"
+            );
+            *stash = None;
+        }
+    }
+
     match content {
         ClipboardContent::Text(text) => {
             tracing::debug!("Clipboard Text Change Detected (len={})", text.len());

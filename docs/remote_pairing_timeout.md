@@ -1,190 +1,196 @@
-# Remote Pairing Timeout (open, intermittent)
+# Remote Pairing — PIN-mismatch failure with misleading error (FIX CANDIDATES IN FLIGHT, 2026-05-30)
 
-**Status:** open, root cause not yet captured. The symptom self-resolves before
-a probe can witness it; we have hypotheses but no in-the-act evidence.
+**Status:** root cause partially identified. Confirmed: the failure is a
+T2 AEAD mismatch (initiator's `k_i2r` ≠ responder's `k_i2r`), which can
+only happen if the PIN bytes the two sides plug into SPAKE2 differ
+(transcript divergence is the only other possibility and the network was
+proven clean). Not confirmed yet: *why* the PINs diverged when the user
+read the PIN fresh off Windows's UI and typed exactly that.
 
-**Last observed:** 2026-05-30 by Keith, pairing Linux (Fedora 44, Tauri app) to
-Windows peer at `192.168.96.7` over an OpenVPN tunnel (`vassallo_cloud`,
-client source `10.8.0.8`).
+Three changes landed in this branch — two defensive against an
+invisible-whitespace divergence (the most plausible mechanism I can
+construct from the code), and one diagnostic to capture the actual
+divergence next time. **None of these is yet proven to fix the bug.**
+The next reproduction either succeeds (defensive fix was sufficient) or
+the new debug log line nails the exact byte-level cause.
 
-## Symptom
+The user-reported symptom string ("Failed to connect to peer: pairing
+connect timeout") was a red herring — that string only exists at the
+TCP-connect-timeout site and was probably a stale UI banner from a
+prior failure or a misread. The bug never had anything to do with TCP.
 
-When the user triggers "Add Remote Peer" with the remote's IP + PIN and the
-remote is reachable over a VPN, the local Tauri app shows:
+## What was actually happening
 
-> Failed to connect to peer: pairing connect timeout
+1. User triggers "Add Remote Peer" on Linux, types Windows's PIN, IP.
+2. TCP connects fine (≈100 ms across the VPN; verified by probe).
+3. T0 / T1 / SPAKE2 finish all succeed.
+4. Initiator sends T2 (InitiatorKC) under `k_i2r`.
+5. Responder's T2 AEAD decrypt fails — its derived `k_i2r` differs from
+   the initiator's, which happens iff the PINs the two sides plugged
+   into SPAKE2 differ (transcript divergence is the only other cause,
+   and the network was proven clean).
+6. Responder drops the stream ([lib.rs:2287-2294](../src-tauri/src/lib.rs#L2287-L2294)).
+7. Initiator's T3 read gets EOF, hits the `Err` branch at the T3 read
+   site, fires `pairing-failed` with the (previously) misleading
+   *"Pairing session expired"* message.
+8. User retries. PIN still mismatches. Same outcome. Loops.
 
-The behaviour is intermittent:
+The "what finally worked" sequence — Windows leaves cluster a second
+time, generating a fresh PIN, Linux types the new PIN — was the user
+re-reading the PIN after a UI refresh and happening to type one that
+the responder agreed with.
 
-1. Sometimes the attempt times out as described.
-2. Sometimes the local side times out but the *remote* (Windows) UI shows the
-   peer as connected.
-3. Sometimes the attempt simply succeeds.
+`start_spake2` uses `Spake2::start_symmetric` with a fixed identity
+([crypto.rs:13-24](../src-tauri/src/crypto.rs#L13-L24)) — the `_id_a`
+and `_id_b` parameters are ignored — so identity-label mismatch can be
+ruled out. Sub-key derivation
+([crypto.rs:91-113](../src-tauri/src/crypto.rs#L91-L113)) depends only on
+the SPAKE2 session key + transcript hash. Network was healthy, so
+transcripts matched. That leaves the PIN as the sole independent
+variable, and AEAD decryption fails closed on the smallest divergence.
 
-A subsequent attempt may succeed without any intervening change.
+## What changed in this branch
 
-## Error origin
+Three things. The first two are candidate fixes for the most plausible
+mechanism; the third is instrumentation in case the first two miss.
 
-The error string is emitted by [`pairing_connect`](../src-tauri/src/transport.rs#L648)
-in [src-tauri/src/transport.rs:651-656](../src-tauri/src/transport.rs#L651-L656):
+### 1. Trim PIN on every backend save/load (`storage.rs`)
 
-```rust
-let stream = tokio::time::timeout(
-    std::time::Duration::from_secs(10),
-    TcpStream::connect(addr),
-)
-.await
-.map_err(|_| "pairing connect timeout")??;
-```
+`load_network_pin` returns `pin.trim().to_string()` instead of the raw
+file contents, and `save_network_pin` writes `pin.trim()` instead of
+the raw input string. Belt-and-braces: even if some path writes
+whitespace, the next load discards it; a legacy `network_pin` file with
+trailing whitespace from any source gets healed on next read without
+migration code.
 
-The wrapper is bypassed/preserved by the caller in
-[src-tauri/src/lib.rs:1848-1850](../src-tauri/src/lib.rs#L1848-L1850):
+### 2. Trim PIN in the Settings input (`App.tsx`)
 
-```rust
-let mut stream = crate::transport::pairing_connect(peer_addr)
-    .await
-    .map_err(|e| format!("Failed to connect to peer: {}", e))?;
-```
+The Add Remote Peer modal's PIN input already had `e.target.value.trim()`
+in its `onChange`. The Settings/Provisioned-mode PIN input did not — so
+a PIN entered there (or pasted with a trailing space/newline) would
+land in `state.network_pin` with whitespace, get displayed in the UI
+(whitespace invisible to the user), get read by the user, get typed
+into the *other* device's Add-Remote modal which then *does* trim, and
+the two sides plug different byte strings into SPAKE2. The Settings
+input now matches the Add-Remote one.
 
-So the user-visible error fires when, and only when, the local-side
-`TcpStream::connect(addr)` does not produce an established socket within
-10 seconds. The budget was sized for LAN — see the comment block at
-[transport.rs:608-614](../src-tauri/src/transport.rs#L608-L614):
+### 3. Diagnostic logging in the responder's T2 AEAD-failure path (`lib.rs`)
 
-> "the wall-clock budget here covers TCP slowness + JSON encode/decode
->  + a stray re-transmit, not human input."
+Gated on the existing `pairing_debug_logs` flag (so it never leaks
+PIN-bearing log lines in default config). When T2 AEAD decrypt fails,
+the responder now emits `Responder PIN at T2-AEAD-failure: len=<N>
+bytes=[<hex bytes>]`. Combined with the initiator-side trim boundary,
+this is what diagnoses an invisible-whitespace or encoding divergence
+*directly* instead of by elimination. If the trim fixes above don't
+solve the bug, this log line tells us exactly what bytes the responder
+plugged into SPAKE2 vs what the initiator must have sent.
 
-## Pairing protocol context
+### Also: the misleading error string
 
-Pairing runs on plaintext TCP/4654. The exchange (per WIRE-PROTOCOL-0.3.3):
+While in the area, also replaced the misleading *"Pairing session
+expired. Please try again."* on the initiator's T3-read `Err` branch
+with *"Failed to join network. The PIN may be incorrect."* — the same
+string already used a few lines down for the symmetric (initiator-side
+T3 AEAD decrypt) failure. This is a pure UX improvement, not the fix
+for the underlying divergence, but it removes the specific phrasing
+that misled the first investigation into a TCP-timeout hypothesis.
 
-- **Initiator** opens TCP → `T0 PairRequest` → reads `T1 PairResponse` →
-  `T2 InitiatorKC` → reads `T3 ResponderId` → `T4 InitiatorId` → close.
-- **Responder** accepts TCP, gates on `pairing_accept_enabled` /
-  `is_pairing_locked_out` / single-flight `pairing_slot` permit
-  ([lib.rs:3382-3431](../src-tauri/src/lib.rs#L3382-L3431)),
-  wraps `handle_pairing_connection` in a 10 s `PAIRING_PROTOCOL_TIMEOUT`,
-  and only persists the peer to `known_peers.json` *after* T4 verifies
-  ([lib.rs:2426-2432](../src-tauri/src/lib.rs#L2426-L2432)).
+## Why this took a session and a half to find
 
-Post-pairing clipboard sync runs on a long-lived QUIC stream on the same
-port — *separate* from the pairing TCP socket.
+The original symptom string the user reported — *"Failed to connect to
+peer: pairing connect timeout"* — sits in
+[lib.rs:1850-ish](../src-tauri/src/lib.rs) where `pairing_connect`'s 10 s
+TCP-connect timeout is mapped. That string only appears for an actual
+`TcpStream::connect` failure. Anchoring on it produced an entire
+hypothesis tree (H1: VPN slowness, etc.) that the second-attempt
+reproduction — with responder logs and a concurrent TCP probe — falsified
+in one trace. Lessons worth keeping:
 
-## Why the local-timeout / remote-connected asymmetry is not necessarily a bug
+- **One-line user-reported error strings are not authoritative.** Verify
+  the string actually exists in the source code along the failure path
+  before building hypotheses around it. The reported string was probably
+  a stale UI banner from a different earlier failure, or a misread of
+  the toast.
+- **The opaque `Pairing failed from <addr>.` line on the responder
+  hides every protocol-step distinction.** Flipping `pairing_debug_logs`
+  on (which the user did for the second attempt) made the specific
+  AEAD-decrypt failure visible immediately. That toggle is the single
+  best diagnostic in this subsystem — recommend it first, every time.
+- **Per WIRE-PROTOCOL-0.3.1 §H7**, the *log* channel deliberately
+  collapses failure modes to avoid leaking wrong-PIN vs. other-error
+  distinctions to attackers. That principle was correctly applied to
+  logs. It does NOT need to apply to user-facing error UX on the
+  initiator side, which is the legitimate user's machine — there's no
+  attacker to whom the message could leak anything they don't already
+  know. Future error-message changes in this subsystem should follow
+  the same split: opaque on the responder's log, specific on the
+  initiator's UI.
 
-Two independent reasons the remote can show "connected" while the local TCP
-connect times out, *without* the current attempt having reached T4:
+## How to verify the candidate fixes
 
-1. **Stale persistence.** Once a pair has ever succeeded, the responder
-   stores the peer in `known_peers.json` and leaves it there across failed
-   subsequent attempts. The Windows UI keeps showing the peer.
-2. **Live QUIC sync channel.** The clipboard-sync QUIC link is a separate
-   socket from the pairing TCP socket. If a previous pairing succeeded,
-   QUIC can be in steady state at the moment a new pairing attempt's TCP
-   connect is failing.
+This is the procedure to run on the next reproduction. Two outcomes are
+informative:
 
-So if the symptom is "I see the timeout, but remote shows me connected,"
-that alone is not evidence of a bug — it is consistent with VPN flakiness
-on the pairing TCP path only.
+1. **Enable `pairing_debug_logs` on both sides** (Settings → toggle).
+   The new diagnostic only fires under this flag, and we want it.
+2. **On Windows, leave the cluster** (regenerates a clean PIN via the
+   trimmed save/load path).
+3. **On Linux, type Windows's freshly-displayed PIN** exactly as shown,
+   no copy-paste from anywhere else.
+4. **If pairing succeeds:** the trim fixes were sufficient. Bug was
+   invisible whitespace getting into `state.network_pin` from some
+   path that's now closed.
+5. **If pairing still fails:** capture the responder's new
+   `Responder PIN at T2-AEAD-failure: len=<N> bytes=[<hex bytes>]` log
+   line. That gives us the exact byte sequence the responder used.
+   Compare to what the initiator must have sent — if they differ, we
+   have ground truth for the divergence and can write a targeted fix
+   in one more cycle.
 
-## Hypotheses
+Side-effect verification (UX-only):
 
-### H1: VPN TCP-connect latency exceeds 10 s on flaky tunnel — *most likely, unconfirmed*
+1. With everything paired correctly, deliberately type the *wrong* PIN
+   in the Add Remote Peer modal.
+2. Linux app should display *"Failed to join network. The PIN may be
+   incorrect."* — not *"Pairing session expired"*. This is the
+   misleading-message change, independent of whether the underlying
+   divergence is solved.
 
-Linux retransmits SYN with exponential backoff (~1 s, 2 s, 4 s, 8 s). If a
-couple of SYNs are dropped during an idle-tunnel wake or rekey, the 10 s
-budget runs out before the 3-way handshake completes. When the tunnel is
-warm, the handshake fits in <100 ms (verified — see diagnostic run below).
+## Source data preserved below
 
-**Fix if confirmed:** widen `pairing_connect`'s timeout (e.g. 25–30 s),
-possibly only on the manual-Add-Remote path, and optionally add one SYN-
-level retry.
+The two reproductions and the `pair-probe.sh` harness from the
+investigation are kept verbatim at the foot of this document for future
+reference if anything in this area regresses.
 
-### H2: Responder drops stream immediately after accept — *unlikely*
-
-If the responder rejects via `pairing_accept_enabled = false`,
-`is_pairing_locked_out()`, or `pairing_slot` exhaustion, the initiator
-TCP connect succeeds (3-way handshake completes) but the *next* step
-(write T0 / read T1) errors. That would surface as `"Failed to send
-PairRequest"` or `"Failed to read PairResponse"`, not `"pairing connect
-timeout"`. So this hypothesis does not match the observed string.
-
-### H3: Race between tokio's 10 s timer and TCP establishment — *very unlikely*
-
-The connect could in principle complete at the kernel exactly as tokio
-fires the timer. But if `TcpStream::connect` had completed, `tokio::time::
-timeout` would resolve to `Ok`. A drop after timeout would close the
-socket; the remote would never see a fully established connection nor
-any T0 byte, so no peer would be persisted in `known_peers.json`. So this
-also does not explain a remote-connected outcome.
-
-**Conclusion:** investigation should focus on H1.
-
-## Diagnostic run, 2026-05-30
-
-Performed while the tunnel was in the "right now it just works" state — i.e.
-not during a failure.
-
-```
-$ time nc -zv -w 15 192.168.96.7 4654
-Ncat: Connected to 192.168.96.7:4654.
-... 5 attempts back-to-back, all OK in ~100 ms each.
-
-$ ping -c 10 -W 2 192.168.96.7
-10 packets transmitted, 0 received, 100% packet loss
-```
-
-ICMP being 100 % blocked while TCP/4654 succeeds is the normal
-Windows-firewall posture — not a bug.
-
-Route confirms the path is the VPN:
-
-```
-$ ip route get 192.168.96.7
-192.168.96.7 dev vassallo_cloud table 52303 src 10.8.0.8 uid 1000
-```
-
-After tearing the VPN down, restarting the app on both ends, and bringing
-the VPN back up, the symptom did **not** reproduce. We have no in-the-act
-trace yet.
+---
 
 ## Reproduction harness — `pair-probe.sh`
 
-This is the probe script we use to capture the failure mode in evidence.
-It originally lived at `tmp/pair-probe.sh` (ephemeral); reproduce it from
-the listing below.
+Originally written under the H1 (VPN-slowness) hypothesis. It still
+works as a general-purpose pairing-port reachability prober and is
+worth keeping in the repo for future investigations.
 
 **How to use:**
 
 1. `chmod +x pair-probe.sh && ./pair-probe.sh` (defaults to
    `192.168.96.7:4654`).
 2. Trigger pairing in the app as usual.
-3. When the UI shows "pairing connect timeout", note the wall-clock time.
+3. When the UI shows the failure, note the wall-clock time.
 4. Ctrl-C the probe and inspect the log line that matches that moment.
-
-**Interpretation rubric:**
-
-| Probe state around failure | Implication |
-|---|---|
-| All `OK`, elapsed < 100 ms | VPN was healthy. Look beyond the network: responder accept gating, app-side scheduling, blocked tokio runtime. |
-| `FAIL` lines, or elapsed climbing toward 10 s | H1 confirmed. Widen `pairing_connect` budget and add a retry. |
-| `OK` but elapsed 3–9 s | Tunnel is alive but slow. Same fix as H1. |
 
 **Script (verbatim):**
 
 ```bash
 #!/bin/bash
 # Probes pairing TCP reachability to a remote peer while you try to pair.
-# When the app reports "pairing connect timeout", the log around that wall-clock
+# When the app reports a pairing failure, the log around that wall-clock
 # moment shows whether the VPN path was actually unreachable at that moment.
 #
 # Usage:
 #   ./pair-probe.sh [IP] [PORT]
 # Default: 192.168.96.7 4654
 #
-# Probe cadence: every 1s. Each probe has its own 11s budget (1s wider than the
-# app's 10s, so we'd record success right before the app gave up if that were
-# the boundary).
+# Probe cadence: every 1s. Each probe has its own 11s budget.
 
 IP=${1:-192.168.96.7}
 PORT=${2:-4654}
@@ -199,7 +205,6 @@ echo "------------------------ --------  --------  ---------------------------" 
 while true; do
     TS=$(date '+%Y-%m-%d %H:%M:%S.%3N')
     START=$(date +%s.%N)
-    # nc -G is BSD; we have Ncat (Nmap). -w sets the timeout in seconds.
     OUT=$(nc -zv -w 11 "${IP}" "${PORT}" 2>&1)
     RC=$?
     END=$(date +%s.%N)
@@ -211,7 +216,6 @@ while true; do
         RESULT="FAIL    "
     fi
 
-    # Strip newlines from ncat output for single-line log
     DETAIL=$(echo "${OUT}" | tr '\n' ' ' | sed 's/  */ /g' | head -c 80)
 
     echo "${TS}  ${RESULT}  ${ELAPSED}  ${DETAIL}" | tee -a "${LOG}"
@@ -220,37 +224,22 @@ while true; do
 done
 ```
 
-## Next steps when the symptom recurs
+## Raw evidence — first attempt (2026-05-30, TCP probe only)
 
-1. **Start `pair-probe.sh` before retrying.** Without an in-the-act probe
-   trace, we are still guessing.
-2. **Capture app-side logs.** The initiator has no per-step tracing around
-   `pairing_connect`; if H1 is suspected, also note whether the symptom
-   only follows a VPN-idle period (idle-tunnel wake) or whether it can
-   appear mid-session.
-3. **On the responder (Windows), check the tracing log for the matching
-   accept.** If a TCP accept *did* occur at the same wall-clock moment as
-   the initiator timeout, that rules H1 out (the SYN got through; the
-   timeout was app-side) and forces us to re-open H2/H3.
-4. **If H1 confirms**, the minimal change is to widen the budget in
-   [transport.rs:652](../src-tauri/src/transport.rs#L652) and consider a
-   single SYN-level retry. The LAN justification in the existing comment
-   no longer holds for the manual-Add-Remote path, which is by design a
-   cross-network entry point.
+Probe ran while tunnel was healthy. Every connect to `192.168.96.7:4654`
+returned OK in ~100 ms — i.e. the network path was fine even when the
+user was reporting "pairing connect timeout." This was the first hint
+that the reported error string did not match what was actually
+happening; it should have ended H1 sooner.
 
-## Code references
+## Raw evidence — second attempt (2026-05-30, with responder logs)
 
-- Timeout site: [src-tauri/src/transport.rs:648-658](../src-tauri/src/transport.rs#L648-L658)
-- LAN-budget rationale: [src-tauri/src/transport.rs:608-614](../src-tauri/src/transport.rs#L608-L614)
-- Caller / user-visible error: [src-tauri/src/lib.rs:1848-1850](../src-tauri/src/lib.rs#L1848-L1850)
-- Responder accept gating: [src-tauri/src/lib.rs:3382-3431](../src-tauri/src/lib.rs#L3382-L3431)
-- Responder peer persistence (post-T4): [src-tauri/src/lib.rs:2426-2432](../src-tauri/src/lib.rs#L2426-L2432)
-- Responder handler entry: [src-tauri/src/lib.rs:2170](../src-tauri/src/lib.rs#L2170)
+Linux is `Europe/London` = BST = UTC+1; Tauri's tracing logs use UTC
+(both sides). Subtract one hour from probe LOCAL timestamps to compare.
 
+### Initiator-side probe log (LOCAL = BST)
 
-
-## Run
-
+```
 ./tmp/pair-probe.sh
 Probing 192.168.96.7:4654 every 1s. Log: /tmp/pair-probe-20260530-070626.log
 Trigger pairing in the app now. Press Ctrl-C to stop.
@@ -289,7 +278,11 @@ ts                       result    elapsed   detail
 2026-05-30 07:07:00.092  OK         0.116s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
 2026-05-30 07:07:01.263  OK         0.125s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
 2026-05-30 07:07:02.438  OK         0.103s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+```
 
+### Responder-side log (Windows, UTC, `pairing_debug_logs = false`)
+
+```
 2026-05-30T06:06:13.788730Z  WARN Pairing failed from 192.168.96.17:51508.
 2026-05-30T06:06:20.752714Z  INFO [Discovery] Active probe FAILED/TIMEOUT. Removing peer clustercut-1100959039
 2026-05-30T06:06:25.749101Z  WARN Pairing failed from 192.168.96.17:34032.
@@ -313,3 +306,45 @@ ts                       result    elapsed   detail
 2026-05-30T06:06:46.698631Z  WARN Pairing failed from 192.168.96.17:44302.
 2026-05-30T06:06:47.878569Z  WARN Pairing failed from 192.168.96.17:44316.
 2026-05-30T06:06:49.055267Z  WARN Pairing failed from 192.168.96.17:44330.
+```
+
+Source port appearing on the responder side is `192.168.96.17` (the
+WireGuard server's IP, SNAT'ing the Linux client's `10.8.0.8`), not the
+Linux tunnel IP. Expected for this topology; noted in case future
+investigations are confused by the post-NAT source.
+
+## Raw evidence — third attempt (2026-05-30, with `pairing_debug_logs = on`)
+
+After the user enabled verbose pairing logs on the responder and
+reproduced once more. This is the trace that nailed the diagnosis.
+
+### Initiator (Linux)
+
+```
+2026-05-30T07:51:56.204433Z  INFO [Netmon] Re-probing 2 known peers
+2026-05-30T07:51:57.262614Z  INFO Unregistering old service: clustercut-3699914280._clustercut._tcp.local.
+2026-05-30T07:51:57.269477Z  INFO Registered service: clustercut-3699914280 (clustercut-3699914280._clustercut._tcp.local.) on 10.8.0.8:4654
+2026-05-30T07:51:57.271107Z  INFO [Netmon] Re-registered mDNS service
+2026-05-30T07:51:57.271488Z  INFO [Netmon] Re-probing 2 known peers
+2026-05-30T07:52:30.662177Z  INFO SPAKE2 complete (initiator); sending InitiatorKC (T2).
+2026-05-30T07:52:30.666404Z  INFO InitiatorKC sent (initiator); awaiting ResponderId (T3).
+```
+
+### Responder (Windows)
+
+```
+2026-05-30T07:51:34.375461Z ERROR Connection handshake failed from 192.168.96.17:4654: the cryptographic handshake failed: error 40: unexpected error: client cert fingerprint not in known peers: cdc6e775284f8f57
+2026-05-30T07:52:30.181694Z  INFO Received PairRequest from 192.168.96.17:55808; running SPAKE2.
+2026-05-30T07:52:30.212509Z  INFO SPAKE2 complete (responder) for 192.168.96.17:55808; awaiting InitiatorKC (T2).
+2026-05-30T07:52:30.516927Z  WARN Pairing failed from 192.168.96.17:55808: InitiatorKC AEAD decrypt failed: pair AEAD decrypt failed: aead::Error
+```
+
+The QUIC handshake failure at 07:51:34 is unrelated — it's Linux trying
+to maintain its old QUIC sync link to Windows after Windows had wiped
+its `known_peers.json` by leaving the cluster, and Linux's cert
+fingerprint is no longer trusted there. Visible-but-separate from the
+pairing failure that follows.
+
+The pairing trace itself is unambiguous: SPAKE2 completes on both
+sides, the initiator successfully sends T2, the responder fails to
+decrypt T2's AEAD tag → PIN mismatch.

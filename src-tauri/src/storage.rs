@@ -270,8 +270,17 @@ pub fn load_network_pin(app: &AppHandle) -> String {
 
     if path.exists() {
         if let Ok(pin) = fs::read_to_string(&path) {
-            if !pin.trim().is_empty() {
-                return pin;
+            // Trim defensively. The PIN is fed straight into SPAKE2 as the
+            // shared password, so even a single trailing byte (newline,
+            // space) on one side and not the other makes the derived AEAD
+            // sub-keys diverge and pairing fails on T2 — and the user-facing
+            // symptom is a misleading "Pairing session expired"-class error
+            // with no hint that whitespace was the cause. A legacy
+            // network_pin file written by an older build (or hand-edited)
+            // gets healed on the next load without any migration code.
+            let trimmed = pin.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
             }
         }
     }
@@ -303,7 +312,10 @@ pub fn save_network_pin(app: &AppHandle, pin: &str) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(path, pin);
+    // Mirror the trim done on load_network_pin — keeps the on-disk file
+    // canonical (no trailing whitespace from a pasted Settings input) so
+    // even a build without the load-side trim would behave correctly.
+    let _ = fs::write(path, pin.trim());
 }
 // Helper to reset network state (Self-Destruct/Kick)
 pub fn reset_network_state(app: &AppHandle) {

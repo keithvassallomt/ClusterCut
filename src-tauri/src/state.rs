@@ -59,6 +59,17 @@ pub struct AppState {
     pub pending_removals: Arc<Mutex<HashMap<String, u64>>>,
     // Pending Clipboard Content (Received but not yet applied due to Auto-Receive OFF)
     pub pending_clipboard: Arc<Mutex<Option<crate::protocol::ClipboardPayload>>>,
+    /// Latest rich payload received on a GNOME-extension receiver, stashed
+    /// pending a user-triggered "promote to rich" click. On GNOME the
+    /// extension can only advertise a single MIME at a time
+    /// (`Meta.SelectionSource` multi-MIME subclassing is blocked by GJS issue
+    /// #255 — see `gnome-extension/extension.js::_writeFormats`). To make
+    /// plain-text consumers (gedit, GNOME Text Editor, OnlyOffice, browser
+    /// inputs) work by default we apply plain text on receive and stash
+    /// the full Rich payload here. The `promote_pending_rich` Tauri command
+    /// overwrites the clipboard with the rich payload on user demand. Cleared
+    /// automatically when the monitor sees a non-echo clipboard change.
+    pub pending_rich_promotion: Arc<Mutex<Option<crate::protocol::ClipboardPayload>>>,
     // Shutdown flag for graceful termination of background threads
     pub shutdown: Arc<AtomicBool>,
     // Mapping of Message ID -> File Paths (for serving file requests)
@@ -145,6 +156,7 @@ impl AppState {
             settings: Arc::new(Mutex::new(AppSettings::default())),
             pending_removals: Arc::new(Mutex::new(HashMap::new())),
             pending_clipboard: Arc::new(Mutex::new(None)),
+            pending_rich_promotion: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
             local_files: Arc::new(Mutex::new(HashMap::new())),
             local_clipboard_blobs: Arc::new(Mutex::new(HashMap::new())),

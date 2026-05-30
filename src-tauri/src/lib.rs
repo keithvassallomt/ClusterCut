@@ -720,6 +720,11 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
                     dl_btn.insert("label", zbus::zvariant::Value::from("Download"));
                     dl_btn.insert("action", zbus::zvariant::Value::from("download"));
                     vec![open_btn, dl_btn]
+                } else if matches!(&payload, NotificationPayload::PromoteRichClipboard) {
+                    let mut promote_btn = std::collections::HashMap::<&str, zbus::zvariant::Value<'_>>::new();
+                    promote_btn.insert("label", zbus::zvariant::Value::from("Switch to Rich"));
+                    promote_btn.insert("action", zbus::zvariant::Value::from("promote_rich"));
+                    vec![open_btn, promote_btn]
                 } else {
                     vec![open_btn]
                 };
@@ -799,6 +804,32 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
                                             }
                                         }
                                     }
+                                } else if action == "promote_rich" {
+                                    let promoted = {
+                                        let mut slot = state.pending_rich_promotion.lock().unwrap();
+                                        slot.take()
+                                    };
+                                    if let Some(payload_inner) = promoted {
+                                        if let Some(formats) = payload_inner
+                                            .formats
+                                            .as_ref()
+                                            .filter(|fs| !fs.is_empty())
+                                            .cloned()
+                                        {
+                                            tracing::info!(
+                                                "[Notification/portal] User clicked Switch to Rich. Promoting from {}: text={} chars, formats=[{}]",
+                                                payload_inner.sender,
+                                                payload_inner.text.len(),
+                                                formats.iter().map(|f| f.mime_type.as_str()).collect::<Vec<_>>().join(", ")
+                                            );
+                                            clipboard::set_clipboard_rich(&app, payload_inner.text.clone(), formats);
+                                            let _ = app.emit("clipboard-change", &payload_inner);
+                                        }
+                                    } else {
+                                        tracing::debug!(
+                                            "[Notification/portal] Switch to Rich clicked but nothing stashed"
+                                        );
+                                    }
                                 }
                                 break;
                             }
@@ -858,9 +889,12 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
             // Actions
             notification.action("default", "Open");
             notification.action("open_btn", "Open");
-            
+
             if let NotificationPayload::DownloadAvailable { .. } = &payload {
                  notification.action("download", "Download");
+            }
+            if matches!(&payload, NotificationPayload::PromoteRichClipboard) {
+                notification.action("promote_rich", "Switch to Rich");
             }
 
             if let Ok(id) = std::env::var("FLATPAK_ID") {
@@ -896,20 +930,20 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
                 } else if action == "download" || action == "Download" {
                      if let NotificationPayload::DownloadAvailable { msg_id: _, file_count, peer_id } = &payload {
                          tracing::info!("User clicked Download. Triggering download for {} files...", file_count);
-                         // Trigger download for all files. 
+                         // Trigger download for all files.
                          // Note: We need msg_id to look up the files locally in state.local_files map?
-                         // Wait, request_file_internal takes (state, file_id, index, peer_id). 
+                         // Wait, request_file_internal takes (state, file_id, index, peer_id).
                          // The msg_id IS the file_id used for storage?
                          // In handle_incoming_file_stream/metadata logic:
                          // `files_lock.insert(msg_id.clone(), valid_paths.clone());`
                          // But `request_file` uses `file_id` which maps to `msg_id` in our context.
-                         
+
                          let msg_id = if let NotificationPayload::DownloadAvailable { msg_id, .. } = &payload { msg_id.clone() } else { String::new() };
-                         
+
                          let state_clone = state.clone();
                          let peer_id_clone = peer_id.clone();
                          let count = *file_count;
-                         
+
                          tauri::async_runtime::spawn(async move {
                              let _ = app.emit("notification-clicked", serde_json::json!({ "view": "history" }));
                              let _ = app.get_webview_window("main").map(|w: tauri::WebviewWindow| {
@@ -928,6 +962,36 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
                              }
                          });
                      }
+                } else if action == "promote_rich" || action == "Switch to Rich" {
+                    // Pop the stashed Rich payload and overwrite the clipboard
+                    // with it. The IGNORED guard + lenient `rich_eq_stable`
+                    // suppresses the resulting truncated read-back so this
+                    // doesn't echo back to the sender.
+                    let promoted = {
+                        let mut slot = state.pending_rich_promotion.lock().unwrap();
+                        slot.take()
+                    };
+                    if let Some(payload_inner) = promoted {
+                        if let Some(formats) = payload_inner
+                            .formats
+                            .as_ref()
+                            .filter(|fs| !fs.is_empty())
+                            .cloned()
+                        {
+                            tracing::info!(
+                                "[Notification] User clicked Switch to Rich. Promoting from {}: text={} chars, formats=[{}]",
+                                payload_inner.sender,
+                                payload_inner.text.len(),
+                                formats.iter().map(|f| f.mime_type.as_str()).collect::<Vec<_>>().join(", ")
+                            );
+                            clipboard::set_clipboard_rich(&app, payload_inner.text.clone(), formats);
+                            let _ = app.emit("clipboard-change", &payload_inner);
+                        }
+                    } else {
+                        tracing::debug!(
+                            "[Notification] Switch to Rich clicked but nothing stashed (already promoted or superseded)"
+                        );
+                    }
                 }
             });
         });
@@ -1913,13 +1977,21 @@ async fn start_pairing(
 
     // T3 (wire 0.3.3) — responder's AEAD-wrapped identity (device_id + cert
     // fingerprint). Sent only after the responder verifies our T2 KC frame.
+    //
+    // If the read returns EOF here, the dominant cause is the responder
+    // closing after its T2 AEAD verify failed — i.e. the PIN we sent didn't
+    // match the PIN the responder loaded. A genuine connection drop would
+    // also surface as EOF, so we phrase the user-visible message to cover
+    // both without leaking which one it was. (Previously this was
+    // "Pairing session expired", which sent debugging down a TCP-timeout
+    // rabbit hole the first time this bug was observed.)
     let (nonce_r, ciphertext_r) = match crate::transport::read_pairing_frame(&mut stream).await {
         Ok(PairingMessage::ResponderId { nonce, ciphertext }) => (nonce, ciphertext),
         Ok(other) => {
             return Err(format!("Pairing protocol error: expected ResponderId, got {:?}", other));
         }
         Err(e) => {
-            let _ = app_handle.emit("pairing-failed", "Pairing session expired. Please try again.");
+            let _ = app_handle.emit("pairing-failed", "Failed to join network. The PIN may be incorrect.");
             return Err(format!("Failed to read ResponderId: {}", e));
         }
     };
@@ -2284,6 +2356,23 @@ async fn handle_pairing_connection(
         }
         Err(e) => {
             // The big one: wrong PIN or active MITM forging T2. Counter++.
+            //
+            // When the user has explicitly enabled pairing_debug_logs (same
+            // flag that switches `Pairing failed from <addr>.` to a detailed
+            // form), also emit the byte-level form of the PIN this responder
+            // plugged into SPAKE2. Combined with the initiator-side trim
+            // boundary, this is what diagnoses an invisible-whitespace or
+            // encoding-divergence cause directly instead of by elimination.
+            // The PIN is short-lived shared-secret material and the user is
+            // debugging their own device, but we still gate on the flag so
+            // it never leaks into a default-config session.
+            if state.settings.lock().map(|s| s.pairing_debug_logs).unwrap_or(false) {
+                tracing::warn!(
+                    "Responder PIN at T2-AEAD-failure: len={} bytes={:02x?}",
+                    pin.len(),
+                    pin.as_bytes()
+                );
+            }
             record_pairing_aead_failure(
                 &state,
                 &app_handle,
@@ -2651,6 +2740,55 @@ async fn retry_connection(
          }
     });
     
+    Ok(())
+}
+
+/// User-triggered "switch to rich format" promotion (issue #17 follow-up,
+/// GNOME only). On receive, a Rich payload landed plain text on the clipboard
+/// and stashed the full payload in `pending_rich_promotion`. This command
+/// pops the stash and writes the rich formats — last-write-wins on the GNOME
+/// extension, so what survives is the final rich MIME (`text/rtf` in our
+/// current priority order). The `IGNORED_CONTENT` guard set by
+/// `set_clipboard_rich_with_ignore` combined with `rich_eq_stable`'s lenient
+/// subset rule catches the resulting truncated read-back, so the promotion
+/// doesn't echo back to the sender. Idempotent — a second call with nothing
+/// stashed returns Ok.
+#[tauri::command]
+async fn promote_pending_rich(
+    state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let promoted = {
+        let mut slot = state.pending_rich_promotion.lock().unwrap();
+        slot.take()
+    };
+
+    let Some(payload) = promoted else {
+        tracing::debug!("promote_pending_rich called with nothing stashed");
+        return Ok(());
+    };
+
+    let Some(formats) = payload
+        .formats
+        .as_ref()
+        .filter(|fs| !fs.is_empty())
+        .cloned()
+    else {
+        tracing::warn!(
+            "promote_pending_rich: stashed payload had no rich formats; nothing to promote"
+        );
+        return Ok(());
+    };
+
+    tracing::info!(
+        "Promoting rich clipboard from {}: text={} chars, formats=[{}]",
+        payload.sender,
+        payload.text.len(),
+        formats.iter().map(|f| f.mime_type.as_str()).collect::<Vec<_>>().join(", ")
+    );
+
+    clipboard::set_clipboard_rich(&app_handle, payload.text.clone(), formats);
+    let _ = app_handle.emit("clipboard-change", &payload);
     Ok(())
 }
 
@@ -3615,6 +3753,7 @@ pub fn run() {
             set_local_clipboard,
             set_local_clipboard_files,
             confirm_pending_clipboard,
+            promote_pending_rich,
             get_launch_args,
             exit_app,
             retry_connection,
@@ -4446,10 +4585,46 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                     text.len(),
                                     formats.iter().map(|f| f.mime_type.as_str()).collect::<Vec<_>>().join(", ")
                                 );
+                                // GNOME-only two-stage promotion (issue #17 follow-up).
+                                // mutter's `Meta.SelectionSource` is single-MIME and
+                                // can't be subclassed for multi-MIME from GJS (GJS #255),
+                                // so the extension's `_writeFormats` is last-write-wins.
+                                // Writing the rich payload directly leaves *only* the
+                                // final rich MIME advertised — plain-text consumers
+                                // (gedit, GNOME Text Editor, OnlyOffice, browser inputs)
+                                // then get nothing on paste. Apply plain text by default
+                                // so the broad case works, stash the full payload, and
+                                // emit `rich-promotion-available` so the UI can offer a
+                                // one-click "switch to rich format" promotion. Other
+                                // backends (Windows, macOS, wlroots) write all MIMEs
+                                // atomically and don't need this path.
+                                let needs_promotion_dance: bool = {
+                                    #[cfg(target_os = "linux")]
+                                    {
+                                        matches!(
+                                            clipboard::get_backend(),
+                                            clipboard::ClipboardBackend::GnomeExtension
+                                        ) && !text.trim().is_empty()
+                                    }
+                                    #[cfg(not(target_os = "linux"))]
+                                    {
+                                        false
+                                    }
+                                };
+
                                 let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
                                 if auto_receiver {
-                                    clipboard::set_clipboard_rich(&listener_handle, text.clone(), formats);
-                                    let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                    if needs_promotion_dance {
+                                        {
+                                            let mut stash = listener_state.pending_rich_promotion.lock().unwrap();
+                                            *stash = Some(payload_obj.clone());
+                                        }
+                                        clipboard::set_clipboard(&listener_handle, text.clone());
+                                        let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                    } else {
+                                        clipboard::set_clipboard_rich(&listener_handle, text.clone(), formats);
+                                        let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                    }
                                 } else {
                                     tracing::info!("[Clipboard] Auto-receive OFF. Storing pending rich clipboard from {}", sender);
                                     {
@@ -4459,9 +4634,39 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
                                     let _ = listener_handle.emit("clipboard-pending", &payload_obj);
                                 }
 
-                                let notifications = listener_state.settings.lock().unwrap().notifications.clone();
-                                if notifications.data_received {
-                                    send_notification(&listener_handle, "Clipboard Received", "Formatted content copied to clipboard", false, Some(2), "history", NotificationPayload::None);
+                                if needs_promotion_dance {
+                                    // The promotion notification is the *only* path
+                                    // to the rich format on a GNOME receiver — without
+                                    // it the user has no way to upgrade past the
+                                    // plain-text fallback. Surface unconditionally,
+                                    // not gated on the generic `data_received`
+                                    // toggle (which is off by default and used for
+                                    // purely informational pings).
+                                    send_notification(
+                                        &listener_handle,
+                                        "Pasted as plain text",
+                                        &format!(
+                                            "From {}. Click \"Switch to Rich\" to upgrade.",
+                                            sender
+                                        ),
+                                        false,
+                                        Some(2),
+                                        "history",
+                                        NotificationPayload::PromoteRichClipboard,
+                                    );
+                                } else {
+                                    let notifications = listener_state.settings.lock().unwrap().notifications.clone();
+                                    if notifications.data_received {
+                                        send_notification(
+                                            &listener_handle,
+                                            "Clipboard Received",
+                                            "Formatted content copied to clipboard",
+                                            false,
+                                            Some(2),
+                                            "history",
+                                            NotificationPayload::None,
+                                        );
+                                    }
                                 }
                             } else if !text.trim().is_empty() {
                                 // TEXT HANDLING — plain text only, no rich formats present.
@@ -4981,6 +5186,11 @@ async fn handle_message(msg: Message, addr: std::net::SocketAddr, listener_state
 pub enum NotificationPayload {
     None,
     DownloadAvailable { msg_id: String, file_count: usize, peer_id: String },
+    /// GNOME-only: a Rich payload landed plain-text on the OS clipboard and the
+    /// full rich payload is stashed in `pending_rich_promotion`. The system
+    /// notification carries a "Switch to Rich" action that invokes
+    /// `promote_pending_rich` so the user can upgrade without opening the app.
+    PromoteRichClipboard,
 }
 
 #[tauri::command]
