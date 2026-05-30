@@ -575,11 +575,25 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
     // Monitor Thread
     thread::spawn(move || {
         let mut last_content = ClipboardContent::None;
+        // macOS-only: last seen NSPasteboard.changeCount. When unchanged we
+        // skip the whole read round-trip so AppKit doesn't log "Looked for
+        // URLs on the pasteboard, but found none." / "Couldn't get a file
+        // system path for a URL: file:///.file/id=…" twice a second whenever
+        // the current clipboard owner left a stale file-reference URL behind.
+        let mut last_change_count: Option<i64> = None;
 
         loop {
             if state.is_shutdown() {
                 tracing::info!("Clipboard monitor received shutdown signal, exiting.");
                 break;
+            }
+
+            if let Some(current) = rich::clipboard_change_count() {
+                if Some(current) == last_change_count {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+                last_change_count = Some(current);
             }
 
             if cmd_tx.send(WorkerCommand::Read).is_err() {

@@ -51,6 +51,24 @@ pub fn write_clipboard_rich(text: &str, formats: &[ClipboardFormat]) -> Result<(
     }
 }
 
+/// macOS-only: monotonically increasing pasteboard mutation counter. Returns
+/// `None` on platforms that don't expose an equivalent. The plugin monitor
+/// uses this to skip the entire read path when the clipboard hasn't been
+/// touched, which both saves work on idle and stops AppKit from logging
+/// "Looked for URLs on the pasteboard, but found none." / "Couldn't get a
+/// file system path for a URL: file:///.file/id=…" on every poll when the
+/// current clipboard owner left a stale file-reference URL behind.
+pub fn clipboard_change_count() -> Option<i64> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(macos::change_count())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// Read a passthrough image (SVG vector or animated GIF) from the OS
 /// clipboard if one is present. Returns `(mime, bytes)`. The plugin backend
 /// calls this *before* arboard's RGBA probe so passthrough representations
@@ -603,6 +621,13 @@ mod macos {
 
     fn pasteboard() -> Retained<NSPasteboard> {
         NSPasteboard::generalPasteboard()
+    }
+
+    /// `NSPasteboard.changeCount` — increments on every mutation. Cheap;
+    /// involves no URL/data materialization, so it doesn't trigger the
+    /// AppKit NSLog chatter that the file-URL read path emits.
+    pub fn change_count() -> i64 {
+        pasteboard().changeCount() as i64
     }
 
     /// Read HTML and RTF if present. Single pasteboard handle keeps the
