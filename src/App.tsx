@@ -36,11 +36,6 @@ const internalLogToBackend = (level: string | null, msg: string, ...args: any[])
 
 const logToBackend = (msg: string, ...args: any[]) => internalLogToBackend(null, msg, ...args);
 
-/* --- Types moved to src/types.ts --- */
-/* --- Protocol helpers moved to src/lib/protocol.ts --- */
-
-/* --- UI components moved to src/components/ui.tsx --- */
-
 /* --- Main App Component --- */
 
 export default function App() {
@@ -1231,17 +1226,3 @@ export default function App() {
     </div>
   );
 }
-
-/* --- Views --- */
-
-/* --- DevicesView moved to src/components/DevicesView.tsx --- */
-
-/* --- HistoryView moved to src/components/HistoryView.tsx --- */
-
-/* --- SettingsView moved to src/components/SettingsView.tsx --- */
-
-/* --- Dialog moved to src/components/Dialog.tsx --- */
-
-/* --- CopyMini moved to src/components/DevicesView.tsx --- */
-
-/* --- ManualSyncFAB and ManualSyncModal moved to src/components/ManualSync.tsx --- */
