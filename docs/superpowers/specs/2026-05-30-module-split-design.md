@@ -43,22 +43,25 @@ Rust backend with protocol.
   `protocol.rs`, `discovery.rs`, `netmon.rs`, `tray.rs`, `dbus.rs`,
   `compression.rs`, `peer.rs`, `clipboard/`).
 
-## Key insight: `crypto.rs` is two concerns
+## Key insight: `crypto.rs` is purely pairing crypto
 
-`crypto.rs` (391 lines) already mixes two independently-consumed concerns:
+`crypto.rs` (391 lines) is **entirely** SPAKE2 + pairing-AEAD: `start_spake2`,
+`finish_spake2`, `pairing_transcript`, `derive_pair_subkeys`, `fresh_pair_nonce`,
+`pair_aead_encrypt`/`decrypt`, `INITIATOR_KC_PLAINTEXT`, plus the transcript/HKDF
+constants and a substantial unit-test module. It is consumed **only** by the
+pairing flow in lib.rs.
 
-- **SPAKE2 + pairing-AEAD half** — `start_spake2`, `finish_spake2`,
-  `pairing_transcript`, `derive_pair_subkeys`, `fresh_pair_nonce`,
-  `pair_aead_encrypt`/`decrypt`, `INITIATOR_KC_PLAINTEXT`. Consumed **only** by
-  the pairing flow in lib.rs.
-- **TLS-verification half** — `verify_tls13_signature`, `verify_tls12_signature`,
-  `WebPkiSupportedAlgorithms`, rustls provider glue. Consumed **only** by
-  `transport.rs` for mTLS.
+The TLS/mTLS verification code (`verify_tls13_signature`, `verify_tls12_signature`,
+`WebPkiSupportedAlgorithms`) is **not** in our `crypto.rs` — it lives in
+`transport.rs` and resolves to `rustls::crypto` / `quinn::crypto::rustls`
+(external crates). `transport.rs` never imports `crate::crypto`. (An earlier draft
+of this spec wrongly proposed carving a `tls.rs` out of `crypto.rs`; there is no
+TLS code in our crypto module to carve.)
 
-Therefore the SPAKE half folds into the new `pairing` module; the TLS half moves
-to a new `tls.rs` next to the transport. The existing crypto unit tests move with
-their respective halves and **must keep passing** — they are the guardrail for
-the riskiest move in this refactor.
+Therefore `crypto.rs` folds **wholesale** into the new `pairing` module — function
+bodies, constants, and tests all move together. `transport.rs` is untouched by
+this. The migrated crypto unit tests **must keep passing**; they are the guardrail
+for the riskiest move in this refactor.
 
 ## Strategy
 
@@ -78,17 +81,16 @@ Existing modules are kept as-is. lib.rs is carved into:
 
 | New module | Moved from lib.rs / crypto.rs | ~LOC |
 |---|---|---|
-| `pairing.rs` (or `pairing/` dir if it reads cleaner) | `start_pairing`, `handle_pairing_connection`, pairing `#[command]`s, failure/AEAD logging, **+ SPAKE half of crypto.rs and its tests** | ~800 |
-| `tls.rs` | **TLS-verification half of crypto.rs** | ~200 |
+| `pairing.rs` (or `pairing/` dir if it reads cleaner) | `start_pairing`, `handle_pairing_connection`, pairing `#[command]`s, failure/AEAD logging, **+ the whole of crypto.rs and its tests** | ~1000 |
 | `handlers.rs` (or `handlers/` dir) | `handle_message` (~900), `handle_incoming_clipboard_blob_stream`, `handle_incoming_file_stream` | ~1250 |
 | `commands/` (dir, by theme): `theme.rs`, `identity.rs`, `settings.rs`, `peers.rs`, `pairing.rs`, `clipboard.rs`, `system.rs` | the ~40 `#[command]` handlers | ~1100 |
 | `app.rs` (or `app/setup.rs` + `app/listeners.rs`) | `pub fn run()` builder + spawned loops (discovery / heartbeat / GC / transport listener) | ~870 |
 | `shortcuts.rs` | `register_shortcuts`, `handle_shortcut` | ~150 |
 | `net_util.rs` | `probe_ip`, `gossip_peer`, `is_local_ip`, `is_in_local_subnet`, firewall helpers | ~250 |
 
-After the split, `crypto.rs` ceases to exist (its two halves having moved), and
-lib.rs shrinks to: module declarations, the `Args` struct, and minimal glue —
-on the order of a few hundred lines.
+After the split, `crypto.rs` ceases to exist (folded into `pairing`), and lib.rs
+shrinks to: module declarations, the `Args` struct, and minimal glue — on the
+order of a few hundred lines.
 
 Whether `pairing`, `handlers`, and `app` are single files or small directories
 is an implementation detail to decide during extraction based on what reads
@@ -173,8 +175,8 @@ Rust*, not relocated verbatim.
 
 ## Risks & mitigations
 
-- **Riskiest move = SPAKE half of crypto.rs into `pairing`.** Mitigated by moving
-  its unit tests with it and gating on `cargo test`.
+- **Riskiest move = crypto.rs into `pairing`.** Mitigated by moving its unit
+  tests with it and gating on `cargo test`.
 - **Large `handle_message` move** could subtly drop a match arm. Mitigated by
   extracting it whole first (verbatim), compiling, then optionally sub-splitting.
 - **Two protocol relocations change the bridge surface.** Done as their own
