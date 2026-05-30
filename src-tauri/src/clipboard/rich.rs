@@ -103,6 +103,111 @@ pub fn append_clipboard_passthrough_atom(mime: &str, bytes: &[u8]) -> Result<(),
     windows::append_passthrough_atom_no_empty(mime, bytes)
 }
 
+/// If `html` is a full HTML document, return just the content between
+/// `<body…>` and `</body>`. Otherwise return the input unchanged.
+///
+/// Used by the Windows CF_HTML write path. `clipboard-win::raw::set_html_inner`
+/// wraps whatever we hand it in
+/// `<html>\r\n<body>\r\n<!--StartFragment-->{input}<!--EndFragment-->\r\n</body>\r\n</html>`.
+/// PyCharm (and many other apps — browsers, Pages, Word for Web) already
+/// emit a full `<html><head>…</head><body>…</body></html>` document on the
+/// wire, so without this step the CF_HTML payload ends up with nested
+/// `<html>/<body>` tags. Word's HTML importer recovers from the invalid
+/// nesting by latching onto a later well-formed fragment and pasting only
+/// the tail end of the document — symptom of the issue #17 follow-up
+/// (Paste-Special-as-HTML in Word showed only the last few characters of
+/// a copy from PyCharm). Notepad and VSCode read CF_UNICODETEXT and don't
+/// see this. Stripping down to body content before clipboard-win wraps
+/// it produces a single `<html><body>` envelope and a flat fragment.
+///
+/// Lives at the rich-module top level (not inside `mod windows`) so it
+/// can be unit-tested on every platform; the dead-code allow covers
+/// macOS/Linux builds where the CF_HTML call site doesn't exist.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(super) fn strip_html_doc(html: &str) -> &str {
+    let lower = html.to_ascii_lowercase();
+    let Some(body_open_lt) = lower.find("<body") else {
+        return html;
+    };
+    let Some(body_open_gt_rel) = lower[body_open_lt..].find('>') else {
+        return html;
+    };
+    let body_start = body_open_lt + body_open_gt_rel + 1;
+    let Some(body_close) = lower.rfind("</body") else {
+        return html;
+    };
+    if body_close < body_start {
+        return html;
+    }
+    &html[body_start..body_close]
+}
+
+#[cfg(test)]
+mod strip_html_doc_tests {
+    use super::strip_html_doc;
+
+    #[test]
+    fn unwraps_pycharm_style_full_document() {
+        let input = "<html><head><meta charset=\"utf-8\"></head>\
+                     <body><pre><span>print(1)</span></pre></body></html>";
+        assert_eq!(strip_html_doc(input), "<pre><span>print(1)</span></pre>");
+    }
+
+    #[test]
+    fn leaves_fragment_only_input_unchanged() {
+        let input = "<p>hello <b>world</b></p>";
+        assert_eq!(strip_html_doc(input), input);
+    }
+
+    #[test]
+    fn handles_body_with_attributes() {
+        let input = "<html><body style=\"color: red\" class=\"x\">hi</body></html>";
+        assert_eq!(strip_html_doc(input), "hi");
+    }
+
+    #[test]
+    fn handles_uppercase_tags() {
+        let input = "<HTML><BODY>hi</BODY></HTML>";
+        assert_eq!(strip_html_doc(input), "hi");
+    }
+
+    #[test]
+    fn handles_mixed_case_tags() {
+        let input = "<Html><Head></Head><Body>hi</Body></Html>";
+        assert_eq!(strip_html_doc(input), "hi");
+    }
+
+    #[test]
+    fn falls_back_when_no_closing_body() {
+        // Malformed: open <body> but no closing tag. Return as-is rather
+        // than guessing where the fragment ends.
+        let input = "<html><body>hi";
+        assert_eq!(strip_html_doc(input), input);
+    }
+
+    #[test]
+    fn falls_back_when_no_opening_body() {
+        let input = "<html></body></html>";
+        assert_eq!(strip_html_doc(input), input);
+    }
+
+    #[test]
+    fn preserves_inner_body_literals_in_content() {
+        // `<body>` text inside the actual body (e.g. an HTML snippet in
+        // a code block) is preserved — we use the first `<body` for the
+        // opening tag and the last `</body>` for the close, so nested
+        // body literals between them survive.
+        let input = "<html><body><pre>&lt;body&gt; example</pre></body></html>";
+        assert_eq!(strip_html_doc(input), "<pre>&lt;body&gt; example</pre>");
+    }
+
+    #[test]
+    fn empty_body_returns_empty_str() {
+        let input = "<html><body></body></html>";
+        assert_eq!(strip_html_doc(input), "");
+    }
+}
+
 // ── Windows ────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -309,12 +414,18 @@ mod windows {
                 "text/html" => {
                     // Html setter takes the unwrapped fragment and adds the
                     // CF_HTML header for us. `Html::new` registers the format
-                    // atom; None means registration failed.
+                    // atom; None means registration failed. `super::strip_html_doc`
+                    // unwraps a full HTML document down to its body content
+                    // before clipboard-win adds its `<html><body>` envelope —
+                    // without that step Word's HTML paste shows only the
+                    // tail end of the document (see `strip_html_doc` for
+                    // the full reasoning).
                     let html_str = std::str::from_utf8(&bytes)
                         .map_err(|e| format!("text/html not UTF-8: {}", e))?;
+                    let fragment = super::strip_html_doc(html_str);
                     let html = Html::new()
                         .ok_or_else(|| "couldn't register CF_HTML format atom".to_string())?;
-                    html.write_clipboard(&html_str)
+                    html.write_clipboard(&fragment)
                         .map_err(|e| format!("CF_HTML: {}", e))?;
                 }
                 "text/rtf" => {

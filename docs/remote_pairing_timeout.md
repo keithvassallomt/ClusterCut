@@ -246,3 +246,70 @@ done
 - Responder accept gating: [src-tauri/src/lib.rs:3382-3431](../src-tauri/src/lib.rs#L3382-L3431)
 - Responder peer persistence (post-T4): [src-tauri/src/lib.rs:2426-2432](../src-tauri/src/lib.rs#L2426-L2432)
 - Responder handler entry: [src-tauri/src/lib.rs:2170](../src-tauri/src/lib.rs#L2170)
+
+
+
+## Run
+
+./tmp/pair-probe.sh
+Probing 192.168.96.7:4654 every 1s. Log: /tmp/pair-probe-20260530-070626.log
+Trigger pairing in the app now. Press Ctrl-C to stop.
+
+ts                       result    elapsed   detail
+------------------------ --------  --------  ---------------------------
+2026-05-30 07:06:26.534  OK         0.110s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:27.672  OK         0.091s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:28.790  OK         0.100s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:29.920  OK         0.084s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:31.022  OK         0.120s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:32.197  OK         0.105s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:33.347  OK         0.129s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:34.521  OK         0.119s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:35.695  OK         0.113s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:36.855  OK         0.095s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:38.014  OK         0.111s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:39.164  OK         0.161s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:40.380  OK         0.111s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:41.562  OK         0.097s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:42.696  OK         0.142s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:43.890  OK         0.121s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:45.087  OK         0.116s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:46.274  OK         0.138s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:47.447  OK         0.151s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:48.660  OK         0.130s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:49.854  OK         0.099s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:50.972  OK         0.092s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:52.084  OK         0.097s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:53.206  OK         0.135s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:54.379  OK         0.093s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:55.507  OK         0.120s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:56.658  OK         0.100s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:57.782  OK         0.104s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:06:58.928  OK         0.120s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:07:00.092  OK         0.116s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:07:01.263  OK         0.125s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+2026-05-30 07:07:02.438  OK         0.103s  Ncat: Version 7.92 ( https://nmap.org/ncat ) Ncat: Connected to 192.168.96.7:465
+
+2026-05-30T06:06:13.788730Z  WARN Pairing failed from 192.168.96.17:51508.
+2026-05-30T06:06:20.752714Z  INFO [Discovery] Active probe FAILED/TIMEOUT. Removing peer clustercut-1100959039
+2026-05-30T06:06:25.749101Z  WARN Pairing failed from 192.168.96.17:34032.
+2026-05-30T06:06:26.865572Z  WARN Pairing failed from 192.168.96.17:34038.
+2026-05-30T06:06:28.000840Z  WARN Pairing failed from 192.168.96.17:34046.
+2026-05-30T06:06:29.103204Z  WARN Pairing failed from 192.168.96.17:34054.
+2026-05-30T06:06:30.239182Z  WARN Pairing failed from 192.168.96.17:34066.
+2026-05-30T06:06:31.395772Z  WARN Pairing failed from 192.168.96.17:59190.
+2026-05-30T06:06:32.570162Z  WARN Pairing failed from 192.168.96.17:59202.
+2026-05-30T06:06:33.735368Z  WARN Pairing failed from 192.168.96.17:59208.
+2026-05-30T06:06:34.908076Z  WARN Pairing failed from 192.168.96.17:59222.
+2026-05-30T06:06:36.044338Z  WARN Pairing failed from 192.168.96.17:59234.
+2026-05-30T06:06:37.212881Z  WARN Pairing failed from 192.168.96.17:59246.
+2026-05-30T06:06:38.418955Z  WARN Pairing failed from 192.168.96.17:59258.
+2026-05-30T06:06:39.586995Z  WARN Pairing failed from 192.168.96.17:59272.
+2026-05-30T06:06:40.769848Z  WARN Pairing failed from 192.168.96.17:59288.
+2026-05-30T06:06:41.933510Z  WARN Pairing failed from 192.168.96.17:44270.
+2026-05-30T06:06:43.107687Z  WARN Pairing failed from 192.168.96.17:44276.
+2026-05-30T06:06:44.290134Z  WARN Pairing failed from 192.168.96.17:44282.
+2026-05-30T06:06:45.503020Z  WARN Pairing failed from 192.168.96.17:44292.
+2026-05-30T06:06:46.698631Z  WARN Pairing failed from 192.168.96.17:44302.
+2026-05-30T06:06:47.878569Z  WARN Pairing failed from 192.168.96.17:44316.
+2026-05-30T06:06:49.055267Z  WARN Pairing failed from 192.168.96.17:44330.
