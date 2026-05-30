@@ -1,5 +1,15 @@
 import type { ClipboardBlobPreview, ClipboardFormatPreview } from "../types";
 
+// Descriptor-vs-inline is a PROTOCOL decision owned by the backend: it sets
+// `fetch_id` exactly when the bytes ride the file-transfer ALPN instead of
+// inline (Rust `ClipboardBlob::is_descriptor()` == `fetch_id.is_some()`). The
+// UI doesn't decide this — it only reads the backend's signal. Naming the check
+// here keeps that rule in one place on the TS side rather than inlining the raw
+// `fetch_id` test at every use.
+function isDescriptorBlob(payloadBlob: any): boolean {
+  return typeof payloadBlob.fetch_id === "string" && payloadBlob.fetch_id.length > 0;
+}
+
 // The backend ships ClipboardBlob.data as a base64 string (chosen over the
 // default Vec<u8>→JSON-int-array encoding to keep wire size manageable —
 // see protocol.rs). Decode once at receive time and stash an object URL so
@@ -13,7 +23,7 @@ export function blobFromPayload(payloadBlob: any): ClipboardBlobPreview | undefi
   // "Large image (X.Y MB) — accept to receive". User accept triggers the fetch
   // through `confirm_pending_clipboard`, which the backend routes to a
   // `Message::FileRequest`.
-  if (typeof payloadBlob.fetch_id === "string" && payloadBlob.fetch_id.length > 0) {
+  if (isDescriptorBlob(payloadBlob)) {
     return {
       mime_type: payloadBlob.mime_type || "image/png",
       width: typeof payloadBlob.width === "number" ? payloadBlob.width : undefined,
