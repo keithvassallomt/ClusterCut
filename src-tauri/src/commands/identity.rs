@@ -32,80 +32,77 @@ pub(crate) fn get_hostname(state: State<'_, AppState>) -> String {
         .unwrap_or_else(|_| "Unknown".to_string())
 }
 
-#[tauri::command]
-pub(crate) fn set_network_identity(
-    name: String,
-    pin: String,
-    state: State<'_, AppState>,
-    app_handle: tauri::AppHandle,
+/// Apply a local cluster-name change: bump the register version, set origin to
+/// this device, persist all three fields, re-register mDNS, and broadcast the
+/// new register to connected peers. Shared by provisioned set-name and auto
+/// regenerate. Does NOT touch the PIN.
+fn apply_local_rename(
+    name: &str,
+    state: &AppState,
+    transport: &crate::transport::Transport,
+    app_handle: &tauri::AppHandle,
 ) {
-    // Validate?
-    *state.network_name.lock().unwrap() = name.clone();
-    *state.network_pin.lock().unwrap() = pin.clone();
-
-    crate::storage::save_network_name(&app_handle, &name);
-    crate::storage::save_network_pin(&app_handle, &pin);
-
-    // Also likely need to reset keys if we are "provisioning" a new identity?
-    // Or do we keep the key?
-    // If I type a new name/pin, I am essentially saying "I belong to THIS network now".
-    // I need the key for THAT network.
-    // If I'm creating it, I generate a key.
-    // If I'm joining it (provisioned), I usually need the Key too OR I need to Pair.
-    // But "Provisioned" usually means "I set the config manually".
-    // The prompt says "Toggle... default behaviour applies (random)... Provisioned... user can enter".
-    // It doesn't say "User enters Key".
-    // So "Provisioned" here effectively just means "Manual valid Network Name/PIN" instead of "Random Name/PIN".
-    // It implies we are STARTING a cluster with this name/pin.
-    // So we keep our current Key (or gen a new one).
-    // Since we are changing identity, a new Key is safer.
-    // But if we just rename the cluster, we might want to keep the key.
-    // Actually, if I just want to rename my cluster "My Home", I don't want to break existing peers if I can help it?
-    // But existing peers know me by Key? No, they pair with Spake2 using PIN.
-    // If I change PIN, they can't pair.
-    // If I change Name, they see "My Home" instead of "Fuzzy-Badger".
-    // I'll stick to just updating Name/PIN.
-
-    // Re-register mDNS with new name
     let device_id = state.local_device_id.lock().unwrap().clone();
-
-    // Get actual port from transport
-    let port = if let Some(transport) = state.transport.lock().unwrap().as_ref() {
-        transport.local_addr().map(|a| a.port()).unwrap_or(4654)
-    } else {
-        4654
+    let new_version = {
+        let cur = *state.network_name_version.lock().unwrap();
+        crate::cluster_name::next_local_version(cur)
     };
 
-    // Discovery usually stores port.
+    *state.network_name.lock().unwrap() = name.to_string();
+    *state.network_name_version.lock().unwrap() = new_version;
+    *state.network_name_origin.lock().unwrap() = device_id.clone();
+
+    crate::storage::save_network_name(app_handle, name);
+    crate::storage::save_network_name_version(app_handle, new_version);
+    crate::storage::save_network_name_origin(app_handle, &device_id);
+
+    // Re-register mDNS with the new name.
+    let port = state
+        .transport
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|t| t.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(4654);
     if let Some(discovery) = state.discovery.lock().unwrap().as_mut() {
-          let _ = discovery.register(&device_id, &name, port);
+        let _ = discovery.register(&device_id, name, port);
     }
+
+    // Propagate to connected peers.
+    crate::net_util::broadcast_cluster_name(
+        name, new_version, &device_id, state, transport, None,
+    );
 
     let _ = app_handle.emit("network-update", ());
 }
 
 #[tauri::command]
-pub(crate) fn regenerate_network_identity(
+pub(crate) fn set_network_identity(
+    name: String,
+    pin: String,
     state: State<'_, AppState>,
+    transport: State<'_, crate::transport::Transport>,
     app_handle: tauri::AppHandle,
 ) {
-    let (name, pin) = crate::storage::regenerate_identity(&app_handle);
-
-    *state.network_name.lock().unwrap() = name.clone();
+    // PIN stays per-device; persist it as before.
     *state.network_pin.lock().unwrap() = pin.clone();
+    crate::storage::save_network_pin(&app_handle, &pin);
 
-    let device_id = state.local_device_id.lock().unwrap().clone();
+    // The name is shared cluster state: bump the register + propagate.
+    apply_local_rename(&name, &state, &transport, &app_handle);
+}
 
-    // Get actual port from transport
-    let port = if let Some(transport) = state.transport.lock().unwrap().as_ref() {
-        transport.local_addr().map(|a| a.port()).unwrap_or(4654)
-    } else {
-        4654
-    };
+#[tauri::command]
+pub(crate) fn regenerate_network_identity(
+    state: State<'_, AppState>,
+    transport: State<'_, crate::transport::Transport>,
+    app_handle: tauri::AppHandle,
+) {
+    // Regenerate name + PIN files; PIN stays per-device.
+    let (name, pin) = crate::storage::regenerate_identity(&app_handle);
+    *state.network_pin.lock().unwrap() = pin;
 
-    if let Some(discovery) = state.discovery.lock().unwrap().as_mut() {
-          let _ = discovery.register(&device_id, &name, port);
-    }
-
-    let _ = app_handle.emit("network-update", ());
+    // The regenerated name is a cluster rename: bump the register + propagate.
+    apply_local_rename(&name, &state, &transport, &app_handle);
 }
