@@ -3,7 +3,26 @@ use names::Generator;
 use rand::Rng;
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use tauri::{path::BaseDirectory, AppHandle, Manager};
+
+/// Restrict a file to owner-only access. On Unix sets mode 0600. On Windows
+/// this is intentionally a no-op: `%APPDATA%\<app>` is already ACL-restricted to
+/// the user, SYSTEM, and Administrators by default, so other standard users
+/// cannot read it. Best-effort — logs on failure, never panics.
+fn set_owner_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            tracing::warn!("Failed to set 0600 on {}: {}", path.display(), e);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path; // Windows: AppData is already per-user ACL-protected.
+    }
+}
 
 pub fn load_network_name(app: &AppHandle) -> String {
     let path_resolver = app.path();
@@ -44,6 +63,64 @@ pub fn save_network_name(app: &AppHandle, name: &str) {
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(path, name);
+}
+
+/// Load the cluster-name version counter. Missing/invalid file → 0 (pre-issue
+/// default; an upgraded install starts unversioned and converges by origin).
+pub fn load_network_name_version(app: &AppHandle) -> u64 {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("network_name_version", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    if let Ok(s) = fs::read_to_string(&path) {
+        if let Ok(v) = s.trim().parse::<u64>() {
+            return v;
+        }
+    }
+    0
+}
+
+pub fn save_network_name_version(app: &AppHandle, version: u64) {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("network_name_version", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, version.to_string());
+}
+
+/// Load the device_id that set the current cluster name (tie-breaker). Missing
+/// file → empty string; callers seed it with the local device_id at startup so
+/// an unversioned install has a well-formed origin.
+pub fn load_network_name_origin(app: &AppHandle) -> String {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("network_name_origin", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+    if let Ok(s) = fs::read_to_string(&path) {
+        let trimmed = s.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    String::new()
+}
+
+pub fn save_network_name_origin(app: &AppHandle, origin: &str) {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("network_name_origin", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, origin);
 }
 
 pub fn load_cluster_id(app: &AppHandle) -> Option<String> {
@@ -227,7 +304,24 @@ pub fn save_device_cert(app: &AppHandle, cert_der: &[u8], key_der: &[u8]) {
         tracing::error!("Failed to write device key: {}", e);
         return;
     }
+    // The private key must not be world-readable (issue: secret file perms).
+    set_owner_only(&key_path);
     tracing::debug!("Saved device cert to disk.");
+}
+
+/// Re-apply owner-only permissions to the on-disk secret files if they exist.
+/// Run once at startup so installs created before this hardening landed get
+/// fixed — `device_key.der` in particular is written only at first launch and
+/// never rewritten, so the write-path hardening alone would never reach it.
+pub fn harden_secret_files(app: &AppHandle) {
+    let path_resolver = app.path();
+    for name in ["device_key.der", "network_pin"] {
+        if let Ok(path) = path_resolver.resolve(name, BaseDirectory::AppConfig) {
+            if path.exists() {
+                set_owner_only(&path);
+            }
+        }
+    }
 }
 
 pub fn load_device_id(app: &AppHandle) -> String {
@@ -261,6 +355,17 @@ pub fn save_device_id(app: &AppHandle, id: &str) {
     let _ = fs::write(path, id);
 }
 
+/// Generate a fresh 6-character lowercase-alphanumeric pairing PIN. No disk I/O.
+fn generate_pin() -> String {
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    (0..6)
+        .map(|_| {
+            let idx = rand::thread_rng().gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
+}
+
 pub fn load_network_pin(app: &AppHandle) -> String {
     let path_resolver = app.path();
     let path = match path_resolver.resolve("network_pin", BaseDirectory::AppConfig) {
@@ -285,16 +390,9 @@ pub fn load_network_pin(app: &AppHandle) -> String {
         }
     }
 
-    // Generate new PIN
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let pin: String = (0..6)
-        .map(|_| {
-            let idx = rand::thread_rng().gen_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect();
-
-    tracing::info!("Generated New Network PIN: {}", pin);
+    // Generate a new PIN and persist it (provisioned-mode path / lazy default).
+    let pin = generate_pin();
+    tracing::info!("Generated a new network PIN.");
     save_network_pin(app, &pin);
     pin
 }
@@ -315,8 +413,39 @@ pub fn save_network_pin(app: &AppHandle, pin: &str) {
     // Mirror the trim done on load_network_pin — keeps the on-disk file
     // canonical (no trailing whitespace from a pasted Settings input) so
     // even a build without the load-side trim would behave correctly.
-    let _ = fs::write(path, pin.trim());
+    if fs::write(&path, pin.trim()).is_ok() {
+        // The pairing PIN must not be world-readable (issue: secret file perms).
+        set_owner_only(&path);
+    }
 }
+/// Whether this device's pairing PIN should be persisted to disk. Only
+/// provisioned mode keeps a stable, user-set PIN across restarts; auto mode is
+/// ephemeral (issue 4).
+pub(crate) fn pin_should_persist(mode: &str) -> bool {
+    mode == "provisioned"
+}
+
+/// Establish this device's pairing PIN for the given cluster mode.
+///
+/// Provisioned mode persists the PIN (a user-set, memorable value must survive
+/// restarts), so it reads (and lazily generates + saves) from disk. Auto mode
+/// keeps the PIN ephemeral: any on-disk `network_pin` file is deleted and a
+/// fresh PIN is generated in memory, never written to disk. The PIN is only
+/// needed live during interactive pairing, so a per-launch value is sufficient
+/// and avoids storing the secret. See issue 4.
+pub fn establish_network_pin(app: &AppHandle, mode: &str) -> String {
+    if pin_should_persist(mode) {
+        return load_network_pin(app);
+    }
+    // Auto mode: delete any stored PIN, go ephemeral.
+    if let Ok(path) = app.path().resolve("network_pin", BaseDirectory::AppConfig) {
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+    }
+    generate_pin()
+}
+
 // Helper to reset network state (Self-Destruct/Kick)
 pub fn reset_network_state(app: &AppHandle) {
     let path_resolver = app.path();
@@ -341,25 +470,18 @@ pub fn reset_network_state(app: &AppHandle) {
     }
 }
 
-pub fn regenerate_identity(app: &AppHandle) -> (String, String) {
+/// Regenerate just the cluster NAME: delete the on-disk name file and return a
+/// fresh generated name (`load_network_name` regenerates and persists it). The
+/// PIN is handled separately by `establish_network_pin` so its persistence
+/// follows the cluster mode (ephemeral in auto — issue 4).
+pub fn regenerate_network_name(app: &AppHandle) -> String {
     let path_resolver = app.path();
-    // 1. Delete existing Name/PIN files
     if let Ok(path) = path_resolver.resolve("network_name", BaseDirectory::AppConfig) {
         if path.exists() {
             let _ = fs::remove_file(path);
         }
     }
-    if let Ok(path) = path_resolver.resolve("network_pin", BaseDirectory::AppConfig) {
-        if path.exists() {
-            let _ = fs::remove_file(path);
-        }
-    }
-
-    // 2. Load (which generates new ones if missing)
-    let new_name = load_network_name(app);
-    let new_pin = load_network_pin(app);
-
-    (new_name, new_pin)
+    load_network_name(app)
 }
 // --- Settings Persistance ---
 
@@ -412,9 +534,21 @@ pub struct AppSettings {
     /// Surfaced in the UI as a header-bar toggle (issue #16).
     #[serde(default = "default_pairing_accept_enabled")]
     pub pairing_accept_enabled: bool,
+    /// Issue #18: when off, the Windows firewall rule is NOT auto-created at
+    /// startup. Default-on for backward compatibility. Windows-only effect.
+    #[serde(default = "default_true")]
+    pub configure_firewall: bool,
+    /// Issue #18: when off, the device does not advertise itself over mDNS
+    /// (browsing/discovery of others stays active). Default-on.
+    #[serde(default = "default_true")]
+    pub mdns_advertising: bool,
 }
 
 fn default_pairing_accept_enabled() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -436,6 +570,8 @@ impl Default for AppSettings {
             compress_file_transfers: false,
             pairing_debug_logs: false,
             pairing_accept_enabled: true,
+            configure_firewall: true,
+            mdns_advertising: true,
         }
     }
 }
@@ -473,5 +609,94 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) {
 
     if let Ok(json) = serde_json::to_string_pretty(settings) {
         let _ = fs::write(path, json);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod perms_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn set_owner_only_sets_0600() {
+        // Create a world-readable temp file, then harden it.
+        let path = std::env::temp_dir().join(format!(
+            "clustercut_perms_test_{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::set_owner_only(&path);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode & 0o777);
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::AppSettings;
+
+    #[test]
+    fn missing_new_fields_default_to_true() {
+        // A settings.json written before issue #18 has neither field.
+        // They must deserialize to `true`, not bool's serde default of false.
+        let json = r#"{
+            "custom_device_name": null,
+            "cluster_mode": "auto",
+            "auto_send": true,
+            "auto_receive": true,
+            "notifications": {"device_join": true, "device_leave": true, "data_sent": false, "data_received": false},
+            "shortcut_send": null,
+            "shortcut_receive": null,
+            "enable_file_transfer": true,
+            "max_auto_download_size": 52428800,
+            "notify_large_files": true
+        }"#;
+        let s: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(s.configure_firewall);
+        assert!(s.mdns_advertising);
+    }
+
+    #[test]
+    fn explicit_false_round_trips() {
+        let mut s = AppSettings::default();
+        s.configure_firewall = false;
+        s.mdns_advertising = false;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(!back.configure_firewall);
+        assert!(!back.mdns_advertising);
+    }
+
+    #[test]
+    fn defaults_are_true() {
+        let s = AppSettings::default();
+        assert!(s.configure_firewall);
+        assert!(s.mdns_advertising);
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::{generate_pin, pin_should_persist};
+
+    #[test]
+    fn generate_pin_is_six_lowercase_alnum() {
+        let pin = generate_pin();
+        assert_eq!(pin.len(), 6, "pin was {:?}", pin);
+        assert!(
+            pin.chars().all(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "unexpected chars in {:?}",
+            pin
+        );
+    }
+
+    #[test]
+    fn only_provisioned_persists() {
+        assert!(pin_should_persist("provisioned"));
+        assert!(!pin_should_persist("auto"));
+        assert!(!pin_should_persist("something-else"));
     }
 }

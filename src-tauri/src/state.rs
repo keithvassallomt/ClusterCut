@@ -1,7 +1,7 @@
 use crate::peer::Peer;
 use crate::storage::AppSettings;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -50,11 +50,19 @@ pub struct AppState {
     pub last_clipboard_content: Arc<Mutex<String>>,
     // Human Readable Network Name
     pub network_name: Arc<Mutex<String>>,
+    // Cluster-name version counter (Lamport-style) and the device_id that set
+    // the current name (tie-breaker). Together with `network_name` these form
+    // the replicated cluster-name register. See cluster_name.rs.
+    pub network_name_version: Arc<Mutex<u64>>,
+    pub network_name_origin: Arc<Mutex<String>>,
     // Network PIN (6-char alphanumeric, for auto-joining)
     // Network PIN (6-char alphanumeric, for auto-joining)
     pub network_pin: Arc<Mutex<String>>,
     // App Settings
     pub settings: Arc<Mutex<AppSettings>>,
+    /// In-memory diagnostics ring buffer (pairing/mTLS events). Never persisted;
+    /// surfaced in the Diagnostics panel. See diagnostics.rs.
+    pub diagnostics: Arc<Mutex<VecDeque<crate::diagnostics::DiagnosticEvent>>>,
     // Pending Removals (Debounce for mDNS)
     pub pending_removals: Arc<Mutex<HashMap<String, u64>>>,
     // Pending Clipboard Content (Received but not yet applied due to Auto-Receive OFF)
@@ -152,8 +160,11 @@ impl AppState {
             discovery: Arc::new(Mutex::new(None)),
             last_clipboard_content: Arc::new(Mutex::new(String::new())),
             network_name: Arc::new(Mutex::new(String::new())),
+            network_name_version: Arc::new(Mutex::new(0)),
+            network_name_origin: Arc::new(Mutex::new(String::new())),
             network_pin: Arc::new(Mutex::new(String::new())),
             settings: Arc::new(Mutex::new(AppSettings::default())),
+            diagnostics: Arc::new(Mutex::new(VecDeque::new())),
             pending_removals: Arc::new(Mutex::new(HashMap::new())),
             pending_clipboard: Arc::new(Mutex::new(None)),
             pending_rich_promotion: Arc::new(Mutex::new(None)),

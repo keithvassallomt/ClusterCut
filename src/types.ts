@@ -18,6 +18,16 @@ export interface Peer {
 
 export type View = "devices" | "history" | "settings";
 
+export type DiagLevel = "minimal" | "detailed" | "debug";
+
+export interface DiagnosticEvent {
+  ts_ms: number;
+  level: DiagLevel;
+  kind: string;
+  peer: string | null;
+  message: string;
+}
+
 export type NearbyNetwork = {
   networkName: string;
   devices: {
@@ -88,4 +98,6 @@ export interface AppSettings {
   ignore_extension_missing: boolean;
   compress_file_transfers: boolean;
   pairing_debug_logs: boolean;
+  configure_firewall: boolean;
+  mdns_advertising: boolean;
 }

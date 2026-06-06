@@ -11,7 +11,7 @@ use crate::peer::Peer;
 use rand::Rng;
 use crate::state::{AppState, LegacyPeerInfo};
 use crate::storage::{
-    load_cluster_id, load_device_id, load_known_peers, load_network_name, load_network_pin,
+    load_cluster_id, load_device_id, load_known_peers, load_network_name,
     save_cluster_id, save_device_id, save_known_peers,
     wipe_legacy_cluster_key,
     load_settings,
@@ -509,10 +509,15 @@ pub(crate) fn run() {
 
             #[cfg(target_os = "windows")]
             {
-                // Ensure firewall rule exists; checks first and only prompts UAC if needed.
-                std::thread::spawn(|| {
-                    crate::net_util::configure_windows_firewall();
-                });
+                // Issue #18: skip auto-config when the user disabled it. Settings
+                // are loaded into state below (later in setup), but this block runs
+                // earlier, so read straight from disk here.
+                if crate::storage::load_settings(app_handle).configure_firewall {
+                    // Ensure firewall rule exists; checks first and only prompts UAC if needed.
+                    std::thread::spawn(|| {
+                        crate::net_util::configure_windows_firewall();
+                    });
+                }
             }
 
             #[cfg(target_os = "linux")]
@@ -535,6 +540,9 @@ pub(crate) fn run() {
                 // 1. Load (or generate) cluster_id, and wipe the legacy
                 //    cluster_key.bin secret if it's still on disk from v0.2.
                 wipe_legacy_cluster_key(app_handle);
+                // Re-apply owner-only perms to secret files for installs created
+                // before this hardening (issue: secret file perms).
+                crate::storage::harden_secret_files(app_handle);
                 let mut cid_lock = state.cluster_id.lock().unwrap();
                 if let Some(id) = load_cluster_id(app_handle) {
                     *cid_lock = id;
@@ -597,10 +605,26 @@ pub(crate) fn run() {
                 let network_name = load_network_name(app_handle);
                 *state.network_name.lock().unwrap() = network_name.clone();
 
-                // 3c. Load Network PIN
-                let network_pin = load_network_pin(app_handle);
+                // 3b-ii. Load the cluster-name register version + origin
+                // (issue: cluster-name convergence). A pre-feature install has
+                // no version/origin files → version 0, origin seeded to our own
+                // device_id so the register is well-formed.
+                let nn_version = crate::storage::load_network_name_version(app_handle);
+                let mut nn_origin = crate::storage::load_network_name_origin(app_handle);
+                if nn_origin.is_empty() {
+                    nn_origin = device_id.clone();
+                }
+                *state.network_name_version.lock().unwrap() = nn_version;
+                *state.network_name_origin.lock().unwrap() = nn_origin;
+
+                // 3c. Establish Network PIN — mode-aware: persisted in
+                // provisioned, ephemeral (in-memory, file deleted) in auto.
+                // Issue 4. Settings are already loaded into state above, so the
+                // mode is available here.
+                let cluster_mode = state.settings.lock().unwrap().cluster_mode.clone();
+                let network_pin = crate::storage::establish_network_pin(app_handle, &cluster_mode);
                 *state.network_pin.lock().unwrap() = network_pin.clone();
-                tracing::info!("Network PIN: {}", network_pin);
+                tracing::info!("Network PIN established (mode: {})", cluster_mode);
 
                 // 3e. Load Settings
                 let settings = load_settings(app_handle);
@@ -669,11 +693,17 @@ pub(crate) fn run() {
                      }
                 });
 
-                // 4. Register Discovery
+                // 4. Register Discovery. Browsing always runs so we can still
+                // discover peers; advertising (register) is gated on the
+                // mdns_advertising setting (issue #18).
                 let mut discovery = Discovery::new().expect("Failed to initialize discovery");
-                discovery
-                    .register(&device_id, &network_name, port)
-                    .expect("Failed to register service");
+                if state.settings.lock().unwrap().mdns_advertising {
+                    discovery
+                        .register(&device_id, &network_name, port)
+                        .expect("Failed to register service");
+                } else {
+                    tracing::info!("mDNS advertising disabled by settings; browsing only.");
+                }
                 let receiver = discovery.browse().expect("Failed to browse");
                 *state.discovery.lock().unwrap() = Some(discovery);
 
@@ -959,6 +989,8 @@ pub(crate) fn run() {
             let transport_inside = transport.clone();
             let file_state = listener_state.clone();
             let file_handle = listener_handle.clone();
+            let conn_state = listener_state.clone();
+            let conn_app = listener_handle.clone();
 
             transport.start_listening(
                 move |data, addr| {
@@ -983,6 +1015,18 @@ pub(crate) fn run() {
                     tauri::async_runtime::spawn(async move {
                          crate::handlers::handle_incoming_file_stream(recv, addr, state, handle).await;
                     });
+                },
+                move |kind: &str, addr: std::net::SocketAddr, detail: Option<String>| {
+                    let (level, msg) = match kind {
+                        "connect" => (crate::diagnostics::DiagLevel::Minimal, "mTLS connection established".to_string()),
+                        "drop" => (crate::diagnostics::DiagLevel::Minimal, "mTLS connection dropped".to_string()),
+                        "handshake_failed" => (
+                            crate::diagnostics::DiagLevel::Detailed,
+                            format!("mTLS handshake failed: {}", detail.unwrap_or_default()),
+                        ),
+                        _ => (crate::diagnostics::DiagLevel::Detailed, kind.to_string()),
+                    };
+                    crate::diagnostics::push_diagnostic(&conn_state, &conn_app, level, "mtls", Some(addr.to_string()), msg);
                 }
             );
             // Start Clipboard Monitor
@@ -1115,6 +1159,7 @@ pub(crate) fn run() {
             crate::commands::peers::get_peers,
 
             crate::commands::peers::add_manual_peer,
+            crate::commands::peers::add_remote_peer,
             crate::pairing::start_pairing,
             crate::commands::peers::delete_peer,
             crate::commands::peers::leave_network,
@@ -1126,6 +1171,8 @@ pub(crate) fn run() {
             crate::commands::identity::get_device_id,
             crate::commands::identity::get_hostname,
             crate::commands::settings::get_settings,
+            crate::commands::diagnostics::get_diagnostic_events,
+            crate::commands::diagnostics::clear_diagnostic_events,
             crate::commands::peers::get_known_peers,
             crate::commands::peers::expects_remote_manual_peers,
             crate::commands::system::log_frontend,

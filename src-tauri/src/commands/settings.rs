@@ -15,30 +15,61 @@ pub(crate) fn save_settings(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) {
-    // Preserve backend-only fields that the frontend doesn't manage
-    settings.flatpak_autostart = state.settings.lock().unwrap().flatpak_autostart;
+    // Capture the previous settings so we can detect toggle transitions.
+    let prev = state.settings.lock().unwrap().clone();
+
+    // Preserve backend-only fields that the frontend doesn't manage. These are
+    // owned elsewhere (autostart plugin; the header-bar `set_pairing_accept`
+    // command) and are absent from the frontend `AppSettings` type, so a general
+    // settings save must never overwrite them — otherwise a stale SettingsView
+    // copy could clobber a value the header toggle just changed.
+    settings.flatpak_autostart = prev.flatpak_autostart;
+    settings.pairing_accept_enabled = prev.pairing_accept_enabled;
     *state.settings.lock().unwrap() = settings.clone();
-    tracing::info!("Saving Settings: auto_send={}, auto_receive={}", settings.auto_send, settings.auto_receive);
+    tracing::info!(
+        "Saving Settings: auto_send={}, auto_receive={}, configure_firewall={}, mdns_advertising={}",
+        settings.auto_send, settings.auto_receive, settings.configure_firewall, settings.mdns_advertising
+    );
     crate::storage::save_settings(&app_handle, &settings);
     let _ = app_handle.emit("settings-changed", settings.clone());
+
+    // --- Issue #18: apply mDNS advertising toggle live ---
+    if settings.mdns_advertising != prev.mdns_advertising {
+        let mut disc_lock = state.discovery.lock().unwrap();
+        if let Some(disc) = disc_lock.as_mut() {
+            if settings.mdns_advertising {
+                let device_id = state.local_device_id.lock().unwrap().clone();
+                let network_name = state.network_name.lock().unwrap().clone();
+                let port = state
+                    .transport
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|t| t.local_addr().ok())
+                    .map(|a| a.port())
+                    .unwrap_or(4654);
+                if let Err(e) = disc.register(&device_id, &network_name, port) {
+                    tracing::error!("Failed to re-register mDNS service: {}", e);
+                }
+            } else {
+                disc.unregister();
+            }
+        }
+    }
+
+    // --- Issue #18: apply firewall toggle live (Windows OFF->ON only) ---
+    #[cfg(target_os = "windows")]
+    {
+        if settings.configure_firewall && !prev.configure_firewall {
+            std::thread::spawn(|| {
+                crate::net_util::configure_windows_firewall();
+            });
+        }
+    }
 
     #[cfg(desktop)]
     crate::tray::update_tray_menu(&app_handle);
 
     // Update Shortcuts
     crate::shortcuts::register_shortcuts(&app_handle);
-    // If auto_receive is now OFF, we might want to do something?
-    // If device name changed, we should probably rebroadcast or something,
-    // but the next heartbeat or discovery probe will pick it up.
-    // Ideally we emit an event if needed.
-
-    // Check if network name changed via Provisioning (this function saves AppSettings, but UI might call separate commands for Network Name/PIN)
-    // Wait, the UI for Provisioned Mode will likely update NetworkName/PIN directly?
-    // Or do we store them in AppSettings too?
-    // The requirement says "Provisioned mode, the user can enter a cluster name and PIN".
-    // Those are actually `state.network_name` and `state.network_pin`.
-    // `AppSettings` stores the *mode*.
-    // So the UI should call `save_network_identity` (new command needed?) or Update existing commands?
-    // We already have `load_network_name` but no set command exposed.
-    // I will add `set_network_identity` command.
 }
