@@ -412,9 +412,21 @@ pub struct AppSettings {
     /// Surfaced in the UI as a header-bar toggle (issue #16).
     #[serde(default = "default_pairing_accept_enabled")]
     pub pairing_accept_enabled: bool,
+    /// Issue #18: when off, the Windows firewall rule is NOT auto-created at
+    /// startup. Default-on for backward compatibility. Windows-only effect.
+    #[serde(default = "default_true")]
+    pub configure_firewall: bool,
+    /// Issue #18: when off, the device does not advertise itself over mDNS
+    /// (browsing/discovery of others stays active). Default-on.
+    #[serde(default = "default_true")]
+    pub mdns_advertising: bool,
 }
 
 fn default_pairing_accept_enabled() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -436,6 +448,8 @@ impl Default for AppSettings {
             compress_file_transfers: false,
             pairing_debug_logs: false,
             pairing_accept_enabled: true,
+            configure_firewall: true,
+            mdns_advertising: true,
         }
     }
 }
@@ -473,5 +487,49 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) {
 
     if let Ok(json) = serde_json::to_string_pretty(settings) {
         let _ = fs::write(path, json);
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::AppSettings;
+
+    #[test]
+    fn missing_new_fields_default_to_true() {
+        // A settings.json written before issue #18 has neither field.
+        // They must deserialize to `true`, not bool's serde default of false.
+        let json = r#"{
+            "custom_device_name": null,
+            "cluster_mode": "auto",
+            "auto_send": true,
+            "auto_receive": true,
+            "notifications": {"device_join": true, "device_leave": true, "data_sent": false, "data_received": false},
+            "shortcut_send": null,
+            "shortcut_receive": null,
+            "enable_file_transfer": true,
+            "max_auto_download_size": 52428800,
+            "notify_large_files": true
+        }"#;
+        let s: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(s.configure_firewall);
+        assert!(s.mdns_advertising);
+    }
+
+    #[test]
+    fn explicit_false_round_trips() {
+        let mut s = AppSettings::default();
+        s.configure_firewall = false;
+        s.mdns_advertising = false;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(!back.configure_firewall);
+        assert!(!back.mdns_advertising);
+    }
+
+    #[test]
+    fn defaults_are_true() {
+        let s = AppSettings::default();
+        assert!(s.configure_firewall);
+        assert!(s.mdns_advertising);
     }
 }

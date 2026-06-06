@@ -88,4 +88,6 @@ export interface AppSettings {
   ignore_extension_missing: boolean;
   compress_file_transfers: boolean;
   pairing_debug_logs: boolean;
+  configure_firewall: boolean;
+  mdns_advertising: boolean;
 }

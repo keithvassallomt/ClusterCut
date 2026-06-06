@@ -750,9 +750,22 @@ export default function App() {
         setManualBusy(false);
       }
     } else {
-      setAddManualOpen(false);
-      setManualIp("");
-      startManualPairFlow(input);
+      // Single IP: try a direct connect to an already-paired peer first
+      // (issue #18). Only fall back to the PIN/pairing modal if we don't
+      // recognise this address.
+      setManualBusy(true);
+      try {
+        const outcome = await invoke<"connected" | "needs_pairing">("add_remote_peer", { ip: input });
+        setAddManualOpen(false);
+        setManualIp("");
+        if (outcome === "needs_pairing") {
+          startManualPairFlow(input);
+        }
+      } catch (e) {
+        alert("Failed: " + e);
+      } finally {
+        setManualBusy(false);
+      }
     }
   };
 

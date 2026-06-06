@@ -509,10 +509,15 @@ pub(crate) fn run() {
 
             #[cfg(target_os = "windows")]
             {
-                // Ensure firewall rule exists; checks first and only prompts UAC if needed.
-                std::thread::spawn(|| {
-                    crate::net_util::configure_windows_firewall();
-                });
+                // Issue #18: skip auto-config when the user disabled it. Settings
+                // are loaded into state below (later in setup), but this block runs
+                // earlier, so read straight from disk here.
+                if crate::storage::load_settings(app_handle).configure_firewall {
+                    // Ensure firewall rule exists; checks first and only prompts UAC if needed.
+                    std::thread::spawn(|| {
+                        crate::net_util::configure_windows_firewall();
+                    });
+                }
             }
 
             #[cfg(target_os = "linux")]
@@ -669,11 +674,17 @@ pub(crate) fn run() {
                      }
                 });
 
-                // 4. Register Discovery
+                // 4. Register Discovery. Browsing always runs so we can still
+                // discover peers; advertising (register) is gated on the
+                // mdns_advertising setting (issue #18).
                 let mut discovery = Discovery::new().expect("Failed to initialize discovery");
-                discovery
-                    .register(&device_id, &network_name, port)
-                    .expect("Failed to register service");
+                if state.settings.lock().unwrap().mdns_advertising {
+                    discovery
+                        .register(&device_id, &network_name, port)
+                        .expect("Failed to register service");
+                } else {
+                    tracing::info!("mDNS advertising disabled by settings; browsing only.");
+                }
                 let receiver = discovery.browse().expect("Failed to browse");
                 *state.discovery.lock().unwrap() = Some(discovery);
 
@@ -1115,6 +1126,7 @@ pub(crate) fn run() {
             crate::commands::peers::get_peers,
 
             crate::commands::peers::add_manual_peer,
+            crate::commands::peers::add_remote_peer,
             crate::pairing::start_pairing,
             crate::commands::peers::delete_peer,
             crate::commands::peers::leave_network,
