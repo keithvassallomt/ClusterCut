@@ -10,6 +10,10 @@ import { ShortcutRecorder } from "./ShortcutRecorder";
 import { Dialog } from "./Dialog";
 import type { AppSettings } from "../types";
 
+// Issue #18: the firewall toggle only has an effect on Windows, where
+// configure_windows_firewall() exists. Match ShortcutRecorder's userAgent check.
+const isWindows = navigator.userAgent.toLowerCase().includes("win");
+
 export function SettingsView({
   onSettingsRefreshed
 }: {
@@ -445,6 +449,44 @@ export function SettingsView({
                   <span className={clsx("block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform", settings.compress_file_transfers ? "translate-x-6" : "translate-x-1")} />
                 </button>
               </div>
+            </div>
+          )}
+        </div>
+      </Card>
+
+      {/* Network — issue #18 */}
+      <Card className="p-4">
+        <SectionHeader
+          icon={<Wifi className="h-5 w-5 text-zinc-600 dark:text-zinc-300" />}
+          title="Network"
+          subtitle="Discovery and connectivity."
+        />
+        <div className="mt-4 px-1 space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">mDNS Advertising</div>
+              <div className="text-xs text-zinc-500">Let other devices discover this one automatically. Turn off to stay hidden and connect only via Add Remote.</div>
+            </div>
+            <button
+              onClick={() => setSettings({ ...settings, mdns_advertising: !settings.mdns_advertising })}
+              className={clsx("relative h-6 w-11 shrink-0 rounded-full transition-colors", settings.mdns_advertising ? "bg-emerald-500" : "bg-zinc-200 dark:bg-zinc-700")}
+            >
+              <span className={clsx("block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform", settings.mdns_advertising ? "translate-x-6" : "translate-x-1")} />
+            </button>
+          </div>
+
+          {isWindows && (
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">Configure Windows Firewall</div>
+                <div className="text-xs text-zinc-500">Add the inbound/outbound rule on startup (may prompt for admin). Turn off if your firewall is managed externally.</div>
+              </div>
+              <button
+                onClick={() => setSettings({ ...settings, configure_firewall: !settings.configure_firewall })}
+                className={clsx("relative h-6 w-11 shrink-0 rounded-full transition-colors", settings.configure_firewall ? "bg-emerald-500" : "bg-zinc-200 dark:bg-zinc-700")}
+              >
+                <span className={clsx("block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform", settings.configure_firewall ? "translate-x-6" : "translate-x-1")} />
+              </button>
             </div>
           )}
         </div>
