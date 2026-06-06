@@ -1156,7 +1156,7 @@ export default function App() {
                 }}
               />
             ) : (
-              <SettingsView onSettingsRefreshed={fetchSettings} />
+              <SettingsView onSettingsRefreshed={fetchSettings} hasClusterPeers={myPeers.length > 0} />
             )}
           </div>
         </div>

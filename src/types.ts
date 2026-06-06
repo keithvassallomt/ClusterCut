@@ -18,6 +18,16 @@ export interface Peer {
 
 export type View = "devices" | "history" | "settings";
 
+export type DiagLevel = "minimal" | "detailed" | "debug";
+
+export interface DiagnosticEvent {
+  ts_ms: number;
+  level: DiagLevel;
+  kind: string;
+  peer: string | null;
+  message: string;
+}
+
 export type NearbyNetwork = {
   networkName: string;
   devices: {

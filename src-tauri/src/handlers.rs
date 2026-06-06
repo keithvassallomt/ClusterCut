@@ -985,9 +985,27 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
 
                 let msg = Message::PeerDiscovery(my_peer);
                 let data = serde_json::to_vec(&msg).unwrap_or_default();
+                let transport_reply = transport_inside.clone();
                 tauri::async_runtime::spawn(async move {
-                    let _ = transport_inside.send_message(addr, &data).await;
+                    let _ = transport_reply.send_message(addr, &data).await;
                 });
+            }
+
+            // Anti-entropy: every time we hear from a peer (startup probe, mDNS
+            // rediscovery, gossip), tell it our current cluster-name register so
+            // peers that were offline during a rename converge. Gated on the
+            // peer's protocol version inside send_cluster_name_to.
+            {
+                let name = listener_state.network_name.lock().unwrap().clone();
+                let version = *listener_state.network_name_version.lock().unwrap();
+                let origin = listener_state.network_name_origin.lock().unwrap().clone();
+                let peer_addr = std::net::SocketAddr::new(peer.ip, peer.port);
+                crate::net_util::send_cluster_name_to(
+                    peer_addr,
+                    peer.protocol_version.as_deref(),
+                    name, version, origin,
+                    &transport_inside,
+                );
             }
         }
         Message::PeerRemoval(target_id) => {
@@ -1266,10 +1284,14 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                 .cloned()
                 .collect();
             let network_name = listener_state.network_name.lock().unwrap().clone();
+            let network_name_version = *listener_state.network_name_version.lock().unwrap();
+            let network_name_origin = listener_state.network_name_origin.lock().unwrap().clone();
             let info = crate::protocol::ClusterInfo {
                 cluster_id,
                 known_peers: known_peers_vec,
                 network_name,
+                network_name_version,
+                network_name_origin,
             };
             tracing::debug!("Replying to ClusterInfoRequest from {}", addr);
             match serde_json::to_vec(&Message::ClusterInfo(info)) {
@@ -1294,6 +1316,74 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                 None => {
                     tracing::warn!("Received unsolicited ClusterInfo from {}; ignoring", addr);
                 }
+            }
+        }
+        Message::ClusterName { name, version, origin } => {
+            // Converge the shared cluster-name register (last-write-wins by
+            // version, ties by origin). On a win: adopt, persist, re-register
+            // mDNS, notify the UI, and re-gossip to other peers (excluding the
+            // sender). If we are strictly newer, push our register back so the
+            // sender converges up.
+            let (local_version, local_origin) = {
+                let v = *listener_state.network_name_version.lock().unwrap();
+                let o = listener_state.network_name_origin.lock().unwrap().clone();
+                (v, o)
+            };
+
+            if crate::cluster_name::incoming_register_wins(
+                local_version, &local_origin, version, &origin,
+            ) {
+                {
+                    *listener_state.network_name.lock().unwrap() = name.clone();
+                    *listener_state.network_name_version.lock().unwrap() = version;
+                    *listener_state.network_name_origin.lock().unwrap() = origin.clone();
+                }
+                crate::storage::save_network_name(&listener_handle, &name);
+                crate::storage::save_network_name_version(&listener_handle, version);
+                crate::storage::save_network_name_origin(&listener_handle, &origin);
+
+                // Re-register mDNS with the adopted name.
+                let device_id = listener_state.local_device_id.lock().unwrap().clone();
+                let port = listener_state
+                    .transport
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|t| t.local_addr().ok())
+                    .map(|a| a.port())
+                    .unwrap_or(4654);
+                if let Some(discovery) = listener_state.discovery.lock().unwrap().as_mut() {
+                    let _ = discovery.register(&device_id, &name, port);
+                }
+
+                let _ = listener_handle.emit("network-update", ());
+                tracing::info!("Adopted cluster name '{}' (v{} from {})", name, version, origin);
+
+                // Re-gossip to everyone except the sender.
+                crate::net_util::broadcast_cluster_name(
+                    &name, version, &origin,
+                    &listener_state, &transport_inside, Some(addr),
+                );
+            } else if local_version > version
+                || (local_version == version && local_origin > origin)
+            {
+                // We hold a strictly-newer register; push it back to the sender
+                // so it converges up. (Equal version + equal origin is a no-op.)
+                let local_name = listener_state.network_name.lock().unwrap().clone();
+                // Look up the sender's protocol version from known peers by addr.
+                let sender_proto = listener_state
+                    .get_peers()
+                    .values()
+                    .find(|p| std::net::SocketAddr::new(p.ip, p.port) == addr)
+                    .and_then(|p| p.protocol_version.clone());
+                crate::net_util::send_cluster_name_to(
+                    addr,
+                    sender_proto.as_deref(),
+                    local_name,
+                    local_version,
+                    local_origin,
+                    &transport_inside,
+                );
             }
         }
         Message::Pong => {
