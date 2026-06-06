@@ -64,6 +64,19 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.5" date="2026-06-06">
+      <description>
+        <p>A reorganised Settings page, more control on locked-down networks, a live diagnostics view, and tighter handling of your private key and PIN.</p>
+        <ul>
+          <li>Settings is now organised into a sidebar with categories (General, Cluster, Files, Notifications, Diagnostics) instead of one long scrolling page</li>
+          <li>Adding a remote device by IP is smarter — if you've paired with it before, it just reconnects; it only asks for a PIN when it's a brand-new device</li>
+          <li>New options for restrictive or work networks: you can turn off automatic discovery (mDNS) to stay hidden and connect only by IP, and on Windows you can stop ClusterCut from setting up its firewall rule at startup</li>
+          <li>Your cluster's name now stays in sync across all your devices — rename it on one and the others update too, even ones that were offline at the time. Switching back to an auto-generated name asks for confirmation first, since it renames the cluster everywhere</li>
+          <li>New diagnostics event log under Settings → Diagnostics: watch pairing and connection activity as it happens, with selectable detail levels and a one-click copy for troubleshooting. It lives only in the app and is never written to a file</li>
+          <li>Security: your device's private key and pairing PIN are now saved with locked-down, owner-only permissions; in auto-generated mode the PIN is kept in memory only and never written to disk; and PINs are never written to the log file</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.4" date="2026-05-30">
       <description>
         <p>Clipboard and pairing fixes, plus smoother formatted-text handling on GNOME.</p>
