@@ -11,7 +11,7 @@ use crate::peer::Peer;
 use rand::Rng;
 use crate::state::{AppState, LegacyPeerInfo};
 use crate::storage::{
-    load_cluster_id, load_device_id, load_known_peers, load_network_name, load_network_pin,
+    load_cluster_id, load_device_id, load_known_peers, load_network_name,
     save_cluster_id, save_device_id, save_known_peers,
     wipe_legacy_cluster_key,
     load_settings,
@@ -617,10 +617,14 @@ pub(crate) fn run() {
                 *state.network_name_version.lock().unwrap() = nn_version;
                 *state.network_name_origin.lock().unwrap() = nn_origin;
 
-                // 3c. Load Network PIN
-                let network_pin = load_network_pin(app_handle);
+                // 3c. Establish Network PIN — mode-aware: persisted in
+                // provisioned, ephemeral (in-memory, file deleted) in auto.
+                // Issue 4. Settings are already loaded into state above, so the
+                // mode is available here.
+                let cluster_mode = state.settings.lock().unwrap().cluster_mode.clone();
+                let network_pin = crate::storage::establish_network_pin(app_handle, &cluster_mode);
                 *state.network_pin.lock().unwrap() = network_pin.clone();
-                tracing::info!("Network PIN: {}", network_pin);
+                tracing::info!("Network PIN established (mode: {})", cluster_mode);
 
                 // 3e. Load Settings
                 let settings = load_settings(app_handle);

@@ -99,10 +99,12 @@ pub(crate) fn regenerate_network_identity(
     transport: State<'_, crate::transport::Transport>,
     app_handle: tauri::AppHandle,
 ) {
-    // Regenerate name + PIN files; PIN stays per-device.
-    let (name, pin) = crate::storage::regenerate_identity(&app_handle);
+    // This command runs when switching to Auto mode. Generate a fresh random
+    // name (persisted + version-bumped + propagated by apply_local_rename) and
+    // an EPHEMERAL PIN — auto mode never stores the PIN on disk (issue 4).
+    let name = crate::storage::regenerate_network_name(&app_handle);
+    let pin = crate::storage::establish_network_pin(&app_handle, "auto");
     *state.network_pin.lock().unwrap() = pin;
 
-    // The regenerated name is a cluster rename: bump the register + propagate.
     apply_local_rename(&name, &state, &transport, &app_handle);
 }

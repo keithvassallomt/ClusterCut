@@ -470,25 +470,18 @@ pub fn reset_network_state(app: &AppHandle) {
     }
 }
 
-pub fn regenerate_identity(app: &AppHandle) -> (String, String) {
+/// Regenerate just the cluster NAME: delete the on-disk name file and return a
+/// fresh generated name (`load_network_name` regenerates and persists it). The
+/// PIN is handled separately by `establish_network_pin` so its persistence
+/// follows the cluster mode (ephemeral in auto — issue 4).
+pub fn regenerate_network_name(app: &AppHandle) -> String {
     let path_resolver = app.path();
-    // 1. Delete existing Name/PIN files
     if let Ok(path) = path_resolver.resolve("network_name", BaseDirectory::AppConfig) {
         if path.exists() {
             let _ = fs::remove_file(path);
         }
     }
-    if let Ok(path) = path_resolver.resolve("network_pin", BaseDirectory::AppConfig) {
-        if path.exists() {
-            let _ = fs::remove_file(path);
-        }
-    }
-
-    // 2. Load (which generates new ones if missing)
-    let new_name = load_network_name(app);
-    let new_pin = load_network_pin(app);
-
-    (new_name, new_pin)
+    load_network_name(app)
 }
 // --- Settings Persistance ---
 
