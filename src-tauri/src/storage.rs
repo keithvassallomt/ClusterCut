@@ -392,7 +392,7 @@ pub fn load_network_pin(app: &AppHandle) -> String {
 
     // Generate a new PIN and persist it (provisioned-mode path / lazy default).
     let pin = generate_pin();
-    tracing::info!("Generated New Network PIN: {}", pin);
+    tracing::info!("Generated a new network PIN.");
     save_network_pin(app, &pin);
     pin
 }

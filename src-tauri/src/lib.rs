@@ -791,9 +791,8 @@ pub(crate) fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppSt
         *np = new_pin_val.clone();
 
         tracing::info!(
-            "Reset to New Network: {} (PIN: {}, cluster {})",
+            "Reset to New Network: {} (PIN: <redacted>, cluster {})",
             new_name_val,
-            new_pin_val,
             new_cluster_id
         );
     }
