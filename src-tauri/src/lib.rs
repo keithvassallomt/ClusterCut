@@ -3,6 +3,7 @@ mod clipboard;
 mod cluster_name;
 mod commands;
 mod compression;
+mod diagnostics;
 #[cfg(target_os = "linux")]
 mod dbus;
 mod handlers;

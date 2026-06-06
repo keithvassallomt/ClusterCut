@@ -1,7 +1,7 @@
 use crate::peer::Peer;
 use crate::storage::AppSettings;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -60,6 +60,9 @@ pub struct AppState {
     pub network_pin: Arc<Mutex<String>>,
     // App Settings
     pub settings: Arc<Mutex<AppSettings>>,
+    /// In-memory diagnostics ring buffer (pairing/mTLS events). Never persisted;
+    /// surfaced in the Diagnostics panel. See diagnostics.rs.
+    pub diagnostics: Arc<Mutex<VecDeque<crate::diagnostics::DiagnosticEvent>>>,
     // Pending Removals (Debounce for mDNS)
     pub pending_removals: Arc<Mutex<HashMap<String, u64>>>,
     // Pending Clipboard Content (Received but not yet applied due to Auto-Receive OFF)
@@ -161,6 +164,7 @@ impl AppState {
             network_name_origin: Arc::new(Mutex::new(String::new())),
             network_pin: Arc::new(Mutex::new(String::new())),
             settings: Arc::new(Mutex::new(AppSettings::default())),
+            diagnostics: Arc::new(Mutex::new(VecDeque::new())),
             pending_removals: Arc::new(Mutex::new(HashMap::new())),
             pending_clipboard: Arc::new(Mutex::new(None)),
             pending_rich_promotion: Arc::new(Mutex::new(None)),
