@@ -1266,10 +1266,14 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                 .cloned()
                 .collect();
             let network_name = listener_state.network_name.lock().unwrap().clone();
+            let network_name_version = *listener_state.network_name_version.lock().unwrap();
+            let network_name_origin = listener_state.network_name_origin.lock().unwrap().clone();
             let info = crate::protocol::ClusterInfo {
                 cluster_id,
                 known_peers: known_peers_vec,
                 network_name,
+                network_name_version,
+                network_name_origin,
             };
             tracing::debug!("Replying to ClusterInfoRequest from {}", addr);
             match serde_json::to_vec(&Message::ClusterInfo(info)) {
@@ -1295,6 +1299,10 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                     tracing::warn!("Received unsolicited ClusterInfo from {}; ignoring", addr);
                 }
             }
+        }
+        Message::ClusterName { .. } => {
+            // TODO(Task 6): converge the cluster-name register. Temporary no-op
+            // so the match stays exhaustive until the handler lands.
         }
         Message::Pong => {
              tracing::debug!("Received Pong from {}. Connection Verified.", addr);

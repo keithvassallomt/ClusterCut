@@ -290,6 +290,13 @@ pub struct ClusterInfo {
     pub cluster_id: String,
     pub known_peers: Vec<crate::peer::Peer>,
     pub network_name: String,
+    /// Cluster-name register version + origin so a joiner adopts the full
+    /// register, not just the string. `#[serde(default)]` keeps wire-compat
+    /// with peers that don't send these yet.
+    #[serde(default)]
+    pub network_name_version: u64,
+    #[serde(default)]
+    pub network_name_origin: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -319,6 +326,14 @@ pub enum Message {
     /// `ClusterInfoRequest`. mTLS authenticates both ends, so no extra
     /// per-payload tag is needed.
     ClusterInfo(ClusterInfo),
+    /// Shared cluster-name register announcement, sent post-pairing over
+    /// QUIC/mTLS. Carries the full `(name, version, origin)` register so
+    /// receivers can converge via last-write-wins. See cluster_name.rs.
+    ClusterName {
+        name: String,
+        version: u64,
+        origin: String,
+    },
 }
 
 /// Messages exchanged on the dedicated plaintext-TCP pairing channel.

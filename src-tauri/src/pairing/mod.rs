@@ -355,7 +355,13 @@ pub(crate) async fn start_pairing(
         }
     };
 
-    let crate::protocol::ClusterInfo { cluster_id, known_peers, network_name } = cluster_info;
+    let crate::protocol::ClusterInfo {
+        cluster_id,
+        known_peers,
+        network_name,
+        network_name_version: _nn_version,
+        network_name_origin: _nn_origin,
+    } = cluster_info;
     tracing::info!("Joined Network: {} (cluster {})", network_name, cluster_id);
     {
         let mut cid = state.cluster_id.lock().unwrap();
