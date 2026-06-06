@@ -56,11 +56,11 @@ The cluster name becomes a small versioned register stored per device:
 - `network_name_origin: String` — `device_id` of whoever set the current name
   (the tie-breaker).
 
-**Storage:** persist `network_name_version` and `network_name_origin` next to
-the existing `network_name` file (two new sibling files, or fold into a small
-JSON — implementation choice in the plan; sibling files keep backward-compat
-trivial). **Backward-compat on load:** missing version → `0`; missing origin →
-the local `device_id`.
+**Storage:** persist `network_name_version` and `network_name_origin` as **two
+new sibling files** next to the existing `network_name` file. The existing
+`network_name` file is left exactly as-is (raw text), so there is **no migration
+and no risk** to existing installs. **Backward-compat on load:** missing version
+file → `0`; missing origin file → the local `device_id`.
 
 **State:** `AppState` gains `network_name_version: Arc<Mutex<u64>>` and
 `network_name_origin: Arc<Mutex<String>>`.
