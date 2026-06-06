@@ -99,6 +99,15 @@ pub(crate) async fn start_pairing(
         }
     };
 
+    crate::diagnostics::push_diagnostic(
+        &*state,
+        &app_handle,
+        crate::diagnostics::DiagLevel::Minimal,
+        "pairing",
+        Some(peer_addr.to_string()),
+        "Pairing started".to_string(),
+    );
+
     // Pre-flight version check for mDNS-discovered peers. If the peer's
     // advertised proto is missing or below the floor this build can talk
     // to, emit `peer-incompatible` so the existing "Peer needs updating"
@@ -156,6 +165,22 @@ pub(crate) async fn start_pairing(
         }
         Err(e) => {
             let _ = app_handle.emit("pairing-failed", "Pairing connection failed. Please try again.");
+            crate::diagnostics::push_diagnostic(
+                &*state,
+                &app_handle,
+                crate::diagnostics::DiagLevel::Minimal,
+                "pairing",
+                Some(peer_addr.to_string()),
+                "Pairing failed".to_string(),
+            );
+            crate::diagnostics::push_diagnostic(
+                &*state,
+                &app_handle,
+                crate::diagnostics::DiagLevel::Detailed,
+                "pairing",
+                Some(peer_addr.to_string()),
+                "Pairing failed: Pairing connection failed. Please try again.".to_string(),
+            );
             return Err(format!("Failed to read PairResponse: {}", e));
         }
     };
@@ -166,6 +191,22 @@ pub(crate) async fn start_pairing(
         Err(e) => {
             tracing::error!("SPAKE2 finish failed (initiator): {}", e);
             let _ = app_handle.emit("pairing-failed", "Authentication failed. Check the PIN and try again.");
+            crate::diagnostics::push_diagnostic(
+                &*state,
+                &app_handle,
+                crate::diagnostics::DiagLevel::Minimal,
+                "pairing",
+                Some(peer_addr.to_string()),
+                "Pairing failed".to_string(),
+            );
+            crate::diagnostics::push_diagnostic(
+                &*state,
+                &app_handle,
+                crate::diagnostics::DiagLevel::Detailed,
+                "pairing",
+                Some(peer_addr.to_string()),
+                "Pairing failed: Authentication failed. Check the PIN and try again.".to_string(),
+            );
             return Err(e.to_string());
         }
     };
@@ -200,6 +241,22 @@ pub(crate) async fn start_pairing(
     };
     if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &t2).await {
         let _ = app_handle.emit("pairing-failed", "Pairing connection failed. Please try again.");
+        crate::diagnostics::push_diagnostic(
+            &*state,
+            &app_handle,
+            crate::diagnostics::DiagLevel::Minimal,
+            "pairing",
+            Some(peer_addr.to_string()),
+            "Pairing failed".to_string(),
+        );
+        crate::diagnostics::push_diagnostic(
+            &*state,
+            &app_handle,
+            crate::diagnostics::DiagLevel::Detailed,
+            "pairing",
+            Some(peer_addr.to_string()),
+            "Pairing failed: Pairing connection failed. Please try again.".to_string(),
+        );
         return Err(format!("Failed to send InitiatorKC: {}", e));
     }
     tracing::info!("InitiatorKC sent (initiator); awaiting ResponderId (T3).");
@@ -221,11 +278,43 @@ pub(crate) async fn start_pairing(
         }
         Err(e) => {
             let _ = app_handle.emit("pairing-failed", "Failed to join network. The PIN may be incorrect.");
+            crate::diagnostics::push_diagnostic(
+                &*state,
+                &app_handle,
+                crate::diagnostics::DiagLevel::Minimal,
+                "pairing",
+                Some(peer_addr.to_string()),
+                "Pairing failed".to_string(),
+            );
+            crate::diagnostics::push_diagnostic(
+                &*state,
+                &app_handle,
+                crate::diagnostics::DiagLevel::Detailed,
+                "pairing",
+                Some(peer_addr.to_string()),
+                "Pairing failed: Failed to join network. The PIN may be incorrect.".to_string(),
+            );
             return Err(format!("Failed to read ResponderId: {}", e));
         }
     };
     let nonce_r_arr: [u8; 12] = nonce_r.as_slice().try_into().map_err(|_| {
         let _ = app_handle.emit("pairing-failed", "Pairing protocol error (bad nonce). Please try again.");
+        crate::diagnostics::push_diagnostic(
+            &*state,
+            &app_handle,
+            crate::diagnostics::DiagLevel::Minimal,
+            "pairing",
+            Some(peer_addr.to_string()),
+            "Pairing failed".to_string(),
+        );
+        crate::diagnostics::push_diagnostic(
+            &*state,
+            &app_handle,
+            crate::diagnostics::DiagLevel::Detailed,
+            "pairing",
+            Some(peer_addr.to_string()),
+            "Pairing failed: Pairing protocol error (bad nonce). Please try again.".to_string(),
+        );
         "ResponderId nonce must be 12 bytes".to_string()
     })?;
     let r_inner_bytes = match pair_aead_decrypt(&k_r2i, &nonce_r_arr, &ciphertext_r) {
@@ -234,6 +323,22 @@ pub(crate) async fn start_pairing(
             // Wrong PIN or active MITM. Generic UI message; no detail leaked.
             tracing::warn!("ResponderId AEAD decrypt failed (initiator): {}", e);
             let _ = app_handle.emit("pairing-failed", "Failed to join network. The PIN may be incorrect.");
+            crate::diagnostics::push_diagnostic(
+                &*state,
+                &app_handle,
+                crate::diagnostics::DiagLevel::Minimal,
+                "pairing",
+                Some(peer_addr.to_string()),
+                "Pairing failed".to_string(),
+            );
+            crate::diagnostics::push_diagnostic(
+                &*state,
+                &app_handle,
+                crate::diagnostics::DiagLevel::Detailed,
+                "pairing",
+                Some(peer_addr.to_string()),
+                "Pairing failed: Failed to join network. The PIN may be incorrect.".to_string(),
+            );
             return Err("ResponderId AEAD decrypt failed".to_string());
         }
     };
@@ -265,6 +370,22 @@ pub(crate) async fn start_pairing(
     };
     if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &t4).await {
         let _ = app_handle.emit("pairing-failed", "Failed to complete pairing. Please try again.");
+        crate::diagnostics::push_diagnostic(
+            &*state,
+            &app_handle,
+            crate::diagnostics::DiagLevel::Minimal,
+            "pairing",
+            Some(peer_addr.to_string()),
+            "Pairing failed".to_string(),
+        );
+        crate::diagnostics::push_diagnostic(
+            &*state,
+            &app_handle,
+            crate::diagnostics::DiagLevel::Detailed,
+            "pairing",
+            Some(peer_addr.to_string()),
+            "Pairing failed: Failed to complete pairing. Please try again.".to_string(),
+        );
         return Err(format!("Failed to send InitiatorId: {}", e));
     }
 
@@ -339,6 +460,22 @@ pub(crate) async fn start_pairing(
         // Clear the slot so a stray ClusterInfo doesn't sit in it forever.
         let _ = state.pending_cluster_info.lock().unwrap().take();
         let _ = app_handle.emit("pairing-failed", "Failed to fetch cluster info after pairing. Please try again.");
+        crate::diagnostics::push_diagnostic(
+            &*state,
+            &app_handle,
+            crate::diagnostics::DiagLevel::Minimal,
+            "pairing",
+            Some(peer_addr.to_string()),
+            "Pairing failed".to_string(),
+        );
+        crate::diagnostics::push_diagnostic(
+            &*state,
+            &app_handle,
+            crate::diagnostics::DiagLevel::Detailed,
+            "pairing",
+            Some(peer_addr.to_string()),
+            "Pairing failed: Failed to fetch cluster info after pairing. Please try again.".to_string(),
+        );
         return Err(format!("Failed to send ClusterInfoRequest: {}", e));
     }
     let cluster_info = match tokio::time::timeout(
@@ -351,6 +488,22 @@ pub(crate) async fn start_pairing(
         _ => {
             let _ = state.pending_cluster_info.lock().unwrap().take();
             let _ = app_handle.emit("pairing-failed", "Timed out waiting for cluster info. Please try again.");
+            crate::diagnostics::push_diagnostic(
+                &*state,
+                &app_handle,
+                crate::diagnostics::DiagLevel::Minimal,
+                "pairing",
+                Some(peer_addr.to_string()),
+                "Pairing failed".to_string(),
+            );
+            crate::diagnostics::push_diagnostic(
+                &*state,
+                &app_handle,
+                crate::diagnostics::DiagLevel::Detailed,
+                "pairing",
+                Some(peer_addr.to_string()),
+                "Pairing failed: Timed out waiting for cluster info. Please try again.".to_string(),
+            );
             return Err("ClusterInfo response timed out".to_string());
         }
     };
@@ -429,6 +582,14 @@ pub(crate) async fn start_pairing(
     // Signal pairing completion to the UI. Distinct from `peer-update`
     // (which also fires on mDNS rediscovery and would race the PIN dialog).
     let _ = app_handle.emit("pairing-success", &responder_device_id);
+    crate::diagnostics::push_diagnostic(
+        &*state,
+        &app_handle,
+        crate::diagnostics::DiagLevel::Minimal,
+        "pairing",
+        Some(responder_device_id.clone()),
+        "Pairing succeeded".to_string(),
+    );
     Ok(())
 }
 
@@ -467,6 +628,14 @@ fn record_pairing_aead_failure(
             crate::state::PAIRING_FAILURE_LOCKOUT_THRESHOLD,
         );
         let _ = app_handle.emit("pairing-locked-out", ());
+        crate::diagnostics::push_diagnostic(
+            state,
+            app_handle,
+            crate::diagnostics::DiagLevel::Minimal,
+            "pairing",
+            None,
+            "Pairing listener locked out (too many failures)".to_string(),
+        );
         // Urgent OS-level notification so the user actually sees the lockout
         // rather than only spotting it the next time they open Settings.
         crate::send_notification(
@@ -498,15 +667,34 @@ pub(crate) async fn handle_pairing_connection(
 ) {
     use crate::protocol::PairingMessage;
 
+    crate::diagnostics::push_diagnostic(
+        &state,
+        &app_handle,
+        crate::diagnostics::DiagLevel::Minimal,
+        "pairing",
+        Some(peer_addr.to_string()),
+        "Pairing started".to_string(),
+    );
+
     // T0 — opening SPAKE2 element from the initiator. No identity bytes.
     let spake_msg_i = match crate::transport::read_pairing_frame(&mut stream).await {
         Ok(PairingMessage::PairRequest { spake_msg }) => spake_msg,
         Ok(other) => {
-            log_pairing_failure(&state, peer_addr, &format!("expected PairRequest, got {:?}", other));
+            let d = format!("expected PairRequest, got {:?}", other);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
         Err(e) => {
-            log_pairing_failure(&state, peer_addr, &format!("read PairRequest failed: {}", e));
+            let d = format!("read PairRequest failed: {}", e);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
     };
@@ -519,13 +707,23 @@ pub(crate) async fn handle_pairing_connection(
     let (spake_state, spake_msg_r) = match start_spake2(&pin, &local_id, "initiator") {
         Ok(v) => v,
         Err(e) => {
-            log_pairing_failure(&state, peer_addr, &format!("SPAKE2 init error: {}", e));
+            let d = format!("SPAKE2 init error: {}", e);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
     };
     let resp = PairingMessage::PairResponse { spake_msg: spake_msg_r.clone() };
     if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &resp).await {
-        log_pairing_failure(&state, peer_addr, &format!("send PairResponse failed: {}", e));
+        let d = format!("send PairResponse failed: {}", e);
+        log_pairing_failure(&state, peer_addr, &d);
+        crate::diagnostics::push_diagnostic(
+            &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+            Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+        );
         return;
     }
 
@@ -538,19 +736,34 @@ pub(crate) async fn handle_pairing_connection(
             // is more about malformed inbound bytes. Treat as a generic
             // pairing failure (counter not bumped — only AEAD-tag failures
             // count toward lockout per §H1).
-            log_pairing_failure(&state, peer_addr, &format!("SPAKE2 finish failed: {}", e));
+            let d = format!("SPAKE2 finish failed: {}", e);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
     };
     if session_key.len() != 32 {
         log_pairing_failure(&state, peer_addr, "SPAKE2 produced wrong key length");
+        crate::diagnostics::push_diagnostic(
+            &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+            Some(peer_addr.to_string()),
+            "Pairing failed (responder): SPAKE2 produced wrong key length".to_string(),
+        );
         return;
     }
     let transcript = pairing_transcript(&spake_msg_i, &spake_msg_r);
     let (k_i2r, k_r2i) = match derive_pair_subkeys(&session_key, &transcript) {
         Ok(pair) => pair,
         Err(e) => {
-            log_pairing_failure(&state, peer_addr, &format!("HKDF derive failed: {}", e));
+            let d = format!("HKDF derive failed: {}", e);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
     };
@@ -572,11 +785,21 @@ pub(crate) async fn handle_pairing_connection(
             // `InitiatorId` at the T2 slot. Don't bump the AEAD counter, just
             // log + close. The pre-flight version check in start_pairing will
             // catch this for the initiator side; here we just hang up cleanly.
-            log_pairing_failure(&state, peer_addr, &format!("expected InitiatorKC, got {:?}", other));
+            let d = format!("expected InitiatorKC, got {:?}", other);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
         Err(e) => {
-            log_pairing_failure(&state, peer_addr, &format!("read InitiatorKC failed: {}", e));
+            let d = format!("read InitiatorKC failed: {}", e);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
     };
@@ -607,22 +830,26 @@ pub(crate) async fn handle_pairing_connection(
         Err(e) => {
             // The big one: wrong PIN or active MITM forging T2. Counter++.
             //
-            // When the user has explicitly enabled pairing_debug_logs (same
-            // flag that switches `Pairing failed from <addr>.` to a detailed
-            // form), also emit the byte-level form of the PIN this responder
-            // plugged into SPAKE2. Combined with the initiator-side trim
-            // boundary, this is what diagnoses an invisible-whitespace or
-            // encoding-divergence cause directly instead of by elimination.
-            // The PIN is short-lived shared-secret material and the user is
-            // debugging their own device, but we still gate on the flag so
-            // it never leaks into a default-config session.
-            if state.settings.lock().map(|s| s.pairing_debug_logs).unwrap_or(false) {
-                tracing::warn!(
+            // Capture the byte-level form of the PIN this responder plugged
+            // into SPAKE2 to the in-memory diagnostics channel at Debug level.
+            // Combined with the initiator-side trim boundary, this is what
+            // diagnoses an invisible-whitespace or encoding-divergence cause
+            // directly instead of by elimination. This material is PIN secret
+            // and so it goes ONLY to the never-persisted in-memory channel
+            // (never to the `tracing` file log), surfaced only when the user
+            // views the diagnostics panel at the Debug level.
+            crate::diagnostics::push_diagnostic(
+                &state,
+                &app_handle,
+                crate::diagnostics::DiagLevel::Debug,
+                "pairing",
+                Some(peer_addr.to_string()),
+                format!(
                     "Responder PIN at T2-AEAD-failure: len={} bytes={:02x?}",
                     pin.len(),
                     pin.as_bytes()
-                );
-            }
+                ),
+            );
             record_pairing_aead_failure(
                 &state,
                 &app_handle,
@@ -642,6 +869,11 @@ pub(crate) async fn handle_pairing_connection(
     // cluster; better to abort early.
     if state.cluster_id.lock().unwrap().is_empty() {
         log_pairing_failure(&state, peer_addr, "responder has no cluster_id");
+        crate::diagnostics::push_diagnostic(
+            &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+            Some(peer_addr.to_string()),
+            "Pairing failed (responder): responder has no cluster_id".to_string(),
+        );
         return;
     }
 
@@ -655,7 +887,12 @@ pub(crate) async fn handle_pairing_connection(
     let r_inner_bytes = match serde_json::to_vec(&r_inner) {
         Ok(b) => b,
         Err(e) => {
-            log_pairing_failure(&state, peer_addr, &format!("serialise ResponderId failed: {}", e));
+            let d = format!("serialise ResponderId failed: {}", e);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
     };
@@ -663,7 +900,12 @@ pub(crate) async fn handle_pairing_connection(
     let ciphertext_r = match pair_aead_encrypt(&k_r2i, &nonce_r, &r_inner_bytes) {
         Ok(ct) => ct,
         Err(e) => {
-            log_pairing_failure(&state, peer_addr, &format!("ResponderId AEAD encrypt failed: {}", e));
+            let d = format!("ResponderId AEAD encrypt failed: {}", e);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
     };
@@ -672,7 +914,12 @@ pub(crate) async fn handle_pairing_connection(
         ciphertext: ciphertext_r,
     };
     if let Err(e) = crate::transport::write_pairing_frame(&mut stream, &t3).await {
-        log_pairing_failure(&state, peer_addr, &format!("send ResponderId failed: {}", e));
+        let d = format!("send ResponderId failed: {}", e);
+        log_pairing_failure(&state, peer_addr, &d);
+        crate::diagnostics::push_diagnostic(
+            &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+            Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+        );
         return;
     }
 
@@ -680,11 +927,21 @@ pub(crate) async fn handle_pairing_connection(
     let (nonce_i_vec, ciphertext_i) = match crate::transport::read_pairing_frame(&mut stream).await {
         Ok(PairingMessage::InitiatorId { nonce, ciphertext }) => (nonce, ciphertext),
         Ok(other) => {
-            log_pairing_failure(&state, peer_addr, &format!("expected InitiatorId, got {:?}", other));
+            let d = format!("expected InitiatorId, got {:?}", other);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
         Err(e) => {
-            log_pairing_failure(&state, peer_addr, &format!("read InitiatorId failed: {}", e));
+            let d = format!("read InitiatorId failed: {}", e);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
     };
@@ -710,7 +967,12 @@ pub(crate) async fn handle_pairing_connection(
     let i_inner: crate::protocol::PairIdInner = match serde_json::from_slice(&i_inner_bytes) {
         Ok(v) => v,
         Err(e) => {
-            log_pairing_failure(&state, peer_addr, &format!("malformed InitiatorId inner: {}", e));
+            let d = format!("malformed InitiatorId inner: {}", e);
+            log_pairing_failure(&state, peer_addr, &d);
+            crate::diagnostics::push_diagnostic(
+                &state, &app_handle, crate::diagnostics::DiagLevel::Detailed, "pairing",
+                Some(peer_addr.to_string()), format!("Pairing failed (responder): {}", d),
+            );
             return;
         }
     };
@@ -774,6 +1036,15 @@ pub(crate) async fn handle_pairing_connection(
     // existing mTLS peers need the new fingerprint to accept its inbound
     // connections.
     crate::net_util::gossip_peer(&pinned, &state, &transport, Some(peer_addr));
+
+    crate::diagnostics::push_diagnostic(
+        &state,
+        &app_handle,
+        crate::diagnostics::DiagLevel::Minimal,
+        "pairing",
+        Some(peer_addr.to_string()),
+        "Pairing succeeded".to_string(),
+    );
 
     // T5 (wire 0.3.3) — drop the stream. The kernel closes the TCP
     // connection, which the initiator reads as the "responder is ready
