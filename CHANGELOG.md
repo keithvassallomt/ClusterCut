@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - A general settings save no longer overwrites `pairing_accept_enabled`; the header-bar pairing toggle is now the sole writer, so a stale Settings tab can't clobber it.
+- The cluster name is now shared across all devices instead of being per-device. Renaming on one device (or regenerating it) propagates to every peer, including peers that were offline at the time, so the name no longer silently diverges. Switching to an auto-generated name while in an active cluster now asks for confirmation first. Thanks to @mdunphy for the report.
 
 ## [0.3.4] — 2026-05-30
 
