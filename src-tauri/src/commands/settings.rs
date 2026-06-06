@@ -18,8 +18,13 @@ pub(crate) fn save_settings(
     // Capture the previous settings so we can detect toggle transitions.
     let prev = state.settings.lock().unwrap().clone();
 
-    // Preserve backend-only fields that the frontend doesn't manage.
+    // Preserve backend-only fields that the frontend doesn't manage. These are
+    // owned elsewhere (autostart plugin; the header-bar `set_pairing_accept`
+    // command) and are absent from the frontend `AppSettings` type, so a general
+    // settings save must never overwrite them — otherwise a stale SettingsView
+    // copy could clobber a value the header toggle just changed.
     settings.flatpak_autostart = prev.flatpak_autostart;
+    settings.pairing_accept_enabled = prev.pairing_accept_enabled;
     *state.settings.lock().unwrap() = settings.clone();
     tracing::info!(
         "Saving Settings: auto_send={}, auto_receive={}, configure_firewall={}, mdns_advertising={}",

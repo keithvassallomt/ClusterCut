@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Setting to disable configuring the Windows firewall at startup (default on, Windows only). Applies live when turned on; turning it off leaves any existing rule in place (#18).
+- Setting to disable mDNS advertising (default on). Discovery of other devices keeps working; toggling applies live (#18).
+- "Add Remote" with a single IP now connects directly when the peer is already paired, and only falls back to the PIN/pairing flow otherwise (#18).
+
+### Fixed
+- A general settings save no longer overwrites `pairing_accept_enabled`; the header-bar pairing toggle is now the sole writer, so a stale Settings tab can't clobber it.
+
 ## [0.3.4] — 2026-05-30
 
 ### Fixed
