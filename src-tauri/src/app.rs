@@ -1126,6 +1126,7 @@ pub(crate) fn run() {
             crate::commands::peers::get_peers,
 
             crate::commands::peers::add_manual_peer,
+            crate::commands::peers::add_remote_peer,
             crate::pairing::start_pairing,
             crate::commands::peers::delete_peer,
             crate::commands::peers::leave_network,

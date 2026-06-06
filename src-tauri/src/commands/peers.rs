@@ -72,6 +72,61 @@ pub(crate) fn get_local_ip() -> String {
         .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
+/// True if `ip` belongs to a peer we've already paired with — i.e. a trusted
+/// entry that carries a pinned cert fingerprint. Legacy trusted-but-
+/// unfingerprinted entries and untrusted manual placeholders return false, so
+/// "Add Remote" falls back to the pairing flow for them (issue #18).
+pub(crate) fn peer_already_paired(
+    peers: &std::collections::HashMap<String, Peer>,
+    ip: std::net::IpAddr,
+) -> bool {
+    peers
+        .values()
+        .any(|p| p.is_trusted && p.fingerprint.is_some() && p.ip == ip)
+}
+
+/// Outcome of an "Add Remote" attempt for a single IP. `Connected` means we
+/// recognised an already-paired peer at that address and (re)established the
+/// connection; `NeedsPairing` means the frontend should open the PIN modal.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AddRemoteOutcome {
+    Connected,
+    NeedsPairing,
+}
+
+/// Issue #18: "Add Remote" for a single IP. If we've already paired with the
+/// peer at this address, connect directly (no PIN). Otherwise tell the frontend
+/// to run the pairing flow. CIDR input still goes through `add_manual_peer`.
+#[tauri::command]
+pub(crate) async fn add_remote_peer(
+    ip: String,
+    state: State<'_, AppState>,
+    transport: State<'_, Transport>,
+    app_handle: tauri::AppHandle,
+) -> Result<AddRemoteOutcome, String> {
+    // Parse as IP or IP:PORT (default 4654), matching add_manual_peer's single-IP branch.
+    let (addr, port) = if let Ok(sock) = ip.parse::<std::net::SocketAddr>() {
+        (sock.ip(), sock.port())
+    } else if let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() {
+        (ip_addr, 4654)
+    } else {
+        return Err("Invalid Format. Use IP or IP:PORT.".to_string());
+    };
+
+    let already_paired = {
+        let peers = state.known_peers.lock().unwrap();
+        peer_already_paired(&peers, addr)
+    };
+
+    if already_paired {
+        net_util::probe_ip(addr, port, (*state).clone(), (*transport).clone(), app_handle).await;
+        Ok(AddRemoteOutcome::Connected)
+    } else {
+        Ok(AddRemoteOutcome::NeedsPairing)
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn add_manual_peer(
     ip: String, // Can be IP or CIDR
@@ -203,6 +258,67 @@ pub(crate) async fn delete_peer(
     let _ = app_handle.emit("peer-remove", &peer_id);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod add_remote_tests {
+    use super::peer_already_paired;
+    use crate::peer::Peer;
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+
+    fn peer(ip: &str, is_trusted: bool, fingerprint: Option<Vec<u8>>) -> Peer {
+        Peer {
+            id: format!("clustercut-{}", ip),
+            ip: ip.parse().unwrap(),
+            port: 4654,
+            hostname: "test".to_string(),
+            last_seen: 0,
+            is_trusted,
+            is_manual: false,
+            network_name: None,
+            signature: None,
+            fingerprint,
+            protocol_version: None,
+        }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn matches_trusted_fingerprinted_peer() {
+        let mut peers = HashMap::new();
+        let p = peer("10.8.0.5", true, Some(vec![1, 2, 3]));
+        peers.insert(p.id.clone(), p);
+        assert!(peer_already_paired(&peers, ip("10.8.0.5")));
+    }
+
+    #[test]
+    fn untrusted_peer_is_not_paired() {
+        let mut peers = HashMap::new();
+        let p = peer("10.8.0.5", false, Some(vec![1, 2, 3]));
+        peers.insert(p.id.clone(), p);
+        assert!(!peer_already_paired(&peers, ip("10.8.0.5")));
+    }
+
+    #[test]
+    fn trusted_without_fingerprint_is_not_paired() {
+        // Legacy pre-mTLS entry — must re-pair.
+        let mut peers = HashMap::new();
+        let p = peer("10.8.0.5", true, None);
+        peers.insert(p.id.clone(), p);
+        assert!(!peer_already_paired(&peers, ip("10.8.0.5")));
+    }
+
+    #[test]
+    fn unknown_ip_is_not_paired() {
+        let mut peers = HashMap::new();
+        let p = peer("10.8.0.5", true, Some(vec![1, 2, 3]));
+        peers.insert(p.id.clone(), p);
+        assert!(!peer_already_paired(&peers, ip("10.8.0.99")));
+    }
 }
 
 #[tauri::command]
