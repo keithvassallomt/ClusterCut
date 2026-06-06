@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A general settings save no longer overwrites `pairing_accept_enabled`; the header-bar pairing toggle is now the sole writer, so a stale Settings tab can't clobber it.
 - The cluster name is now shared across all devices instead of being per-device. Renaming on one device (or regenerating it) propagates to every peer, including peers that were offline at the time, so the name no longer silently diverges. Switching to an auto-generated name while in an active cluster now asks for confirmation first. Thanks to @mdunphy for the report.
 
+### Security
+- The device private key (`device_key.der`) and pairing PIN (`network_pin`) are now written with owner-only permissions (`0600`) on Linux and macOS, and existing files are re-hardened at startup. On Windows they rely on the default per-user `%APPDATA%` ACLs. Thanks to @mdunphy for the report.
+
 ## [0.3.4] — 2026-05-30
 
 ### Fixed
