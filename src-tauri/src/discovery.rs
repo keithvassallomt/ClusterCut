@@ -20,7 +20,11 @@ pub const SERVICE_TYPE: &str = "_clustercut._tcp.local.";
 /// - 0.3.3: explicit initiator key-confirmation packet (new T2
 ///   `InitiatorKC`) ahead of the responder's identity reveal, closing
 ///   the online brute-force budget-bypass. Wire-incompatible with 0.3.1.
-pub const CLUSTERCUT_PROTOCOL_VERSION: &str = "0.3.3";
+/// - 0.3.4: advertises support for the `ClusterName` register-sync message
+///   (shared cluster-name convergence). NOT a pairing break — the
+///   compatibility floor in `is_protocol_compatible` stays at 0.3.3; this
+///   version is only used to gate whether we send `ClusterName` to a peer.
+pub const CLUSTERCUT_PROTOCOL_VERSION: &str = "0.3.4";
 
 pub struct Discovery {
     daemon: ServiceDaemon,

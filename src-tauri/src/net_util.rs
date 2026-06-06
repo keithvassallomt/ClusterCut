@@ -37,6 +37,14 @@ pub(crate) fn is_protocol_compatible(version: Option<&str>) -> bool {
     parse_protocol_version(v).map_or(false, |parsed| parsed >= (0, 3, 3))
 }
 
+/// True if a peer advertising `version` understands `Message::ClusterName`
+/// (introduced in wire 0.3.4). Peers without a `proto` property, or older,
+/// are not sent the message and keep per-device-name behavior.
+pub(crate) fn supports_cluster_name(version: Option<&str>) -> bool {
+    let Some(v) = version else { return false };
+    parse_protocol_version(v).map_or(false, |parsed| parsed >= (0, 3, 4))
+}
+
 pub(crate) fn gossip_peer(
     new_peer: &Peer,
     state: &AppState,
@@ -65,6 +73,62 @@ pub(crate) fn gossip_peer(
                 tracing::error!("Failed to gossip peer to {}: {}", addr, e);
             }
         });
+    }
+}
+
+/// Send our current cluster-name register to a single peer address, if that
+/// peer's protocol supports it. Fire-and-forget.
+pub(crate) fn send_cluster_name_to(
+    addr: std::net::SocketAddr,
+    peer_protocol_version: Option<&str>,
+    name: String,
+    version: u64,
+    origin: String,
+    transport: &Transport,
+) {
+    if !supports_cluster_name(peer_protocol_version) {
+        return;
+    }
+    let msg = Message::ClusterName { name, version, origin };
+    let data = match serde_json::to_vec(&msg) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Failed to serialise ClusterName: {}", e);
+            return;
+        }
+    };
+    let transport_clone = transport.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = transport_clone.send_message(addr, &data).await {
+            tracing::debug!("Failed to send ClusterName to {}: {}", addr, e);
+        }
+    });
+}
+
+/// Broadcast our current cluster-name register to all known peers (optionally
+/// excluding one address, e.g. the peer we just received it from). Each send is
+/// gated on the peer's advertised protocol version.
+pub(crate) fn broadcast_cluster_name(
+    name: &str,
+    version: u64,
+    origin: &str,
+    state: &AppState,
+    transport: &Transport,
+    exclude_addr: Option<std::net::SocketAddr>,
+) {
+    for p in state.get_peers().values() {
+        let addr = std::net::SocketAddr::new(p.ip, p.port);
+        if Some(addr) == exclude_addr {
+            continue;
+        }
+        send_cluster_name_to(
+            addr,
+            p.protocol_version.as_deref(),
+            name.to_string(),
+            version,
+            origin.to_string(),
+            transport,
+        );
     }
 }
 
