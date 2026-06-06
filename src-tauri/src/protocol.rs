@@ -643,6 +643,8 @@ mod tests {
             cluster_id: "c".to_string(),
             known_peers: vec![],
             network_name: "n".to_string(),
+            network_name_version: 0,
+            network_name_origin: String::new(),
         };
         let wrapped = Message::ClusterInfo(info);
         let s = serde_json::to_string(&wrapped).unwrap();
