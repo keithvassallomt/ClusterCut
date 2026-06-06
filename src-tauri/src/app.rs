@@ -1157,6 +1157,8 @@ pub(crate) fn run() {
             crate::commands::identity::get_device_id,
             crate::commands::identity::get_hostname,
             crate::commands::settings::get_settings,
+            crate::commands::diagnostics::get_diagnostic_events,
+            crate::commands::diagnostics::clear_diagnostic_events,
             crate::commands::peers::get_known_peers,
             crate::commands::peers::expects_remote_manual_peers,
             crate::commands::system::log_frontend,
