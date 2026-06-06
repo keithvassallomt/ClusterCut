@@ -1,5 +1,6 @@
 mod app;
 mod clipboard;
+mod cluster_name;
 mod commands;
 mod compression;
 #[cfg(target_os = "linux")]
