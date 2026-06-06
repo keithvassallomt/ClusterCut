@@ -46,6 +46,64 @@ pub fn save_network_name(app: &AppHandle, name: &str) {
     let _ = fs::write(path, name);
 }
 
+/// Load the cluster-name version counter. Missing/invalid file → 0 (pre-issue
+/// default; an upgraded install starts unversioned and converges by origin).
+pub fn load_network_name_version(app: &AppHandle) -> u64 {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("network_name_version", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    if let Ok(s) = fs::read_to_string(&path) {
+        if let Ok(v) = s.trim().parse::<u64>() {
+            return v;
+        }
+    }
+    0
+}
+
+pub fn save_network_name_version(app: &AppHandle, version: u64) {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("network_name_version", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, version.to_string());
+}
+
+/// Load the device_id that set the current cluster name (tie-breaker). Missing
+/// file → empty string; callers seed it with the local device_id at startup so
+/// an unversioned install has a well-formed origin.
+pub fn load_network_name_origin(app: &AppHandle) -> String {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("network_name_origin", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+    if let Ok(s) = fs::read_to_string(&path) {
+        let trimmed = s.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    String::new()
+}
+
+pub fn save_network_name_origin(app: &AppHandle, origin: &str) {
+    let path_resolver = app.path();
+    let path = match path_resolver.resolve("network_name_origin", BaseDirectory::AppConfig) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, origin);
+}
+
 pub fn load_cluster_id(app: &AppHandle) -> Option<String> {
     let path_resolver = app.path();
     let path = match path_resolver.resolve("cluster_id", BaseDirectory::AppConfig) {
