@@ -602,6 +602,18 @@ pub(crate) fn run() {
                 let network_name = load_network_name(app_handle);
                 *state.network_name.lock().unwrap() = network_name.clone();
 
+                // 3b-ii. Load the cluster-name register version + origin
+                // (issue: cluster-name convergence). A pre-feature install has
+                // no version/origin files → version 0, origin seeded to our own
+                // device_id so the register is well-formed.
+                let nn_version = crate::storage::load_network_name_version(app_handle);
+                let mut nn_origin = crate::storage::load_network_name_origin(app_handle);
+                if nn_origin.is_empty() {
+                    nn_origin = device_id.clone();
+                }
+                *state.network_name_version.lock().unwrap() = nn_version;
+                *state.network_name_origin.lock().unwrap() = nn_origin;
+
                 // 3c. Load Network PIN
                 let network_pin = load_network_pin(app_handle);
                 *state.network_pin.lock().unwrap() = network_pin.clone();

@@ -50,6 +50,11 @@ pub struct AppState {
     pub last_clipboard_content: Arc<Mutex<String>>,
     // Human Readable Network Name
     pub network_name: Arc<Mutex<String>>,
+    // Cluster-name version counter (Lamport-style) and the device_id that set
+    // the current name (tie-breaker). Together with `network_name` these form
+    // the replicated cluster-name register. See cluster_name.rs.
+    pub network_name_version: Arc<Mutex<u64>>,
+    pub network_name_origin: Arc<Mutex<String>>,
     // Network PIN (6-char alphanumeric, for auto-joining)
     // Network PIN (6-char alphanumeric, for auto-joining)
     pub network_pin: Arc<Mutex<String>>,
@@ -152,6 +157,8 @@ impl AppState {
             discovery: Arc::new(Mutex::new(None)),
             last_clipboard_content: Arc::new(Mutex::new(String::new())),
             network_name: Arc::new(Mutex::new(String::new())),
+            network_name_version: Arc::new(Mutex::new(0)),
+            network_name_origin: Arc::new(Mutex::new(String::new())),
             network_pin: Arc::new(Mutex::new(String::new())),
             settings: Arc::new(Mutex::new(AppSettings::default())),
             pending_removals: Arc::new(Mutex::new(HashMap::new())),
