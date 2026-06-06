@@ -355,6 +355,17 @@ pub fn save_device_id(app: &AppHandle, id: &str) {
     let _ = fs::write(path, id);
 }
 
+/// Generate a fresh 6-character lowercase-alphanumeric pairing PIN. No disk I/O.
+fn generate_pin() -> String {
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    (0..6)
+        .map(|_| {
+            let idx = rand::thread_rng().gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
+}
+
 pub fn load_network_pin(app: &AppHandle) -> String {
     let path_resolver = app.path();
     let path = match path_resolver.resolve("network_pin", BaseDirectory::AppConfig) {
@@ -379,15 +390,8 @@ pub fn load_network_pin(app: &AppHandle) -> String {
         }
     }
 
-    // Generate new PIN
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let pin: String = (0..6)
-        .map(|_| {
-            let idx = rand::thread_rng().gen_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect();
-
+    // Generate a new PIN and persist it (provisioned-mode path / lazy default).
+    let pin = generate_pin();
     tracing::info!("Generated New Network PIN: {}", pin);
     save_network_pin(app, &pin);
     pin
@@ -414,6 +418,34 @@ pub fn save_network_pin(app: &AppHandle, pin: &str) {
         set_owner_only(&path);
     }
 }
+/// Whether this device's pairing PIN should be persisted to disk. Only
+/// provisioned mode keeps a stable, user-set PIN across restarts; auto mode is
+/// ephemeral (issue 4).
+pub(crate) fn pin_should_persist(mode: &str) -> bool {
+    mode == "provisioned"
+}
+
+/// Establish this device's pairing PIN for the given cluster mode.
+///
+/// Provisioned mode persists the PIN (a user-set, memorable value must survive
+/// restarts), so it reads (and lazily generates + saves) from disk. Auto mode
+/// keeps the PIN ephemeral: any on-disk `network_pin` file is deleted and a
+/// fresh PIN is generated in memory, never written to disk. The PIN is only
+/// needed live during interactive pairing, so a per-launch value is sufficient
+/// and avoids storing the secret. See issue 4.
+pub fn establish_network_pin(app: &AppHandle, mode: &str) -> String {
+    if pin_should_persist(mode) {
+        return load_network_pin(app);
+    }
+    // Auto mode: delete any stored PIN, go ephemeral.
+    if let Ok(path) = app.path().resolve("network_pin", BaseDirectory::AppConfig) {
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+    }
+    generate_pin()
+}
+
 // Helper to reset network state (Self-Destruct/Kick)
 pub fn reset_network_state(app: &AppHandle) {
     let path_resolver = app.path();
@@ -650,5 +682,28 @@ mod settings_tests {
         let s = AppSettings::default();
         assert!(s.configure_firewall);
         assert!(s.mdns_advertising);
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::{generate_pin, pin_should_persist};
+
+    #[test]
+    fn generate_pin_is_six_lowercase_alnum() {
+        let pin = generate_pin();
+        assert_eq!(pin.len(), 6, "pin was {:?}", pin);
+        assert!(
+            pin.chars().all(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "unexpected chars in {:?}",
+            pin
+        );
+    }
+
+    #[test]
+    fn only_provisioned_persists() {
+        assert!(pin_should_persist("provisioned"));
+        assert!(!pin_should_persist("auto"));
+        assert!(!pin_should_persist("something-else"));
     }
 }
