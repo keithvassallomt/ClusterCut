@@ -123,9 +123,10 @@ This mirrors the existing `default_pairing_accept_enabled` pattern in
 - Add `configure_firewall` and `mdns_advertising` to the frontend
   `AppSettings` type (`src/types.ts`).
 - Add two toggles to the Settings view, defaulting on. The firewall
-  toggle is most relevant on Windows; it may be shown only on Windows or
-  shown everywhere as a no-op elsewhere (implementation detail — prefer
-  Windows-only display to avoid confusing Linux users).
+  toggle is **Windows-only** — it is hidden on macOS and Linux, where
+  `configure_windows_firewall()` does not exist (`#[cfg(target_os =
+  "windows")]`) and there is nothing for it to control. The mDNS
+  advertising toggle is shown on all platforms.
 - `save_settings` already preserves backend-only fields
   (`flatpak_autostart`); the two new fields are frontend-managed and flow
   through normally.
