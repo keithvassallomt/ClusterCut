@@ -989,6 +989,8 @@ pub(crate) fn run() {
             let transport_inside = transport.clone();
             let file_state = listener_state.clone();
             let file_handle = listener_handle.clone();
+            let conn_state = listener_state.clone();
+            let conn_app = listener_handle.clone();
 
             transport.start_listening(
                 move |data, addr| {
@@ -1013,6 +1015,18 @@ pub(crate) fn run() {
                     tauri::async_runtime::spawn(async move {
                          crate::handlers::handle_incoming_file_stream(recv, addr, state, handle).await;
                     });
+                },
+                move |kind: &str, addr: std::net::SocketAddr, detail: Option<String>| {
+                    let (level, msg) = match kind {
+                        "connect" => (crate::diagnostics::DiagLevel::Minimal, "mTLS connection established".to_string()),
+                        "drop" => (crate::diagnostics::DiagLevel::Minimal, "mTLS connection dropped".to_string()),
+                        "handshake_failed" => (
+                            crate::diagnostics::DiagLevel::Detailed,
+                            format!("mTLS handshake failed: {}", detail.unwrap_or_default()),
+                        ),
+                        _ => (crate::diagnostics::DiagLevel::Detailed, kind.to_string()),
+                    };
+                    crate::diagnostics::push_diagnostic(&conn_state, &conn_app, level, "mtls", Some(addr.to_string()), msg);
                 }
             );
             // Start Clipboard Monitor

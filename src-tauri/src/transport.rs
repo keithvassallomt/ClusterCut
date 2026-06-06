@@ -203,10 +203,11 @@ impl Transport {
         Ok((connection, send))
     }
 
-    pub fn start_listening<F, G>(&self, on_receive_message: F, on_receive_file: G)
+    pub fn start_listening<F, G, H>(&self, on_receive_message: F, on_receive_file: G, on_conn_event: H)
     where
         F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static + Clone,
         G: Fn(quinn::RecvStream, SocketAddr) + Send + Sync + 'static + Clone,
+        H: Fn(&str, SocketAddr, Option<String>) + Send + Sync + 'static + Clone,
     {
         let endpoint = self.endpoint.clone();
         tauri::async_runtime::spawn(async move {
@@ -221,6 +222,7 @@ impl Transport {
                 match connection {
                     Ok(conn) => {
                         let remote_addr = conn.remote_address();
+                        on_conn_event("connect", remote_addr, None);
                         // tracing::info!("Transport established connection with {}", remote_addr);
 
                         // Check Protocol (ALPN)
@@ -266,6 +268,7 @@ impl Transport {
                         } else {
                             // Standard Message Handler (clustercut-transport)
                             let on_receive_message = on_receive_message.clone();
+                            let on_conn_event = on_conn_event.clone();
                             tauri::async_runtime::spawn(async move {
                                 // tracing::debug!("Handling MESSAGE connection from {}", remote_addr);
                                 loop {
@@ -303,6 +306,7 @@ impl Transport {
                                         Err(_e) => {
                                             // connection closed is normal
                                             // tracing::debug!("Message connection closed/error from {}: {}", remote_addr, e);
+                                            on_conn_event("drop", remote_addr, None);
                                             break;
                                         }
                                     }
@@ -310,11 +314,14 @@ impl Transport {
                             });
                         }
                     }
-                    Err(e) => tracing::error!(
-                        "Connection handshake failed from {}: {}",
-                        remote_for_log,
-                        e
-                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            "Connection handshake failed from {}: {}",
+                            remote_for_log,
+                            e
+                        );
+                        on_conn_event("handshake_failed", remote_for_log, Some(e.to_string()));
+                    }
                 }
             }
         });
