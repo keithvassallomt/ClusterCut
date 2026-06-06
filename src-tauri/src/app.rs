@@ -540,6 +540,9 @@ pub(crate) fn run() {
                 // 1. Load (or generate) cluster_id, and wipe the legacy
                 //    cluster_key.bin secret if it's still on disk from v0.2.
                 wipe_legacy_cluster_key(app_handle);
+                // Re-apply owner-only perms to secret files for installs created
+                // before this hardening (issue: secret file perms).
+                crate::storage::harden_secret_files(app_handle);
                 let mut cid_lock = state.cluster_id.lock().unwrap();
                 if let Some(id) = load_cluster_id(app_handle) {
                     *cid_lock = id;

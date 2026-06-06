@@ -304,7 +304,24 @@ pub fn save_device_cert(app: &AppHandle, cert_der: &[u8], key_der: &[u8]) {
         tracing::error!("Failed to write device key: {}", e);
         return;
     }
+    // The private key must not be world-readable (issue: secret file perms).
+    set_owner_only(&key_path);
     tracing::debug!("Saved device cert to disk.");
+}
+
+/// Re-apply owner-only permissions to the on-disk secret files if they exist.
+/// Run once at startup so installs created before this hardening landed get
+/// fixed — `device_key.der` in particular is written only at first launch and
+/// never rewritten, so the write-path hardening alone would never reach it.
+pub fn harden_secret_files(app: &AppHandle) {
+    let path_resolver = app.path();
+    for name in ["device_key.der", "network_pin"] {
+        if let Ok(path) = path_resolver.resolve(name, BaseDirectory::AppConfig) {
+            if path.exists() {
+                set_owner_only(&path);
+            }
+        }
+    }
 }
 
 pub fn load_device_id(app: &AppHandle) -> String {
@@ -392,7 +409,10 @@ pub fn save_network_pin(app: &AppHandle, pin: &str) {
     // Mirror the trim done on load_network_pin — keeps the on-disk file
     // canonical (no trailing whitespace from a pasted Settings input) so
     // even a build without the load-side trim would behave correctly.
-    let _ = fs::write(path, pin.trim());
+    if fs::write(&path, pin.trim()).is_ok() {
+        // The pairing PIN must not be world-readable (issue: secret file perms).
+        set_owner_only(&path);
+    }
 }
 // Helper to reset network state (Self-Destruct/Kick)
 pub fn reset_network_state(app: &AppHandle) {
