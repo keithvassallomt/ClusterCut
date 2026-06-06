@@ -359,8 +359,8 @@ pub(crate) async fn start_pairing(
         cluster_id,
         known_peers,
         network_name,
-        network_name_version: _nn_version,
-        network_name_origin: _nn_origin,
+        network_name_version,
+        network_name_origin,
     } = cluster_info;
     tracing::info!("Joined Network: {} (cluster {})", network_name, cluster_id);
     {
@@ -371,6 +371,21 @@ pub(crate) async fn start_pairing(
         let mut nn = state.network_name.lock().unwrap();
         *nn = network_name.clone();
         crate::storage::save_network_name(&app_handle, &network_name);
+        drop(nn);
+
+        // Adopt the responder's cluster-name register version + origin so the
+        // joiner participates in convergence from the start. If the responder
+        // sent an empty origin (pre-0.3.4 responder), fall back to its
+        // device_id so the register stays well-formed.
+        let adopted_origin = if network_name_origin.is_empty() {
+            responder_device_id.clone()
+        } else {
+            network_name_origin.clone()
+        };
+        *state.network_name_version.lock().unwrap() = network_name_version;
+        *state.network_name_origin.lock().unwrap() = adopted_origin.clone();
+        crate::storage::save_network_name_version(&app_handle, network_name_version);
+        crate::storage::save_network_name_origin(&app_handle, &adopted_origin);
     }
 
     let local_quic_port = transport.local_addr().map(|a| a.port()).unwrap_or(0);
