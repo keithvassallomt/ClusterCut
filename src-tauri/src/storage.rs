@@ -3,7 +3,26 @@ use names::Generator;
 use rand::Rng;
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use tauri::{path::BaseDirectory, AppHandle, Manager};
+
+/// Restrict a file to owner-only access. On Unix sets mode 0600. On Windows
+/// this is intentionally a no-op: `%APPDATA%\<app>` is already ACL-restricted to
+/// the user, SYSTEM, and Administrators by default, so other standard users
+/// cannot read it. Best-effort — logs on failure, never panics.
+fn set_owner_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            tracing::warn!("Failed to set 0600 on {}: {}", path.display(), e);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path; // Windows: AppData is already per-user ACL-protected.
+    }
+}
 
 pub fn load_network_name(app: &AppHandle) -> String {
     let path_resolver = app.path();
@@ -545,6 +564,28 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) {
 
     if let Ok(json) = serde_json::to_string_pretty(settings) {
         let _ = fs::write(path, json);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod perms_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn set_owner_only_sets_0600() {
+        // Create a world-readable temp file, then harden it.
+        let path = std::env::temp_dir().join(format!(
+            "clustercut_perms_test_{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::set_owner_only(&path);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode & 0o777, 0o600, "expected 0600, got {:o}", mode & 0o777);
     }
 }
 
