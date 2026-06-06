@@ -100,6 +100,18 @@ impl Discovery {
         Ok(())
     }
 
+    /// Stop advertising this device without tearing down the daemon or any
+    /// active browse. Used to apply the mDNS-advertising toggle live. Safe to
+    /// call when nothing is registered.
+    pub fn unregister(&mut self) {
+        if let Some(fullname) = self.registered_service.take() {
+            tracing::info!("Unregistering service (advertising disabled): {}", fullname);
+            if let Err(e) = self.daemon.unregister(&fullname) {
+                tracing::error!("Failed to unregister service: {}", e);
+            }
+        }
+    }
+
     pub fn browse(&self) -> Result<mdns_sd::Receiver<ServiceEvent>, Box<dyn Error>> {
         let receiver = self.daemon.browse(SERVICE_TYPE)?;
         Ok(receiver)
