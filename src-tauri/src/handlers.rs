@@ -505,7 +505,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                             if let Some(files) = &payload.files {
                                 if !files.is_empty() {
                                     tracing::info!("Received File Metadata from {}: {} files", sender, files.len());
-                                    let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                    crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-change", &payload_obj);
 
                                     // Auto-Download Logic
                                     let (auto_recv, enable_ft, size_limit, notify_large) = {
@@ -610,7 +610,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                             let mut pending = listener_state.pending_clipboard.lock().unwrap();
                                             *pending = Some(payload_obj.clone());
                                         }
-                                        let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-pending", &payload_obj);
 
                                         // Notification is the primary cue that an
                                         // accept is waiting — gate on
@@ -642,7 +642,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                             let mut pending = listener_state.pending_clipboard.lock().unwrap();
                                             *pending = Some(payload_obj.clone());
                                         }
-                                        let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-pending", &payload_obj);
 
                                         let notify_large = listener_state.settings.lock().unwrap().notify_large_files;
                                         if notify_large {
@@ -673,7 +673,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                             *slot = Some(id.clone());
                                         }
 
-                                        let _ = listener_handle.emit("clipboard-blob-fetching", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-blob-fetching", &payload_obj);
 
                                         let notifications = listener_state.settings.lock().unwrap().notifications.clone();
                                         if notifications.data_received {
@@ -720,14 +720,14 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                     let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
                                     if auto_receiver {
                                         crate::clipboard::set_clipboard_image(&listener_handle, blob);
-                                        let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-change", &payload_obj);
                                     } else {
                                         tracing::info!("[Clipboard] Auto-receive OFF. Storing pending blob from {}", sender);
                                         {
                                             let mut pending = listener_state.pending_clipboard.lock().unwrap();
                                             *pending = Some(payload_obj.clone());
                                         }
-                                        let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-pending", &payload_obj);
                                     }
 
                                     let notifications = listener_state.settings.lock().unwrap().notifications.clone();
@@ -807,10 +807,10 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                             *stash = Some(payload_obj.clone());
                                         }
                                         crate::clipboard::set_clipboard(&listener_handle, text.clone());
-                                        let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-change", &payload_obj);
                                     } else {
                                         crate::clipboard::set_clipboard_rich(&listener_handle, text.clone(), formats);
-                                        let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-change", &payload_obj);
                                     }
                                 } else {
                                     tracing::info!("[Clipboard] Auto-receive OFF. Storing pending rich clipboard from {}", sender);
@@ -818,7 +818,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                         let mut pending = listener_state.pending_clipboard.lock().unwrap();
                                         *pending = Some(payload_obj.clone());
                                     }
-                                    let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                    crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-pending", &payload_obj);
                                 }
 
                                 if needs_promotion_dance {
@@ -871,7 +871,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                 let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
                                 if auto_receiver {
                                     crate::clipboard::set_clipboard(&listener_handle, text.clone());
-                                    let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                    crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-change", &payload_obj);
                                 } else {
                                     // Manual Mode
                                     tracing::info!("[Clipboard] Auto-receive OFF. Storing pending clipboard from {}", sender);
@@ -879,7 +879,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                         let mut pending = listener_state.pending_clipboard.lock().unwrap();
                                         *pending = Some(payload_obj.clone());
                                     }
-                                    let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                    crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-pending", &payload_obj);
                                 }
 
                                 let notifications = listener_state.settings.lock().unwrap().notifications.clone();

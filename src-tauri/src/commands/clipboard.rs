@@ -36,7 +36,7 @@ pub(crate) async fn send_clipboard(
     };
 
     // Emit local event so history updates
-    let _ = app_handle.emit("clipboard-change", &payload_obj);
+    crate::clipboard::common::record_and_emit(&app_handle, &state, "clipboard-change", &payload_obj);
 
     // Send (mTLS provides confidentiality + sender auth; no app-layer
     // encryption needed since v0.3 dropped cluster_key).
@@ -181,7 +181,7 @@ pub(crate) async fn confirm_pending_clipboard(
         }
 
         // Emit change event so history updates
-        let _ = app_handle.emit("clipboard-change", &payload);
+        crate::clipboard::common::record_and_emit(&app_handle, &state, "clipboard-change", &payload);
 
         Ok(())
     } else {
@@ -234,7 +234,7 @@ pub(crate) async fn promote_pending_rich(
     );
 
     crate::clipboard::set_clipboard_rich(&app_handle, payload.text.clone(), formats);
-    let _ = app_handle.emit("clipboard-change", &payload);
+    crate::clipboard::common::record_and_emit(&app_handle, &state, "clipboard-change", &payload);
     Ok(())
 }
 
