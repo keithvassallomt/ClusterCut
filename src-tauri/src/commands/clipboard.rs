@@ -96,6 +96,76 @@ pub(crate) async fn set_local_clipboard_files(app: tauri::AppHandle, paths: Vec<
     Ok(())
 }
 
+/// Re-copy a History item's retained content to the local OS clipboard,
+/// keyed by id. No cluster broadcast.
+#[tauri::command]
+pub(crate) async fn recall_copy_history_item(
+    id: String,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    use crate::clipboard::history_store::RecalledContent;
+    let recalled = {
+        let store = state.history_store.lock().unwrap();
+        let entry = store
+            .get(&id)
+            .ok_or_else(|| "Content no longer available".to_string())?;
+        entry.content.recall()?
+    };
+    match recalled {
+        RecalledContent::Text(t) => crate::clipboard::set_clipboard(&app_handle, t),
+        RecalledContent::Rich { text, formats } => {
+            crate::clipboard::set_clipboard_rich(&app_handle, text, formats)
+        }
+        RecalledContent::Image {
+            mime,
+            bytes,
+            width,
+            height,
+        } => {
+            let blob = crate::protocol::ClipboardBlob::from_bytes(mime, &bytes, width, height);
+            crate::clipboard::set_clipboard_image(&app_handle, blob);
+        }
+    }
+    Ok(())
+}
+
+/// Re-broadcast a History item's retained content to the cluster, keyed by id.
+/// Reconstructs the original clipboard content and runs it through the normal
+/// broadcast path, so large items re-descriptor correctly.
+#[tauri::command]
+pub(crate) async fn recall_send_history_item(
+    id: String,
+    state: State<'_, AppState>,
+    transport: State<'_, Transport>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    use crate::clipboard::common::ClipboardContent;
+    use crate::clipboard::history_store::RecalledContent;
+    let recalled = {
+        let store = state.history_store.lock().unwrap();
+        let entry = store
+            .get(&id)
+            .ok_or_else(|| "Content no longer available".to_string())?;
+        entry.content.recall()?
+    };
+    let content = match recalled {
+        RecalledContent::Text(t) => ClipboardContent::Text(t),
+        RecalledContent::Rich { text, formats } => ClipboardContent::Rich { text, formats },
+        RecalledContent::Image {
+            mime,
+            bytes,
+            width,
+            height,
+        } => {
+            let blob = crate::protocol::ClipboardBlob::from_bytes(mime, &bytes, width, height);
+            ClipboardContent::Image(blob)
+        }
+    };
+    crate::clipboard::common::process_clipboard_change(content, &app_handle, &state, &transport);
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) async fn delete_history_item(
     app_handle: tauri::AppHandle,
@@ -106,6 +176,17 @@ pub(crate) async fn delete_history_item(
     // 1. Emit Local Event (to update UI immediately)
     tracing::info!("Deleting history item locally: {}", id);
     let _ = app_handle.emit("history-delete", &id);
+
+    // Drop retained content + its disk file. Take the evicted entry out of the
+    // history_store lock scope first, so we never hold history_store while
+    // acquiring local_clipboard_blobs.
+    let evicted = state.history_store.lock().unwrap().remove(&id);
+    if let Some(evicted) = evicted {
+        if let Some(path) = evicted.disk_path {
+            let _ = std::fs::remove_file(&path);
+        }
+        state.local_clipboard_blobs.lock().unwrap().remove(&id);
+    }
 
     // 2. Broadcast to Peers
     let msg = Message::HistoryDelete(id);

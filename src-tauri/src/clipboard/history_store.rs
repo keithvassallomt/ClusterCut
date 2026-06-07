@@ -182,6 +182,70 @@ impl HistoryStore {
     }
 }
 
+/// What to do with a retrieved entry: the concrete text or image bytes.
+/// `recall_*` commands turn this into clipboard writes / broadcasts.
+#[derive(Debug, Clone)]
+pub enum RecalledContent {
+    Text(String),
+    Rich {
+        text: String,
+        formats: Vec<ClipboardFormat>,
+    },
+    Image {
+        mime: String,
+        bytes: Vec<u8>,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
+}
+
+impl StoredContent {
+    /// Materialize the content for re-call. Disk entries are read from their
+    /// staged file (text decoded as UTF-8, images kept as raw bytes).
+    pub fn recall(&self) -> Result<RecalledContent, String> {
+        match self {
+            StoredContent::Text(s) => Ok(RecalledContent::Text(s.clone())),
+            StoredContent::Rich { text, formats } => Ok(RecalledContent::Rich {
+                text: text.clone(),
+                formats: formats.clone(),
+            }),
+            StoredContent::Image {
+                mime,
+                bytes,
+                width,
+                height,
+            } => Ok(RecalledContent::Image {
+                mime: mime.clone(),
+                bytes: bytes.clone(),
+                width: *width,
+                height: *height,
+            }),
+            StoredContent::Disk {
+                mime,
+                path,
+                width,
+                height,
+                ..
+            } => {
+                let bytes = std::fs::read(path)
+                    .map_err(|e| format!("read staged content {:?}: {}", path, e))?;
+                if mime.starts_with("text/") {
+                    let text = String::from_utf8(bytes)
+                        .map_err(|e| format!("staged text not UTF-8: {}", e))?;
+                    Ok(RecalledContent::Text(text))
+                } else {
+                    Ok(RecalledContent::Image {
+                        mime: mime.clone(),
+                        bytes,
+                        width: *width,
+                        height: *height,
+                    })
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +319,33 @@ mod tests {
         );
         let e = s.remove("d").unwrap();
         assert_eq!(e.disk_path, Some(PathBuf::from("/tmp/d.png")));
+    }
+
+    #[test]
+    fn recall_text_roundtrips() {
+        let c = StoredContent::Text("hello world".into());
+        match c.recall().unwrap() {
+            RecalledContent::Text(t) => assert_eq!(t, "hello world"),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn recall_disk_text_reads_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("cc_recall_test_{}.txt", std::process::id()));
+        std::fs::write(&path, b"disk text").unwrap();
+        let c = StoredContent::Disk {
+            mime: "text/plain".into(),
+            path: path.clone(),
+            width: None,
+            height: None,
+            size: 9,
+        };
+        match c.recall().unwrap() {
+            RecalledContent::Text(t) => assert_eq!(t, "disk text"),
+            _ => panic!("expected text"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

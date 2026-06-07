@@ -1168,6 +1168,8 @@ pub(crate) fn run() {
             crate::commands::identity::get_network_name,
             crate::commands::clipboard::request_file,
             crate::commands::clipboard::delete_history_item,
+            crate::commands::clipboard::recall_copy_history_item,
+            crate::commands::clipboard::recall_send_history_item,
             crate::commands::system::check_gnome_extension_status,
             crate::commands::identity::get_network_pin,
             crate::commands::identity::get_device_id,
