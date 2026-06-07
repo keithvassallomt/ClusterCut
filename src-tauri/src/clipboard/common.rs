@@ -644,33 +644,89 @@ pub fn process_clipboard_change(
                 return;
             }
 
-            {
-                let mut last_global = state.last_clipboard_content.lock().unwrap();
-                if *last_global != text {
-                    *last_global = text.clone();
-                }
-            }
-
             let hostname = crate::get_hostname_internal();
             let msg_id = uuid::Uuid::new_v4().to_string();
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-
             let local_id = state.local_device_id.lock().unwrap().clone();
-            let payload_obj = ClipboardPayload {
-                id: msg_id,
-                text,
-                files: None,
-                blob: None,
-                formats: None,
-                timestamp: ts,
-                sender: hostname,
-                sender_id: local_id,
-            };
 
-            broadcast_clipboard(app_handle, state, transport, payload_obj);
+            match text_wire_decision(text.len()) {
+                TextWireDecision::Inline => {
+                    {
+                        let mut last_global = state.last_clipboard_content.lock().unwrap();
+                        if *last_global != text {
+                            *last_global = text.clone();
+                        }
+                    }
+                    let payload_obj = ClipboardPayload {
+                        id: msg_id,
+                        text,
+                        files: None,
+                        blob: None,
+                        formats: None,
+                        timestamp: ts,
+                        sender: hostname,
+                        sender_id: local_id,
+                    };
+                    broadcast_clipboard(app_handle, state, transport, payload_obj);
+                }
+                TextWireDecision::Descriptor => {
+                    let len = text.len() as u64;
+                    match stage_clipboard_blob_temp_file(
+                        app_handle, state, &msg_id, "text/plain", None, None, text.as_bytes(),
+                    ) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "[ClipboardText] Large text ({} bytes) — broadcasting descriptor (id={})",
+                                len, msg_id
+                            );
+                            {
+                                let mut last_global = state.last_clipboard_content.lock().unwrap();
+                                if *last_global != text {
+                                    *last_global = text.clone();
+                                }
+                            }
+                            let payload_obj = ClipboardPayload {
+                                id: msg_id.clone(),
+                                text: String::new(),
+                                files: None,
+                                blob: Some(ClipboardBlob::descriptor(
+                                    "text/plain",
+                                    msg_id,
+                                    len,
+                                    None,
+                                    None,
+                                )),
+                                formats: None,
+                                timestamp: ts,
+                                sender: hostname,
+                                sender_id: local_id,
+                            };
+                            broadcast_clipboard(app_handle, state, transport, payload_obj);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to stage large clipboard text for descriptor path: {}", e);
+                        }
+                    }
+                }
+                TextWireDecision::TooLarge => {
+                    tracing::warn!(
+                        "Clipboard text is {} bytes (> {} cap); not sharing.",
+                        text.len(), MAX_CLIPBOARD_TEXT_BYTES
+                    );
+                    crate::send_notification(
+                        app_handle,
+                        "Clipboard too large to share",
+                        "The copied text is over 100 MB and was not sent to your cluster.",
+                        false,
+                        Some(4),
+                        "history",
+                        crate::NotificationPayload::None,
+                    );
+                }
+            }
         }
         ClipboardContent::Files(raw_paths) => {
             tracing::debug!(
