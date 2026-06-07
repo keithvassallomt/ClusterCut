@@ -32,6 +32,8 @@ pub struct BlobPreview {
 pub struct FormatPreview {
     pub mime_type: String,
     pub binary: bool,
+    /// Wire-encoded byte length (base64 for binary formats), matching
+    /// `ClipboardFormat.data.len()` accounting — not the raw decoded size.
     pub size: u64,
 }
 
@@ -58,6 +60,10 @@ pub fn text_preview_str(s: &str) -> String {
         return s.to_string();
     }
     let mut end = TEXT_PREVIEW_BYTES;
+    // Walk back to the nearest char boundary. `end` reaching 0 (empty result)
+    // is only possible for a degenerate string with no char boundary within the
+    // first TEXT_PREVIEW_BYTES bytes — impossible for valid UTF-8 — and is
+    // handled gracefully here rather than panicking.
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
@@ -110,9 +116,11 @@ pub fn preview_parts(
             ..
         } => {
             if mime.starts_with("text/") {
-                // Large text: the caller fills text_preview from the staged
-                // file prefix (no text bytes available here). text_len is the
-                // true size.
+                // Large text: text_preview is returned as None here because no
+                // text bytes are available in this match. CALLER PRECONDITION:
+                // for a Disk text entry the caller MUST fill text_preview from
+                // the staged-file prefix before emitting. text_len is the true
+                // byte size.
                 (None, *size, None)
             } else {
                 (
@@ -214,5 +222,23 @@ mod tests {
     #[test]
     fn thumbnail_of_garbage_is_none() {
         assert!(make_thumbnail(b"not an image").is_none());
+    }
+
+    #[test]
+    fn thumbnail_caps_dimensions() {
+        use image::{ImageBuffer, Rgba};
+        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(512, 384, Rgba([10, 20, 30, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let b64 = make_thumbnail(png.get_ref()).expect("thumbnail");
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert!(decoded.width() <= 256 && decoded.height() <= 256);
     }
 }
