@@ -1059,7 +1059,7 @@ fn disk_text_prefix(path: &std::path::Path) -> Option<String> {
 /// Apply the side effects of an eviction: delete the disk file (unless an
 /// in-flight fetch still needs it), drop the local_clipboard_blobs entry, and
 /// tell the UI the item's backing is gone.
-fn handle_evictions(app: &AppHandle, state: &AppState, evicted: Vec<Evicted>) {
+pub(crate) fn handle_evictions(app: &AppHandle, state: &AppState, evicted: Vec<Evicted>) {
     for e in evicted {
         {
             let mut map = state.local_clipboard_blobs.lock().unwrap();
