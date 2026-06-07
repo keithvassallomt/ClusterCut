@@ -1,57 +1,21 @@
 import type { ClipboardBlobPreview, ClipboardFormatPreview } from "../types";
 
-// Descriptor-vs-inline is a PROTOCOL decision owned by the backend: it sets
-// `fetch_id` exactly when the bytes ride the file-transfer ALPN instead of
-// inline (Rust `ClipboardBlob::is_descriptor()` == `fetch_id.is_some()`). The
-// UI doesn't decide this — it only reads the backend's signal. Naming the check
-// here keeps that rule in one place on the TS side rather than inlining the raw
-// `fetch_id` test at every use.
-function isDescriptorBlob(payloadBlob: any): boolean {
-  return typeof payloadBlob.fetch_id === "string" && payloadBlob.fetch_id.length > 0;
-}
-
-// The backend ships ClipboardBlob.data as a base64 string (chosen over the
-// default Vec<u8>→JSON-int-array encoding to keep wire size manageable —
-// see protocol.rs). Decode once at receive time and stash an object URL so
-// the thumbnail can render straight from memory. Caller is responsible for
-// revoking the URL when the item is dropped.
-export function blobFromPayload(payloadBlob: any): ClipboardBlobPreview | undefined {
-  if (!payloadBlob) return undefined;
-
-  // §3.3 descriptor — bytes ride the file-transfer ALPN, not inline. Surface
-  // a preview without thumbnail so the pending UI / history list can render
-  // "Large image (X.Y MB) — accept to receive". User accept triggers the fetch
-  // through `confirm_pending_clipboard`, which the backend routes to a
-  // `Message::FileRequest`.
-  if (isDescriptorBlob(payloadBlob)) {
-    return {
-      mime_type: payloadBlob.mime_type || "image/png",
-      width: typeof payloadBlob.width === "number" ? payloadBlob.width : undefined,
-      height: typeof payloadBlob.height === "number" ? payloadBlob.height : undefined,
-      size: typeof payloadBlob.total_size === "number" ? payloadBlob.total_size : 0,
-      descriptor: true,
-    };
-  }
-
-  if (typeof payloadBlob.data !== "string" || payloadBlob.data.length === 0) {
-    return undefined;
-  }
-  let bytes: Uint8Array;
-  try {
-    const binString = atob(payloadBlob.data);
-    bytes = Uint8Array.from(binString, c => c.charCodeAt(0));
-  } catch (e) {
-    console.warn("Failed to decode clipboard blob base64:", e);
-    return undefined;
-  }
-  if (bytes.length === 0) return undefined;
-  const url = URL.createObjectURL(new Blob([bytes], { type: payloadBlob.mime_type || "image/png" }));
+// Build the history blob preview from a backend ClipboardPreview.blob. The
+// backend ships a small base64 PNG thumbnail (or none for a not-yet-fetched
+// descriptor); we wrap it as a data URL. No full-bytes decode happens in the
+// WebView anymore — that was the History perf bottleneck.
+export function blobPreviewFromPreview(blob: any): ClipboardBlobPreview | undefined {
+  if (!blob) return undefined;
   return {
-    mime_type: payloadBlob.mime_type || "image/png",
-    width: typeof payloadBlob.width === "number" ? payloadBlob.width : undefined,
-    height: typeof payloadBlob.height === "number" ? payloadBlob.height : undefined,
-    size: bytes.length,
-    object_url: url,
+    mime_type: blob.mime_type || "image/png",
+    width: typeof blob.width === "number" ? blob.width : undefined,
+    height: typeof blob.height === "number" ? blob.height : undefined,
+    size: typeof blob.size === "number" ? blob.size : 0,
+    thumbnail:
+      typeof blob.thumbnail === "string" && blob.thumbnail.length > 0
+        ? `data:image/png;base64,${blob.thumbnail}`
+        : undefined,
+    descriptor: !!blob.descriptor,
   };
 }
 
@@ -65,11 +29,17 @@ export function formatsFromPayload(payloadFormats: any): ClipboardFormatPreview[
   if (!Array.isArray(payloadFormats) || payloadFormats.length === 0) return undefined;
   const list: ClipboardFormatPreview[] = [];
   for (const f of payloadFormats) {
-    if (!f || typeof f.mime_type !== "string" || typeof f.data !== "string") continue;
+    if (!f || typeof f.mime_type !== "string") continue;
+    // New light-preview shape ships `size` directly; old full-payload shape
+    // carried `data` (base64/utf-8 string) and size was computed from its length.
+    const size =
+      typeof f.size === "number" ? f.size :
+      typeof f.data === "string" ? f.data.length :
+      0;
     list.push({
       mime_type: f.mime_type,
       binary: !!f.binary,
-      size: f.data.length,
+      size,
     });
   }
   return list.length > 0 ? list : undefined;

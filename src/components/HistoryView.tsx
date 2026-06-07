@@ -157,9 +157,9 @@ export function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; o
 
                     {it.blob && (
                       <div className="mt-2 flex flex-col gap-1 rounded-lg bg-zinc-50 p-2 dark:bg-zinc-800">
-                        {it.blob.object_url ? (
+                        {it.blob.thumbnail ? (
                           <img
-                            src={it.blob.object_url}
+                            src={it.blob.thumbnail}
                             alt="Clipboard image"
                             className="max-h-48 max-w-full rounded-md object-contain"
                           />

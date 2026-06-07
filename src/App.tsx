@@ -21,7 +21,7 @@ import type {
   Peer, View, NearbyNetwork, ClipboardBlobPreview, ClipboardFormatPreview,
   HistoryItem, AppSettings,
 } from "./types";
-import { blobFromPayload, formatsFromPayload } from "./lib/protocol";
+import { blobPreviewFromPreview, formatsFromPayload } from "./lib/protocol";
 
 // Helper for backend logging
 // Helper for backend logging
@@ -493,14 +493,18 @@ export default function App() {
         device: "Me", // It's always me for monitor updates
         sender_id: p.sender_id,
         ts: p.timestamp,
-        text: p.text || "",
+        text: p.text_preview || "",
+        text_len: typeof p.text_len === "number" ? p.text_len : 0,
         files: p.files,
-        blob: blobFromPayload(p.blob),
+        blob: blobPreviewFromPreview(p.blob),
         formats: formatsFromPayload(p.formats),
+        has_backing: !!p.has_backing,
       };
 
       // Update Local State but NOT 'lastSentClipboard'
-      if (newItem.text) {
+      // Only mirror small items whose full text IS the preview. Large items
+      // are re-called from the backend on demand.
+      if (newItem.text && newItem.text_len <= newItem.text.length) {
         setLocalClipboard(newItem.text);
         // Do NOT set lastSentClipboard here, because we haven't sent it yet!
         // This discrepancy (local > lastSent) will trigger the FAB.
@@ -521,21 +525,23 @@ export default function App() {
         device: p.sender,
         sender_id: p.sender_id,
         ts: p.timestamp,
-        text: p.text || "",
+        text: p.text_preview || "",
+        text_len: typeof p.text_len === "number" ? p.text_len : 0,
         files: p.files,
-        blob: blobFromPayload(p.blob),
+        blob: blobPreviewFromPreview(p.blob),
         formats: formatsFromPayload(p.formats),
+        has_backing: !!p.has_backing,
       };
 
       // Update Local Clipboard State
+      const fullTextAvailable = newItem.text_len <= newItem.text.length;
       if (isLocal) {
-        // If it has text, update local view
-        if (newItem.text) setLocalClipboard(newItem.text);
-        // If local change event -> it is committed (Auto or Manual).
-        if (newItem.text) setLastSentClipboard(newItem.text);
+        if (newItem.text && fullTextAvailable) {
+          setLocalClipboard(newItem.text);
+          setLastSentClipboard(newItem.text);
+        }
       } else {
-        // Remote sender
-        if (newItem.text) {
+        if (newItem.text && fullTextAvailable) {
           setLocalClipboard(newItem.text);
           setLastReceivedClipboard(newItem.text);
         }
@@ -543,31 +549,19 @@ export default function App() {
 
       // Update History
       setClipboardHistory((prev) => {
-        // Dedupe by ID — discard the freshly-allocated blob URL to avoid leak.
-        if (prev.find(i => i.id === newItem.id)) {
-          if (newItem.blob?.object_url) URL.revokeObjectURL(newItem.blob.object_url);
-          return prev;
-        }
-        const next = [newItem, ...prev];
-        if (next.length > 50) {
-          next.slice(50).forEach(item => {
-            if (item.blob?.object_url) URL.revokeObjectURL(item.blob.object_url);
-          });
-        }
-        return next.slice(0, 50);
+        if (prev.find(i => i.id === newItem.id)) return prev;
+        return [newItem, ...prev].slice(0, 50);
       });
     });
 
     const unlistenPending = listen<any>("clipboard-pending", (event) => {
       const p = event.payload;
-      // Replacing an existing pending entry — revoke its blob URL first if any.
-      setPendingReceive(prev => {
-        if (prev?.blob?.object_url) URL.revokeObjectURL(prev.blob.object_url);
+      setPendingReceive(_prev => {
         return {
-          text: p.text || "",
+          text: p.text_preview || "",
           sender: p.sender,
           timestamp: p.timestamp,
-          blob: blobFromPayload(p.blob),
+          blob: blobPreviewFromPreview(p.blob),
           formats: formatsFromPayload(p.formats),
         };
       });
@@ -575,11 +569,14 @@ export default function App() {
 
     const unlistenDelete = listen<string>("history-delete", (event) => {
       const idToDelete = event.payload;
-      setClipboardHistory((prev) => {
-        const dropped = prev.find(i => i.id === idToDelete);
-        if (dropped?.blob?.object_url) URL.revokeObjectURL(dropped.blob.object_url);
-        return prev.filter(i => i.id !== idToDelete);
-      });
+      setClipboardHistory((prev) => prev.filter(i => i.id !== idToDelete));
+    });
+
+    const unlistenEvicted = listen<string>("history-backing-evicted", (event) => {
+      const id = event.payload;
+      setClipboardHistory((prev) =>
+        prev.map((it) => (it.id === id ? { ...it, has_backing: false } : it))
+      );
     });
 
     const unlistenRemove = listen<string>("peer-remove", (event) => {
@@ -624,6 +621,7 @@ export default function App() {
       unlistenMonitor.then((f) => f());
 
       unlistenPending.then((f) => f());
+      unlistenEvicted.then((f) => f());
       unlistenRemove.then((f) => f());
       unlistenReset.then((f) => f());
       unlistenUpdate.then((f) => f());
