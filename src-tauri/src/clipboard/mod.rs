@@ -1,5 +1,6 @@
 pub mod common;
 pub mod history_store;
+pub mod preview;
 mod plugin;
 mod rich;
 
