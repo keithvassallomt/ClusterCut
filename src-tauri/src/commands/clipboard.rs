@@ -162,6 +162,9 @@ pub(crate) async fn recall_send_history_item(
             ClipboardContent::Image(blob)
         }
     };
+    // Explicit user re-send: clear the echo/dedup guard so process_clipboard_change
+    // does not suppress an image/rich item that still matches the last broadcast.
+    *state.last_clipboard_content.lock().unwrap() = String::new();
     crate::clipboard::common::process_clipboard_change(content, &app_handle, &state, &transport);
     Ok(())
 }
