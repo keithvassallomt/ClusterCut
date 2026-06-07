@@ -47,43 +47,58 @@ async fn handle_incoming_clipboard_blob_stream(
     let mut buf = vec![0u8; 1024 * 1024];
     let mut last_emit = std::time::Instant::now();
     let start_time = std::time::Instant::now();
-    loop {
-        match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if accum.len() + n > cap {
-                    tracing::error!(
-                        "Clipboard-blob stream exceeds {} byte cap (got {}); dropping.",
-                        cap,
-                        accum.len() + n
-                    );
-                    // Drain remainder of stream to keep QUIC happy, but stop accumulating.
-                    let mut sink = vec![0u8; 1024 * 1024];
-                    while let Ok(n2) = reader.read(&mut sink).await {
-                        if n2 == 0 { break; }
+
+    // Macro so the cap/progress/error logic is shared between the compressed
+    // and raw paths without duplication.
+    macro_rules! drain {
+        ($src:expr) => {{
+            let mut src = $src;
+            loop {
+                match src.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if accum.len() + n > cap {
+                            tracing::error!(
+                                "Clipboard-blob stream exceeds {} byte cap (got {}); dropping.",
+                                cap,
+                                accum.len() + n
+                            );
+                            // Drain remainder of stream to keep QUIC happy, but stop accumulating.
+                            let mut sink = vec![0u8; 1024 * 1024];
+                            while let Ok(n2) = src.read(&mut sink).await {
+                                if n2 == 0 { break; }
+                            }
+                            return;
+                        }
+                        accum.extend_from_slice(&buf[..n]);
+                        if last_emit.elapsed().as_millis() > 200 {
+                            let _ = app.emit("file-progress", serde_json::json!({
+                                "id": header.id,
+                                "fileName": if mime_type.starts_with("text/") {
+                                    format!("Clipboard text ({})", mime_type)
+                                } else {
+                                    format!("Clipboard image ({})", mime_type)
+                                },
+                                "total": header.file_size,
+                                "transferred": accum.len() as u64,
+                            }));
+                            last_emit = std::time::Instant::now();
+                        }
                     }
-                    return;
-                }
-                accum.extend_from_slice(&buf[..n]);
-                if last_emit.elapsed().as_millis() > 200 {
-                    let _ = app.emit("file-progress", serde_json::json!({
-                        "id": header.id,
-                        "fileName": if mime_type.starts_with("text/") {
-                            format!("Clipboard text ({})", mime_type)
-                        } else {
-                            format!("Clipboard image ({})", mime_type)
-                        },
-                        "total": header.file_size,
-                        "transferred": accum.len() as u64,
-                    }));
-                    last_emit = std::time::Instant::now();
+                    Err(e) => {
+                        tracing::error!("Clipboard-blob stream read error: {}", e);
+                        return;
+                    }
                 }
             }
-            Err(e) => {
-                tracing::error!("Clipboard-blob stream read error: {}", e);
-                return;
-            }
-        }
+        }};
+    }
+
+    if header.compressed {
+        tracing::info!("[Receiver] Clipboard-blob ZSTD stream; expecting {} bytes (decompressed).", header.file_size);
+        drain!(async_compression::tokio::bufread::ZstdDecoder::new(reader));
+    } else {
+        drain!(reader);
     }
     let total_time = start_time.elapsed();
     tracing::info!(
