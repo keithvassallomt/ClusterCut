@@ -74,6 +74,14 @@ fn offered_contains_prefix(offered: &std::collections::HashSet<String>, prefix: 
 /// per-message cap.
 const MAX_RICH_TEXT_READ_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Bytes pulled for the cheap per-poll clipboard change-probe. Large enough
+/// that two distinct clipboard payloads almost never share an identical prefix,
+/// small enough that probing a huge selection every tick stays cheap — and,
+/// crucially, closing the pipe at this size stops the source process from
+/// pumping a giant selection through the compositor on every poll (the thing
+/// that wedges the Wayland session when a 100 MB+ payload sits on the clipboard).
+const CLIP_PROBE_BYTES: u64 = 64 * 1024;
+
 /// Check if wlr-data-control is available by attempting a paste.
 pub fn is_available() -> bool {
     match get_contents(ClipboardType::Regular, Seat::Unspecified, PasteMimeType::Text) {
@@ -85,14 +93,31 @@ pub fn is_available() -> bool {
 }
 
 fn read_clipboard_text() -> Option<String> {
-    match get_contents(ClipboardType::Regular, Seat::Unspecified, PasteMimeType::Text) {
-        Ok((mut pipe, _mime)) => {
-            let mut text = String::new();
-            if pipe.read_to_string(&mut text).is_ok() && !text.is_empty() {
-                Some(text)
-            } else {
-                None
-            }
+    let (pipe, _mime) =
+        get_contents(ClipboardType::Regular, Seat::Unspecified, PasteMimeType::Text).ok()?;
+    // Bound the read at the text ceiling (+ a small margin). Reading the whole
+    // of a pathological selection would balloon memory *and* — because we poll —
+    // force the source to pump the entire payload through the compositor every
+    // tick. Closing the pipe at the cap stops both. The +64 margin lets an
+    // over-ceiling payload still come back as `len > cap`, so the wire-decision
+    // routes it to the "too large" path rather than silently truncating-and-sending.
+    let cap = common::MAX_CLIPBOARD_TEXT_BYTES as u64;
+    let mut buf = Vec::new();
+    if pipe.take(cap + 64).read_to_end(&mut buf).is_err() || buf.is_empty() {
+        return None;
+    }
+    let over_cap = buf.len() as u64 > cap;
+    match String::from_utf8(buf) {
+        Ok(s) => Some(s),
+        // Hitting the cap can split a multi-byte char at the boundary. Keep the
+        // valid prefix — its length stays > cap, so it still classifies as too
+        // large. (A genuinely non-UTF-8 selection within the cap is dropped, as
+        // before.)
+        Err(e) if over_cap => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut b = e.into_bytes();
+            b.truncate(valid);
+            String::from_utf8(b).ok().filter(|s| !s.is_empty())
         }
         Err(_) => None,
     }
@@ -434,17 +459,108 @@ pub fn write_text_direct(app: &AppHandle, text: String) -> Result<(), String> {
     write_text(app, text)
 }
 
+/// Pick a single representative MIME to prefix-probe for change-detection,
+/// following `read_clipboard`'s priority (files → image → rich → text) so the
+/// probed representation is the one the monitor would actually act on.
+fn clipboard_probe_mime(offered: &std::collections::HashSet<String>) -> Option<String> {
+    const PRIORITY: &[&str] = &[
+        "text/uri-list",
+        "image/png",
+        "image/jpeg",
+        "image/svg+xml",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+        "image/tiff",
+        "text/html",
+        "text/rtf",
+        "application/rtf",
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "STRING",
+    ];
+    for m in PRIORITY {
+        if offered.contains(*m) {
+            return Some((*m).to_string());
+        }
+    }
+    // Fall back to any remaining text type, else the lexicographically first
+    // offered type, so we still produce a stable probe target.
+    offered
+        .iter()
+        .find(|m| m.starts_with("text/"))
+        .or_else(|| offered.iter().min())
+        .cloned()
+}
+
+/// Read at most `CLIP_PROBE_BYTES` of `mime` from the clipboard, returning the
+/// bytes read (possibly empty). Closing the pipe at the cap keeps this cheap
+/// even for a multi-hundred-MB selection.
+fn read_clip_prefix(mime: &str) -> Vec<u8> {
+    match get_contents(
+        ClipboardType::Regular,
+        Seat::Unspecified,
+        PasteMimeType::Specific(mime),
+    ) {
+        Ok((pipe, _)) => {
+            let mut buf = Vec::new();
+            let _ = pipe.take(CLIP_PROBE_BYTES).read_to_end(&mut buf);
+            buf
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// A cheap fingerprint of the current clipboard selection: the sorted set of
+/// offered MIME types plus a bounded prefix of the representation the monitor
+/// would use. `get_mime_types` transfers no content and the prefix read closes
+/// the pipe early, so this stays cheap every poll regardless of payload size.
+/// Returns `None` for an empty/unavailable clipboard.
+///
+/// Equality means "the monitor would produce the same content as last time", so
+/// the poll loop can skip the full (potentially huge) read. The only blind spot
+/// is two payloads that share an identical first `CLIP_PROBE_BYTES` *and* MIME
+/// set — vanishingly rare for real clipboard content, and the cost of a miss is
+/// one skipped sync, not a crash.
+fn clipboard_fingerprint() -> Option<(Vec<String>, Vec<u8>)> {
+    let offered = get_mime_types(ClipboardType::Regular, Seat::Unspecified).ok()?;
+    if offered.is_empty() {
+        return None;
+    }
+    let mut mimes: Vec<String> = offered.iter().cloned().collect();
+    mimes.sort();
+    let prefix = match clipboard_probe_mime(&offered) {
+        Some(m) => read_clip_prefix(&m),
+        None => Vec::new(),
+    };
+    Some((mimes, prefix))
+}
+
 pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transport) {
     thread::spawn(move || {
         tracing::info!("Starting Wayland clipboard monitor (wlr-data-control polling)");
 
         let mut last_content = ClipboardContent::None;
+        let mut last_fp: Option<(Vec<String>, Vec<u8>)> = None;
 
         loop {
             if state.is_shutdown() {
                 tracing::info!("Wayland clipboard monitor shutting down.");
                 break;
             }
+
+            // Cheap change-probe first. Without this the loop re-reads the whole
+            // clipboard every 500 ms; for a large selection (e.g. 100 MB+ of
+            // text) that pumps the entire payload through the compositor on every
+            // tick and wedges the Wayland session. Only do the full read when the
+            // fingerprint actually changes.
+            let fp = clipboard_fingerprint();
+            if fp == last_fp {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            last_fp = fp;
 
             let current_content = read_clipboard();
 
@@ -467,4 +583,46 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
             thread::sleep(Duration::from_millis(500));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clipboard_probe_mime;
+    use std::collections::HashSet;
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn probe_mime_prefers_files_over_image_and_text() {
+        let s = set(&["text/plain", "image/png", "text/uri-list"]);
+        assert_eq!(clipboard_probe_mime(&s).as_deref(), Some("text/uri-list"));
+    }
+
+    #[test]
+    fn probe_mime_prefers_image_over_text() {
+        let s = set(&["text/plain", "image/png"]);
+        assert_eq!(clipboard_probe_mime(&s).as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn probe_mime_prefers_charset_text_variant() {
+        let s = set(&["text/plain;charset=utf-8", "text/plain"]);
+        assert_eq!(
+            clipboard_probe_mime(&s).as_deref(),
+            Some("text/plain;charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn probe_mime_falls_back_to_unknown_text_type() {
+        let s = set(&["text/x-weird"]);
+        assert_eq!(clipboard_probe_mime(&s).as_deref(), Some("text/x-weird"));
+    }
+
+    #[test]
+    fn probe_mime_none_for_empty() {
+        assert_eq!(clipboard_probe_mime(&HashSet::new()), None);
+    }
 }
