@@ -10,6 +10,42 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use std::path::PathBuf;
 use tokio::fs::File;
 
+/// Stage received clipboard-blob bytes under `temp_downloads/<id>.<ext>` and
+/// register them in `local_clipboard_blobs`, so this receiver can re-copy /
+/// re-send the item from History. Mirrors the sender's
+/// `stage_clipboard_blob_temp_file` but works from in-memory bytes we already
+/// drained. Returns the staged path on success.
+fn stage_received_clipboard_blob(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    id: &str,
+    mime_type: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+    bytes: &[u8],
+) -> Option<std::path::PathBuf> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .ok()?
+        .join("temp_downloads");
+    std::fs::create_dir_all(&cache_dir).ok()?;
+    let ext = crate::clipboard::common::extension_for_clipboard_mime(mime_type);
+    let path = cache_dir.join(format!("{}.{}", id, ext));
+    std::fs::write(&path, bytes).ok()?;
+    state.local_clipboard_blobs.lock().unwrap().insert(
+        id.to_string(),
+        crate::state::ClipboardBlobMetadata {
+            path: path.clone(),
+            mime_type: mime_type.to_string(),
+            width,
+            height,
+            total_size: bytes.len() as u64,
+        },
+    );
+    Some(path)
+}
+
 /// Read a §3.3 clipboard-blob stream into memory and land it on the OS
 /// clipboard. The header has already been parsed and confirmed to carry
 /// `DeliveryTarget::Clipboard{…}`. Auth-token verification mirrors the file
@@ -154,12 +190,22 @@ async fn handle_incoming_clipboard_blob_stream(
                 return;
             }
         };
-        // History entry carries the full text (consistent with small text).
+        // Stage for re-call, then emit a light preview (record_and_emit reads
+        // the staged file via local_clipboard_blobs to build the Disk entry).
+        let _ = stage_received_clipboard_blob(
+            &app, &state, &header.id, &mime_type, None, None, text.as_bytes(),
+        );
         let payload_event = crate::protocol::ClipboardPayload {
             id: header.id.clone(),
-            text: text.clone(),
+            text: String::new(),
             files: None,
-            blob: None,
+            blob: Some(crate::protocol::ClipboardBlob::descriptor(
+                mime_type.clone(),
+                header.id.clone(),
+                text.len() as u64,
+                None,
+                None,
+            )),
             formats: None,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -174,7 +220,7 @@ async fn handle_incoming_clipboard_blob_stream(
             let mut pending = state.pending_clipboard.lock().unwrap();
             *pending = Some(payload_event.clone());
         }
-        let _ = app.emit("clipboard-change", &payload_event);
+        crate::clipboard::common::record_and_emit(&app, &state, "clipboard-change", &payload_event);
         if notifications.data_received {
             send_notification(
                 &app,
@@ -184,21 +230,48 @@ async fn handle_incoming_clipboard_blob_stream(
             );
         }
     } else {
-        // Reconstruct a ClipboardBlob and drive it onto the OS clipboard via the
-        // same `set_clipboard_image` that the inline path uses.
+        let staged = stage_received_clipboard_blob(
+            &app, &state, &header.id, &mime_type, width, height, &accum,
+        );
+        // Land the image on the OS clipboard (or stash as pending).
         let blob = crate::protocol::ClipboardBlob::from_bytes(mime_type.clone(), &accum, width, height);
-        let payload_event = crate::protocol::ClipboardPayload {
-            id: header.id.clone(),
-            text: String::new(),
-            files: None,
-            blob: Some(blob.clone()),
-            formats: None,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            sender: format!("{}", addr),
-            sender_id: String::new(),
+        let payload_event = if staged.is_some() {
+            // Descriptor payload → record_and_emit builds a Disk entry +
+            // thumbnail from the staged file.
+            crate::protocol::ClipboardPayload {
+                id: header.id.clone(),
+                text: String::new(),
+                files: None,
+                blob: Some(crate::protocol::ClipboardBlob::descriptor(
+                    mime_type.clone(),
+                    header.id.clone(),
+                    accum.len() as u64,
+                    width,
+                    height,
+                )),
+                formats: None,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                sender: format!("{}", addr),
+                sender_id: String::new(),
+            }
+        } else {
+            // Staging failed — fall back to inline so History still shows it.
+            crate::protocol::ClipboardPayload {
+                id: header.id.clone(),
+                text: String::new(),
+                files: None,
+                blob: Some(blob.clone()),
+                formats: None,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                sender: format!("{}", addr),
+                sender_id: String::new(),
+            }
         };
         if auto_recv {
             crate::clipboard::set_clipboard_image(&app, blob);
@@ -206,7 +279,7 @@ async fn handle_incoming_clipboard_blob_stream(
             let mut pending = state.pending_clipboard.lock().unwrap();
             *pending = Some(payload_event.clone());
         }
-        let _ = app.emit("clipboard-change", &payload_event);
+        crate::clipboard::common::record_and_emit(&app, &state, "clipboard-change", &payload_event);
         if notifications.data_received {
             send_notification(
                 &app,

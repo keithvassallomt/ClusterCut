@@ -550,7 +550,7 @@ pub fn should_process_content(
 /// Picked from MIME so the file is visually meaningful if it leaks past the
 /// startup `clear_cache` (which it shouldn't — but if it does, having the
 /// right extension makes manual cleanup easier).
-fn extension_for_clipboard_mime(mime: &str) -> &'static str {
+pub fn extension_for_clipboard_mime(mime: &str) -> &'static str {
     match mime {
         "image/png" => "png",
         "image/jpeg" => "jpg",
