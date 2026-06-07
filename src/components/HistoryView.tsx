@@ -7,6 +7,9 @@ import type { HistoryItem } from "../types";
 import { timeAgo, formatBytes } from "../lib/format";
 import { shortRichLabel } from "../lib/protocol";
 
+// Stateless; one instance reused for all rows rather than allocating per render.
+const utf8 = new TextEncoder();
+
 export function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; onClearHistory: () => void }) {
   const [myHostname, setMyHostname] = useState<string>("");
   const [progress, setProgress] = useState<Record<string, { transferred: number, total: number }>>({});
@@ -154,7 +157,7 @@ export function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; o
                       )}
                     </div>
                     {it.text && <div className="mt-2 line-clamp-3 whitespace-pre-wrap text-sm text-zinc-900 dark:text-zinc-50">{it.text}</div>}
-                    {it.text && it.text_len > new TextEncoder().encode(it.text).byteLength && (
+                    {it.text && it.text_len > utf8.encode(it.text).byteLength && (
                       <div className="mt-1 text-[11px] text-zinc-500">Large text • {formatBytes(it.text_len)}</div>
                     )}
 
