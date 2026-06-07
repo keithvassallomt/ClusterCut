@@ -542,6 +542,11 @@ pub struct AppSettings {
     /// (browsing/discovery of others stays active). Default-on.
     #[serde(default = "default_true")]
     pub mdns_advertising: bool,
+    /// Max bytes of re-callable clipboard content (text + images) the History
+    /// content store retains, across RAM + disk tiers. File transfers don't
+    /// count. Default 200 MB; oldest entries evict first when exceeded.
+    #[serde(default = "default_history_store_max_bytes")]
+    pub history_store_max_bytes: u64,
 }
 
 fn default_pairing_accept_enabled() -> bool {
@@ -550,6 +555,10 @@ fn default_pairing_accept_enabled() -> bool {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_history_store_max_bytes() -> u64 {
+    200 * 1024 * 1024
 }
 
 impl Default for AppSettings {
@@ -572,6 +581,7 @@ impl Default for AppSettings {
             pairing_accept_enabled: true,
             configure_firewall: true,
             mdns_advertising: true,
+            history_store_max_bytes: 200 * 1024 * 1024,
         }
     }
 }

@@ -97,6 +97,9 @@ pub struct AppState {
     /// bytes still drain off the wire to keep QUIC happy, but they don't
     /// overwrite the OS clipboard once they finish landing. Newest copy wins.
     pub in_flight_clipboard_fetch: Arc<Mutex<Option<String>>>,
+    /// Re-callable clipboard content for the History view, keyed by payload
+    /// id. Budgeted; see `clipboard::history_store`.
+    pub history_store: Arc<Mutex<crate::clipboard::history_store::HistoryStore>>,
     // Transport instance for sending messages from commands
     pub transport: Arc<Mutex<Option<crate::transport::Transport>>>,
     // Tray Menu Handle
@@ -172,6 +175,11 @@ impl AppState {
             local_files: Arc::new(Mutex::new(HashMap::new())),
             local_clipboard_blobs: Arc::new(Mutex::new(HashMap::new())),
             in_flight_clipboard_fetch: Arc::new(Mutex::new(None)),
+            history_store: Arc::new(Mutex::new(
+                crate::clipboard::history_store::HistoryStore::new(
+                    crate::storage::AppSettings::default().history_store_max_bytes,
+                ),
+            )),
             transport: Arc::new(Mutex::new(None)),
             tray_menu: Arc::new(Mutex::new(None)),
             current_theme: Arc::new(Mutex::new(None)),

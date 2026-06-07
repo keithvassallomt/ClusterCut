@@ -26,6 +26,14 @@ pub(crate) fn save_settings(
     settings.flatpak_autostart = prev.flatpak_autostart;
     settings.pairing_accept_enabled = prev.pairing_accept_enabled;
     *state.settings.lock().unwrap() = settings.clone();
+    // Re-budget the History content store (may evict down on a lower cap).
+    // Evicted disk files are cleaned by the next eviction/exit sweep; we only
+    // need the in-memory budget to shrink immediately here.
+    let _evicted = state
+        .history_store
+        .lock()
+        .unwrap()
+        .set_max_bytes(settings.history_store_max_bytes);
     tracing::info!(
         "Saving Settings: auto_send={}, auto_receive={}, configure_firewall={}, mdns_advertising={}",
         settings.auto_send, settings.auto_receive, settings.configure_firewall, settings.mdns_advertising

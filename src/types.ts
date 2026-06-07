@@ -100,4 +100,5 @@ export interface AppSettings {
   pairing_debug_logs: boolean;
   configure_firewall: boolean;
   mdns_advertising: boolean;
+  history_store_max_bytes: number; // bytes; History content store budget
 }
