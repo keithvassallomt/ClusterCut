@@ -52,6 +52,27 @@ enum WorkerCommand {
         text: String,
         response: mpsc::Sender<Result<(), String>>,
     },
+    /// Windows-only: write plain text + rich formats (CF_HTML / CF_RTF) via
+    /// clipboard-win's `write_all`. Routed through the worker so the OS-clipboard
+    /// open/empty/set sequence happens on the single thread that owns clipboard
+    /// access — concurrent `OpenClipboard`/`SetClipboardData` from a per-payload
+    /// thread races the worker's text/image writes and corrupts the heap
+    /// (ntdll 0xc0000374 / 0xc0000005).
+    #[cfg(target_os = "windows")]
+    SetRich {
+        text: String,
+        formats: Vec<ClipboardFormat>,
+        response: mpsc::Sender<Result<(), String>>,
+    },
+    /// Windows-only: write a passthrough image (SVG) verbatim under its source
+    /// MIME atom. Same rationale as `SetRich` — serialize the clipboard open on
+    /// the worker thread. JPEG/GIF already route through `SetImage`'s dual-write.
+    #[cfg(target_os = "windows")]
+    SetPassthroughImage {
+        mime: String,
+        bytes: Vec<u8>,
+        response: mpsc::Sender<Result<(), String>>,
+    },
 }
 
 /// Worker command sender, populated by `start_monitor`. The image write path
@@ -159,7 +180,16 @@ fn write_clipboard_image_arboard(_app: &AppHandle, blob: &ClipboardBlob) -> Resu
     // SVG: vector — no useful raster representation. Pure passthrough on
     // every platform.
     if mime == "image/svg+xml" {
-        return rich::write_clipboard_passthrough_image(mime, &bytes);
+        // Windows: serialize the clipboard open on the worker thread (see
+        // write_rich). Other platforms write in place.
+        #[cfg(target_os = "windows")]
+        {
+            return dispatch_set_passthrough_image(mime.to_string(), bytes);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            return rich::write_clipboard_passthrough_image(mime, &bytes);
+        }
     }
 
     // JPEG/GIF: pure passthrough on macOS + Linux; dual-write on Windows so
@@ -381,6 +411,63 @@ fn write_text(app: &AppHandle, text: String) -> Result<(), String> {
     }
 }
 
+/// Windows-only: dispatch a rich-text write to the clipboard worker and block
+/// until it completes. Mirrors `write_text`'s worker round-trip so the
+/// OS-clipboard open/empty/set happens on the single owning thread. The timeout
+/// is more generous than the plain-text path because `write_all` carries its
+/// own open-retry + per-attempt backoff budget.
+#[cfg(target_os = "windows")]
+fn dispatch_set_rich(text: String, formats: Vec<ClipboardFormat>) -> Result<(), String> {
+    let sender = WORKER_CMD_TX
+        .get()
+        .ok_or_else(|| "clipboard worker not initialised".to_string())?
+        .clone();
+    let (tx, rx) = mpsc::channel();
+    sender
+        .send(WorkerCommand::SetRich {
+            text,
+            formats,
+            response: tx,
+        })
+        .map_err(|_| "clipboard worker channel closed".to_string())?;
+    match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("clipboard worker did not respond within 15 s".to_string())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("clipboard worker dropped response channel".to_string())
+        }
+    }
+}
+
+/// Windows-only: dispatch a passthrough-image (SVG) write to the clipboard
+/// worker and block until it completes. Same rationale as `dispatch_set_rich`.
+#[cfg(target_os = "windows")]
+fn dispatch_set_passthrough_image(mime: String, bytes: Vec<u8>) -> Result<(), String> {
+    let sender = WORKER_CMD_TX
+        .get()
+        .ok_or_else(|| "clipboard worker not initialised".to_string())?
+        .clone();
+    let (tx, rx) = mpsc::channel();
+    sender
+        .send(WorkerCommand::SetPassthroughImage {
+            mime,
+            bytes,
+            response: tx,
+        })
+        .map_err(|_| "clipboard worker channel closed".to_string())?;
+    match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("clipboard worker did not respond within 15 s".to_string())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("clipboard worker dropped response channel".to_string())
+        }
+    }
+}
+
 fn write_files(app: &AppHandle, files: Vec<String>) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -455,7 +542,17 @@ pub fn set_clipboard_image(app: &AppHandle, blob: ClipboardBlob) {
 /// the user still gets *something* — graceful degradation matches what
 /// `set_clipboard_rich` in mod.rs documents.
 fn write_rich(app: &AppHandle, text: &str, formats: &[ClipboardFormat]) -> Result<(), String> {
-    match rich::write_clipboard_rich(text, formats) {
+    // On Windows the actual clipboard open/empty/set must happen on the single
+    // worker thread that owns clipboard access; dispatching from this per-payload
+    // thread directly races the worker's text/image writes and corrupts the heap.
+    // Other platforms have no such per-thread ownership constraint, so they call
+    // the rich writer in place.
+    #[cfg(target_os = "windows")]
+    let result = dispatch_set_rich(text.to_string(), formats.to_vec());
+    #[cfg(not(target_os = "windows"))]
+    let result = rich::write_clipboard_rich(text, formats);
+
+    match result {
         Ok(()) => Ok(()),
         Err(e) => {
             tracing::debug!(
@@ -566,6 +663,24 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 #[cfg(target_os = "windows")]
                 WorkerCommand::SetText { text, response } => {
                     let result = set_text_clearing_clipboard(&text);
+                    let _ = response.send(result);
+                }
+                #[cfg(target_os = "windows")]
+                WorkerCommand::SetRich {
+                    text,
+                    formats,
+                    response,
+                } => {
+                    let result = rich::write_clipboard_rich(&text, &formats);
+                    let _ = response.send(result);
+                }
+                #[cfg(target_os = "windows")]
+                WorkerCommand::SetPassthroughImage {
+                    mime,
+                    bytes,
+                    response,
+                } => {
+                    let result = rich::write_clipboard_passthrough_image(&mime, &bytes);
                     let _ = response.send(result);
                 }
             }
