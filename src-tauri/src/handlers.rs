@@ -18,7 +18,7 @@ use tokio::fs::File;
 /// has superseded this one — we still drain the stream to keep QUIC happy
 /// but skip writing to the OS clipboard.
 async fn handle_incoming_clipboard_blob_stream(
-    mut reader: BufReader<quinn::RecvStream>,
+    reader: BufReader<quinn::RecvStream>,
     header: crate::protocol::FileStreamHeader,
     mime_type: String,
     width: Option<u32>,
@@ -582,12 +582,15 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                     // confirm based on `max_auto_download_size`.
                                     let total_size = blob.total_size.unwrap_or(0);
                                     let mb = total_size as f64 / (1024.0 * 1024.0);
+                                    let is_text = blob.mime_type.starts_with("text/");
+                                    let kind_lower = if is_text { "text" } else { "image" };
+                                    let kind_title = if is_text { "Text" } else { "Image" };
                                     let (auto_recv, enable_ft, size_limit) = {
                                         let s = listener_state.settings.lock().unwrap();
                                         (s.auto_receive, s.enable_file_transfer, s.max_auto_download_size)
                                     };
                                     tracing::info!(
-                                        "Received clipboard image descriptor from {}: mime={}, total={} bytes{} fetch_id={}",
+                                        "Received clipboard descriptor from {}: mime={}, total={} bytes{} fetch_id={}",
                                         sender,
                                         blob.mime_type,
                                         total_size,
@@ -617,10 +620,11 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                         // notification.
                                         let notify_large = listener_state.settings.lock().unwrap().notify_large_files;
                                         if notify_large {
+                                            let title = format!("Large Clipboard {}", kind_title);
                                             send_notification(
                                                 &listener_handle,
-                                                "Large Clipboard Image",
-                                                &format!("{:.1} MB image from {} — accept to receive.", mb, sender),
+                                                &title,
+                                                &format!("{:.1} MB {} from {} — accept to receive.", mb, kind_lower, sender),
                                                 true,
                                                 Some(3),
                                                 "history",
@@ -642,10 +646,11 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
 
                                         let notify_large = listener_state.settings.lock().unwrap().notify_large_files;
                                         if notify_large {
+                                            let title = format!("Large Clipboard {}", kind_title);
                                             send_notification(
                                                 &listener_handle,
-                                                "Large Clipboard Image",
-                                                &format!("{:.1} MB image from {} — accept to receive.", mb, sender),
+                                                &title,
+                                                &format!("{:.1} MB {} from {} — accept to receive.", mb, kind_lower, sender),
                                                 true,
                                                 Some(3),
                                                 "history",
@@ -672,10 +677,11 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
 
                                         let notifications = listener_state.settings.lock().unwrap().notifications.clone();
                                         if notifications.data_received {
+                                            let title = format!("Receiving Clipboard {}", kind_title);
                                             send_notification(
                                                 &listener_handle,
-                                                "Receiving Clipboard Image",
-                                                &format!("Receiving {:.1} MB image from {}…", mb, sender),
+                                                &title,
+                                                &format!("Receiving {:.1} MB {} from {}…", mb, kind_lower, sender),
                                                 false,
                                                 Some(2),
                                                 "history",
