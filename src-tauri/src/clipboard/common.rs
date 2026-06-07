@@ -25,6 +25,39 @@ pub const MAX_CLIPBOARD_IMAGE_WIRE_BYTES: usize = 10 * 1024 * 1024;
 /// ~33 MB, an 8K PNG screenshot tops out around ~150 MB).
 pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 500 * 1024 * 1024;
 
+/// Plain text at or below this size is inlined into `Message::Clipboard` as a
+/// JSON string. Above it, the sender stages the text and broadcasts a
+/// descriptor; peers fetch it over the `clustercut-file` ALPN (like big
+/// images). Matches the image inline threshold.
+pub const MAX_CLIPBOARD_TEXT_WIRE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Absolute ceiling for plain text. The sender will not share text larger than
+/// this (it notifies instead), and the receiver caps its defensive stream
+/// drain here for `text/*` blobs.
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 100 * 1024 * 1024;
+
+/// How a plain-text clipboard payload should travel, by decoded byte length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextWireDecision {
+    /// Inline in the JSON message (small text, the common case).
+    Inline,
+    /// Stage + broadcast a descriptor; bytes ride the file-transfer ALPN.
+    Descriptor,
+    /// Too large to share at all — notify and skip.
+    TooLarge,
+}
+
+/// Decide how a plain-text payload of `len` bytes should travel.
+pub fn text_wire_decision(len: usize) -> TextWireDecision {
+    if len <= MAX_CLIPBOARD_TEXT_WIRE_BYTES {
+        TextWireDecision::Inline
+    } else if len <= MAX_CLIPBOARD_TEXT_BYTES {
+        TextWireDecision::Descriptor
+    } else {
+        TextWireDecision::TooLarge
+    }
+}
+
 /// Threshold above which a "Receiving large clipboard…" notification fires on
 /// the receiver side. A multi-MB inline transfer takes a perceptible amount
 /// of time on the network and the user might paste mid-transfer otherwise.
@@ -522,6 +555,7 @@ fn extension_for_clipboard_mime(mime: &str) -> &'static str {
         "image/webp" => "webp",
         "image/bmp" | "image/x-bmp" => "bmp",
         "image/tiff" => "tiff",
+        "text/plain" => "txt",
         _ => "bin",
     }
 }
@@ -1298,5 +1332,29 @@ mod tests {
         let ign = vec![ClipboardFormat::from_text("text/html", "<p>x</p>")];
         let curr = vec![ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}")];
         assert!(!rich_eq_stable("hello", &ign, "", &curr));
+    }
+}
+
+#[cfg(test)]
+mod text_wire_tests {
+    use super::{text_wire_decision, TextWireDecision,
+                MAX_CLIPBOARD_TEXT_WIRE_BYTES, MAX_CLIPBOARD_TEXT_BYTES};
+
+    #[test]
+    fn small_text_inlines() {
+        assert_eq!(text_wire_decision(0), TextWireDecision::Inline);
+        assert_eq!(text_wire_decision(1024), TextWireDecision::Inline);
+        assert_eq!(text_wire_decision(MAX_CLIPBOARD_TEXT_WIRE_BYTES), TextWireDecision::Inline);
+    }
+
+    #[test]
+    fn medium_text_uses_descriptor() {
+        assert_eq!(text_wire_decision(MAX_CLIPBOARD_TEXT_WIRE_BYTES + 1), TextWireDecision::Descriptor);
+        assert_eq!(text_wire_decision(MAX_CLIPBOARD_TEXT_BYTES), TextWireDecision::Descriptor);
+    }
+
+    #[test]
+    fn huge_text_is_too_large() {
+        assert_eq!(text_wire_decision(MAX_CLIPBOARD_TEXT_BYTES + 1), TextWireDecision::TooLarge);
     }
 }
