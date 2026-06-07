@@ -178,6 +178,92 @@ pub fn set_clipboard_rich(app: &AppHandle, text: String, formats: Vec<ClipboardF
     }
 }
 
+/// Windows-only debug self-test for the concurrent-clipboard heap-corruption
+/// race (ntdll `0xc0000374` / `0xc0000005`). Inert unless the
+/// `CLUSTERCUT_CLIPRACE` env var is set to a positive number of seconds.
+///
+/// When enabled it spawns a thread that drives the *real* `set_clipboard`
+/// (large plain text) and `set_clipboard_rich` (small HTML) entry points
+/// concurrently — the same two-near-simultaneous-payload pattern the network
+/// receive path produces — but with no network/cluster involved. On a build
+/// where rich writes still open the clipboard on a per-payload thread this
+/// aborts within seconds; once those writes are serialized through the
+/// clipboard worker it runs to completion and logs `SURVIVED`.
+///
+/// Tuners (env, all optional):
+///   `CLIPRACE_TEXT_MB`  large-text size in MB        (default 16)
+///   `CLIPRACE_RICH`     rich writes per round        (default 4)
+///   `CLIPRACE_PACE_MS`  sleep between rounds in ms   (default 250)
+///
+/// Run UNCLUSTERED so the rapid clipboard churn isn't broadcast to peers.
+#[cfg(target_os = "windows")]
+pub fn run_clip_race_selftest(app: AppHandle) {
+    let secs: u64 = match std::env::var("CLUSTERCUT_CLIPRACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        Some(s) if s > 0 => s,
+        _ => return,
+    };
+    let text_mb: usize = std::env::var("CLIPRACE_TEXT_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let rich_per_round: usize = std::env::var("CLIPRACE_RICH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let pace_ms: u64 = std::env::var("CLIPRACE_PACE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(250);
+
+    std::thread::spawn(move || {
+        let target = text_mb * 1024 * 1024;
+        let mut big = String::with_capacity(target + 64);
+        while big.len() < target {
+            big.push_str("clipboard race self-test \u{03a9}\u{0416}\u{1f600} ");
+            for _ in 0..40 {
+                big.push('x');
+            }
+            big.push('\n');
+        }
+        let html = ClipboardFormat::from_text(
+            "text/html",
+            "<p><b>clip race self-test</b> \u{03a9}\u{0416}\u{1f600}</p>",
+        );
+
+        tracing::error!(
+            "CLIPRACE self-test START: {}s, text={}MB, rich/round={}, pace={}ms (build aborts here if unfixed)",
+            secs,
+            text_mb,
+            rich_per_round,
+            pace_ms
+        );
+
+        let start = std::time::Instant::now();
+        let mut rounds: u64 = 0;
+        while start.elapsed() < std::time::Duration::from_secs(secs) {
+            // Large plain text -> worker SetText (already serialized).
+            set_clipboard(&app, big.clone());
+            // Small rich HTML -> write_rich. On an unfixed build this opens the
+            // clipboard on a fresh std::thread and races the worker's text
+            // write, corrupting the heap. Once serialized it's safe.
+            for _ in 0..rich_per_round {
+                set_clipboard_rich(&app, "clip race plain".to_string(), vec![html.clone()]);
+            }
+            rounds += 1;
+            std::thread::sleep(std::time::Duration::from_millis(pace_ms));
+        }
+
+        tracing::error!(
+            "CLIPRACE self-test SURVIVED {}s over {} rounds — no crash (serialization is working).",
+            secs,
+            rounds
+        );
+    });
+}
+
 /// Place an image blob (typically `image/png`) on the local clipboard so the
 /// user can paste it in any app. Wired up across all four backends; the GNOME
 /// extension path requires extension v4.0 or newer — older extensions return

@@ -1039,6 +1039,11 @@ pub(crate) fn run() {
                 transport_for_clipboard,
             );
 
+            // Windows-only concurrent-clipboard race self-test. Inert unless the
+            // CLUSTERCUT_CLIPRACE env var is set; see run_clip_race_selftest.
+            #[cfg(target_os = "windows")]
+            crate::clipboard::run_clip_race_selftest(app.handle().clone());
+
             // Background Task: Heartbeat (Keep Manual Peers Alive)
 
             let hb_state = (*app.state::<AppState>()).clone();
