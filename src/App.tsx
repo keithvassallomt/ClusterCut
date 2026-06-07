@@ -502,9 +502,12 @@ export default function App() {
       };
 
       // Update Local State but NOT 'lastSentClipboard'
-      // Only mirror small items whose full text IS the preview. Large items
-      // are re-called from the backend on demand.
-      if (newItem.text && newItem.text_len <= newItem.text.length) {
+      // Only mirror small items whose full text IS the preview. text_len is a
+      // UTF-8 byte count, so compare against the preview's UTF-8 byte length
+      // (NOT String.length, which counts UTF-16 units). Large items are
+      // re-called from the backend on demand.
+      const previewBytes = new TextEncoder().encode(newItem.text).byteLength;
+      if (newItem.text && newItem.text_len <= previewBytes) {
         setLocalClipboard(newItem.text);
         // Do NOT set lastSentClipboard here, because we haven't sent it yet!
         // This discrepancy (local > lastSent) will trigger the FAB.
@@ -534,7 +537,11 @@ export default function App() {
       };
 
       // Update Local Clipboard State
-      const fullTextAvailable = newItem.text_len <= newItem.text.length;
+      // text_len is a UTF-8 byte count — compare against the preview's UTF-8
+      // byte length, not String.length (UTF-16 units), so non-ASCII text that
+      // fits inline isn't misclassified as truncated.
+      const fullTextAvailable =
+        newItem.text_len <= new TextEncoder().encode(newItem.text).byteLength;
       if (isLocal) {
         if (newItem.text && fullTextAvailable) {
           setLocalClipboard(newItem.text);
