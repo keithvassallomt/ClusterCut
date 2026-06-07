@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Plain text over 10 MB now syncs out-of-band (streamed and zstd-compressed) instead of inline, so large text still pastes as text on the receiver; text over 100 MB is not shared and a notice is recorded in History.
 
+### Changed
+- History no longer stalls (10–20 s) on large clipboard items. The view now receives a light preview (truncated text or a thumbnail) while the full content stays in a budgeted backend store; Copy and Send re-call it on demand. The store holds sent and received clipboard content (not files), defaults to 200 MB, is configurable under Settings → General, and evicts oldest-first. Thanks to @mdunphy for the report.
+
 ### Fixed
 - A Windows peer could crash (heap corruption) when receiving a large text payload immediately followed by rich/HTML content. Rich-text and SVG clipboard writes now go through the same single worker thread as plain text and images, instead of opening the Windows clipboard from a second thread. Thanks to @mdunphy for the report.
 
