@@ -685,4 +685,44 @@ mod tests {
         let parsed: FileStreamHeader = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.delivery_target, header.delivery_target);
     }
+
+    #[test]
+    fn clipboard_blob_text_descriptor_round_trips_through_json() {
+        let blob = ClipboardBlob::descriptor("text/plain", "txt-1", 25_000_000, None, None);
+        assert!(blob.is_descriptor());
+        let json = serde_json::to_string(&blob).unwrap();
+        let parsed: ClipboardBlob = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_descriptor());
+        assert_eq!(parsed.mime_type, "text/plain");
+        assert_eq!(parsed.total_size, Some(25_000_000));
+        assert_eq!(parsed.width, None);
+        assert_eq!(parsed.height, None);
+    }
+
+    #[test]
+    fn file_stream_header_text_clipboard_target_round_trips() {
+        let header = FileStreamHeader {
+            id: "txt-1".to_string(),
+            file_index: 0,
+            file_name: "txt-1.txt".to_string(),
+            file_size: 25_000_000,
+            compressed: true,
+            delivery_target: DeliveryTarget::Clipboard {
+                mime_type: "text/plain".to_string(),
+                width: None,
+                height: None,
+            },
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        let parsed: FileStreamHeader = serde_json::from_str(&json).unwrap();
+        assert!(parsed.compressed);
+        match parsed.delivery_target {
+            DeliveryTarget::Clipboard { mime_type, width, height } => {
+                assert_eq!(mime_type, "text/plain");
+                assert_eq!(width, None);
+                assert_eq!(height, None);
+            }
+            _ => panic!("expected Clipboard delivery target"),
+        }
+    }
 }
