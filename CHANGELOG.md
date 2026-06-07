@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A Windows peer could crash (heap corruption) when receiving a large text payload immediately followed by rich/HTML content. Rich-text and SVG clipboard writes now go through the same single worker thread as plain text and images, instead of opening the Windows clipboard from a second thread. Thanks to @mdunphy for the report.
+
 ## [0.3.5] — 2026-06-06
 
 ### Added
