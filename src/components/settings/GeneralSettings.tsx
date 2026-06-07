@@ -42,6 +42,26 @@ export function GeneralSettings({
               <span className={clsx("block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform", autostart ? "translate-x-6" : "translate-x-1")} />
             </button>
           </div>
+          <div className="mt-4 flex flex-col gap-1">
+            <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+              History storage limit (MB)
+            </label>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              className="h-10 w-40 rounded-xl border border-zinc-900/10 bg-white px-3 text-sm text-zinc-900 outline-none focus:ring-2 focus:ring-emerald-500/40 dark:border-white/10 dark:bg-white/5 dark:text-zinc-50"
+              value={Math.round(settings.history_store_max_bytes / (1024 * 1024))}
+              onChange={(e) => {
+                if (e.target.value === "") return;
+                const mb = Math.max(1, parseInt(e.target.value, 10) || 1);
+                setSettings({ ...settings, history_store_max_bytes: mb * 1024 * 1024 });
+              }}
+            />
+            <div className="text-[10px] text-zinc-500">
+              How much copied text &amp; image content History keeps for re-copying. Files don&apos;t count.
+            </div>
+          </div>
         </div>
       </Card>
 

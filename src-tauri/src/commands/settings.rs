@@ -26,6 +26,15 @@ pub(crate) fn save_settings(
     settings.flatpak_autostart = prev.flatpak_autostart;
     settings.pairing_accept_enabled = prev.pairing_accept_enabled;
     *state.settings.lock().unwrap() = settings.clone();
+    // Re-budget the History content store (may evict down on a lower cap),
+    // then clean up evicted entries: delete their disk files, drop their
+    // local_clipboard_blobs entries, and tell the UI their backing is gone.
+    let evicted = state
+        .history_store
+        .lock()
+        .unwrap()
+        .set_max_bytes(settings.history_store_max_bytes);
+    crate::clipboard::common::handle_evictions(&app_handle, &state, evicted);
     tracing::info!(
         "Saving Settings: auto_send={}, auto_receive={}, configure_firewall={}, mdns_advertising={}",
         settings.auto_send, settings.auto_receive, settings.configure_firewall, settings.mdns_advertising

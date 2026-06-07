@@ -10,6 +10,70 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use std::path::PathBuf;
 use tokio::fs::File;
 
+/// Stage received clipboard-blob bytes under `temp_downloads/<id>.<ext>` and
+/// register them in `local_clipboard_blobs`, so this receiver can re-copy /
+/// re-send the item from History. Mirrors the sender's
+/// `stage_clipboard_blob_temp_file` but works from in-memory bytes we already
+/// drained. Returns the staged path on success.
+fn stage_received_clipboard_blob(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    id: &str,
+    mime_type: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+    bytes: &[u8],
+) -> Option<std::path::PathBuf> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .ok()?
+        .join("temp_downloads");
+    std::fs::create_dir_all(&cache_dir).ok()?;
+    let ext = crate::clipboard::common::extension_for_clipboard_mime(mime_type);
+    let path = cache_dir.join(format!("{}.{}", id, ext));
+    std::fs::write(&path, bytes).ok()?;
+    state.local_clipboard_blobs.lock().unwrap().insert(
+        id.to_string(),
+        crate::state::ClipboardBlobMetadata {
+            path: path.clone(),
+            mime_type: mime_type.to_string(),
+            width,
+            height,
+            total_size: bytes.len() as u64,
+        },
+    );
+    Some(path)
+}
+
+/// RAII refcount guard: marks a clipboard-blob id as actively being served to
+/// a peer for the lifetime of the serve task, so History-store eviction won't
+/// delete the staged file mid-transfer. Decrements (and removes at zero) on drop.
+struct ServeGuard {
+    map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    id: String,
+}
+impl ServeGuard {
+    fn new(
+        map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+        id: String,
+    ) -> Self {
+        *map.lock().unwrap().entry(id.clone()).or_insert(0) += 1;
+        ServeGuard { map, id }
+    }
+}
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap();
+        if let Some(c) = m.get_mut(&self.id) {
+            *c -= 1;
+            if *c == 0 {
+                m.remove(&self.id);
+            }
+        }
+    }
+}
+
 /// Read a §3.3 clipboard-blob stream into memory and land it on the OS
 /// clipboard. The header has already been parsed and confirmed to carry
 /// `DeliveryTarget::Clipboard{…}`. Auth-token verification mirrors the file
@@ -154,19 +218,48 @@ async fn handle_incoming_clipboard_blob_stream(
                 return;
             }
         };
-        // History entry carries the full text (consistent with small text).
-        let payload_event = crate::protocol::ClipboardPayload {
-            id: header.id.clone(),
-            text: text.clone(),
-            files: None,
-            blob: None,
-            formats: None,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            sender: format!("{}", addr),
-            sender_id: String::new(),
+        // Stage for re-call, then emit a light preview (record_and_emit reads
+        // the staged file via local_clipboard_blobs to build the Disk entry).
+        let staged = stage_received_clipboard_blob(
+            &app, &state, &header.id, &mime_type, None, None, text.as_bytes(),
+        );
+        let payload_event = if staged.is_some() {
+            // Descriptor → record_and_emit reads the staged file for the snippet.
+            crate::protocol::ClipboardPayload {
+                id: header.id.clone(),
+                text: String::new(),
+                files: None,
+                blob: Some(crate::protocol::ClipboardBlob::descriptor(
+                    mime_type.clone(),
+                    header.id.clone(),
+                    text.len() as u64,
+                    None,
+                    None,
+                )),
+                formats: None,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                sender: format!("{}", addr),
+                sender_id: String::new(),
+            }
+        } else {
+            // Staging failed — inline the full text so the item stays
+            // re-callable (record_and_emit records it as StoredContent::Text).
+            crate::protocol::ClipboardPayload {
+                id: header.id.clone(),
+                text: text.clone(),
+                files: None,
+                blob: None,
+                formats: None,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                sender: format!("{}", addr),
+                sender_id: String::new(),
+            }
         };
         if auto_recv {
             crate::clipboard::set_clipboard(&app, text);
@@ -174,7 +267,7 @@ async fn handle_incoming_clipboard_blob_stream(
             let mut pending = state.pending_clipboard.lock().unwrap();
             *pending = Some(payload_event.clone());
         }
-        let _ = app.emit("clipboard-change", &payload_event);
+        crate::clipboard::common::record_and_emit(&app, &state, "clipboard-change", &payload_event);
         if notifications.data_received {
             send_notification(
                 &app,
@@ -184,21 +277,48 @@ async fn handle_incoming_clipboard_blob_stream(
             );
         }
     } else {
-        // Reconstruct a ClipboardBlob and drive it onto the OS clipboard via the
-        // same `set_clipboard_image` that the inline path uses.
+        let staged = stage_received_clipboard_blob(
+            &app, &state, &header.id, &mime_type, width, height, &accum,
+        );
+        // Land the image on the OS clipboard (or stash as pending).
         let blob = crate::protocol::ClipboardBlob::from_bytes(mime_type.clone(), &accum, width, height);
-        let payload_event = crate::protocol::ClipboardPayload {
-            id: header.id.clone(),
-            text: String::new(),
-            files: None,
-            blob: Some(blob.clone()),
-            formats: None,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            sender: format!("{}", addr),
-            sender_id: String::new(),
+        let payload_event = if staged.is_some() {
+            // Descriptor payload → record_and_emit builds a Disk entry +
+            // thumbnail from the staged file.
+            crate::protocol::ClipboardPayload {
+                id: header.id.clone(),
+                text: String::new(),
+                files: None,
+                blob: Some(crate::protocol::ClipboardBlob::descriptor(
+                    mime_type.clone(),
+                    header.id.clone(),
+                    accum.len() as u64,
+                    width,
+                    height,
+                )),
+                formats: None,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                sender: format!("{}", addr),
+                sender_id: String::new(),
+            }
+        } else {
+            // Staging failed — fall back to inline so History still shows it.
+            crate::protocol::ClipboardPayload {
+                id: header.id.clone(),
+                text: String::new(),
+                files: None,
+                blob: Some(blob.clone()),
+                formats: None,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                sender: format!("{}", addr),
+                sender_id: String::new(),
+            }
         };
         if auto_recv {
             crate::clipboard::set_clipboard_image(&app, blob);
@@ -206,7 +326,7 @@ async fn handle_incoming_clipboard_blob_stream(
             let mut pending = state.pending_clipboard.lock().unwrap();
             *pending = Some(payload_event.clone());
         }
-        let _ = app.emit("clipboard-change", &payload_event);
+        crate::clipboard::common::record_and_emit(&app, &state, "clipboard-change", &payload_event);
         if notifications.data_received {
             send_notification(
                 &app,
@@ -505,7 +625,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                             if let Some(files) = &payload.files {
                                 if !files.is_empty() {
                                     tracing::info!("Received File Metadata from {}: {} files", sender, files.len());
-                                    let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                    crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-change", &payload_obj);
 
                                     // Auto-Download Logic
                                     let (auto_recv, enable_ft, size_limit, notify_large) = {
@@ -610,7 +730,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                             let mut pending = listener_state.pending_clipboard.lock().unwrap();
                                             *pending = Some(payload_obj.clone());
                                         }
-                                        let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-pending", &payload_obj);
 
                                         // Notification is the primary cue that an
                                         // accept is waiting — gate on
@@ -642,7 +762,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                             let mut pending = listener_state.pending_clipboard.lock().unwrap();
                                             *pending = Some(payload_obj.clone());
                                         }
-                                        let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-pending", &payload_obj);
 
                                         let notify_large = listener_state.settings.lock().unwrap().notify_large_files;
                                         if notify_large {
@@ -673,7 +793,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                             *slot = Some(id.clone());
                                         }
 
-                                        let _ = listener_handle.emit("clipboard-blob-fetching", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-blob-fetching", &payload_obj);
 
                                         let notifications = listener_state.settings.lock().unwrap().notifications.clone();
                                         if notifications.data_received {
@@ -720,14 +840,14 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                     let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
                                     if auto_receiver {
                                         crate::clipboard::set_clipboard_image(&listener_handle, blob);
-                                        let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-change", &payload_obj);
                                     } else {
                                         tracing::info!("[Clipboard] Auto-receive OFF. Storing pending blob from {}", sender);
                                         {
                                             let mut pending = listener_state.pending_clipboard.lock().unwrap();
                                             *pending = Some(payload_obj.clone());
                                         }
-                                        let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-pending", &payload_obj);
                                     }
 
                                     let notifications = listener_state.settings.lock().unwrap().notifications.clone();
@@ -807,10 +927,10 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                             *stash = Some(payload_obj.clone());
                                         }
                                         crate::clipboard::set_clipboard(&listener_handle, text.clone());
-                                        let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-change", &payload_obj);
                                     } else {
                                         crate::clipboard::set_clipboard_rich(&listener_handle, text.clone(), formats);
-                                        let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                        crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-change", &payload_obj);
                                     }
                                 } else {
                                     tracing::info!("[Clipboard] Auto-receive OFF. Storing pending rich clipboard from {}", sender);
@@ -818,7 +938,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                         let mut pending = listener_state.pending_clipboard.lock().unwrap();
                                         *pending = Some(payload_obj.clone());
                                     }
-                                    let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                    crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-pending", &payload_obj);
                                 }
 
                                 if needs_promotion_dance {
@@ -871,7 +991,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                 let auto_receiver = { listener_state.settings.lock().unwrap().auto_receive };
                                 if auto_receiver {
                                     crate::clipboard::set_clipboard(&listener_handle, text.clone());
-                                    let _ = listener_handle.emit("clipboard-change", &payload_obj);
+                                    crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-change", &payload_obj);
                                 } else {
                                     // Manual Mode
                                     tracing::info!("[Clipboard] Auto-receive OFF. Storing pending clipboard from {}", sender);
@@ -879,7 +999,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                         let mut pending = listener_state.pending_clipboard.lock().unwrap();
                                         *pending = Some(payload_obj.clone());
                                     }
-                                    let _ = listener_handle.emit("clipboard-pending", &payload_obj);
+                                    crate::clipboard::common::record_and_emit(&listener_handle, &listener_state, "clipboard-pending", &payload_obj);
                                 }
 
                                 let notifications = listener_state.settings.lock().unwrap().notifications.clone();
@@ -1110,7 +1230,12 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                       let height = meta.height;
                                       let req_id = req.id.clone();
                                       let req_file_index = req.file_index;
+                                      let serve_guard = ServeGuard::new(
+                                          listener_state.serving_clipboard_blobs.clone(),
+                                          req_id.clone(),
+                                      );
                                       tauri::async_runtime::spawn(async move {
+                                          let _serve_guard = serve_guard;
                                           let mut file = match File::open(&file_path).await {
                                               Ok(f) => f,
                                               Err(e) => {

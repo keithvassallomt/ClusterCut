@@ -7,6 +7,9 @@ import type { HistoryItem } from "../types";
 import { timeAgo, formatBytes } from "../lib/format";
 import { shortRichLabel } from "../lib/protocol";
 
+// Stateless; one instance reused for all rows rather than allocating per render.
+const utf8 = new TextEncoder();
+
 export function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; onClearHistory: () => void }) {
   const [myHostname, setMyHostname] = useState<string>("");
   const [progress, setProgress] = useState<Record<string, { transferred: number, total: number }>>({});
@@ -48,21 +51,21 @@ export function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; o
     };
   }, []);
 
-  const handleSend = async (text: string) => {
+  const handleSend = async (id: string) => {
     try {
-      await invoke("send_clipboard", { text });
-      // Note: The backend will emit `clipboard-change` which updates list
+      await invoke("recall_send_history_item", { id });
     } catch (e) {
       console.error("Failed to send:", e);
       alert("Failed to send: " + e);
     }
   };
 
-  const handleLocalCopy = async (text: string) => {
+  const handleLocalCopy = async (id: string) => {
     try {
-      await invoke("set_local_clipboard", { text });
+      await invoke("recall_copy_history_item", { id });
     } catch (e) {
-      console.error("Failed to set local clipboard:", e);
+      console.error("Failed to copy:", e);
+      alert("Failed to copy: " + e);
     }
   };
 
@@ -154,12 +157,15 @@ export function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; o
                       )}
                     </div>
                     {it.text && <div className="mt-2 line-clamp-3 whitespace-pre-wrap text-sm text-zinc-900 dark:text-zinc-50">{it.text}</div>}
+                    {it.text && it.text_len > utf8.encode(it.text).byteLength && (
+                      <div className="mt-1 text-[11px] text-zinc-500">Large text • {formatBytes(it.text_len)}</div>
+                    )}
 
                     {it.blob && (
                       <div className="mt-2 flex flex-col gap-1 rounded-lg bg-zinc-50 p-2 dark:bg-zinc-800">
-                        {it.blob.object_url ? (
+                        {it.blob.thumbnail ? (
                           <img
-                            src={it.blob.object_url}
+                            src={it.blob.thumbnail}
                             alt="Clipboard image"
                             className="max-h-48 max-w-full rounded-md object-contain"
                           />
@@ -169,7 +175,7 @@ export function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; o
                           </div>
                         )}
                         <div className="text-[11px] text-zinc-500">
-                          {it.blob.descriptor ? "Large image (not yet fetched)" : "Image"}
+                          {it.blob.descriptor && !it.blob.thumbnail ? "Large image (not yet fetched)" : "Image"}
                           {it.blob.width && it.blob.height ? ` • ${it.blob.width}×${it.blob.height}` : ""}
                           {` • ${formatBytes(it.blob.size)}`}
                         </div>
@@ -207,9 +213,13 @@ export function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; o
                   </div>
 
                   <div className="flex items-center justify-end gap-2">
-                    {it.text && it.text.length > 0 && (
-                      <IconButton label="Copy to Clipboard" onClick={() => handleLocalCopy(it.text)}>
-                        <Copy className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />
+                    {(it.text || it.blob) && (
+                      <IconButton
+                        label={it.has_backing ? "Copy to Clipboard" : "Content no longer available"}
+                        onClick={() => it.has_backing && handleLocalCopy(it.id)}
+                        disabled={!it.has_backing}
+                      >
+                        <Copy className={`h-4 w-4 ${it.has_backing ? "text-zinc-600 dark:text-zinc-300" : "text-zinc-300 dark:text-zinc-600"}`} />
                       </IconButton>
                     )}
 
@@ -227,9 +237,15 @@ export function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; o
                       </>
                     )}
 
-                    <IconButton label="Send to Cluster" onClick={() => handleSend(it.text)}>
-                      <Send className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-                    </IconButton>
+                    {(it.text || it.blob) && (
+                      <IconButton
+                        label={it.has_backing ? "Send to Cluster" : "Content no longer available"}
+                        onClick={() => it.has_backing && handleSend(it.id)}
+                        disabled={!it.has_backing}
+                      >
+                        <Send className={`h-4 w-4 ${it.has_backing ? "text-emerald-600 dark:text-emerald-400" : "text-emerald-600/30 dark:text-emerald-400/30"}`} />
+                      </IconButton>
+                    )}
 
                     <IconButton label="Delete Everywhere" onClick={() => handleDelete(it.id)}>
                       <Trash2 className="h-4 w-4 text-rose-600 dark:text-rose-400" />

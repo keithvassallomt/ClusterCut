@@ -85,9 +85,9 @@ export function ManualSyncModal({
                 <>
                   {remoteContent.blob ? (
                     <div className="flex items-start gap-3 font-sans">
-                      {remoteContent.blob.object_url ? (
+                      {remoteContent.blob.thumbnail ? (
                         <img
-                          src={remoteContent.blob.object_url}
+                          src={remoteContent.blob.thumbnail}
                           alt="Pending image"
                           className="max-h-24 max-w-[40%] rounded object-contain"
                         />

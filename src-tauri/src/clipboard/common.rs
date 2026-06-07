@@ -1,3 +1,7 @@
+use crate::clipboard::history_store::{Evicted, StoredContent};
+use crate::clipboard::preview::{
+    descriptor_preview, formats_preview, make_thumbnail, preview_parts, ClipboardPreview,
+};
 use crate::protocol::{ClipboardBlob, ClipboardFormat, ClipboardPayload, FileMetadata, Message};
 use crate::state::{AppState, ClipboardBlobMetadata};
 use crate::transport::Transport;
@@ -546,7 +550,7 @@ pub fn should_process_content(
 /// Picked from MIME so the file is visually meaningful if it leaks past the
 /// startup `clear_cache` (which it shouldn't — but if it does, having the
 /// right extension makes manual cleanup easier).
-fn extension_for_clipboard_mime(mime: &str) -> &'static str {
+pub fn extension_for_clipboard_mime(mime: &str) -> &'static str {
     match mime {
         "image/png" => "png",
         "image/jpeg" => "jpg",
@@ -979,6 +983,150 @@ pub fn process_clipboard_change(
     }
 }
 
+/// Derive the re-callable `StoredContent` (and an optional base64 thumbnail)
+/// for a payload about to be emitted to the frontend. Returns `None` when the
+/// payload has no re-callable backing: a files-only payload, or a descriptor
+/// whose bytes aren't staged locally (receiver pending pre-fetch).
+pub fn stored_content_for_payload(
+    state: &AppState,
+    payload: &ClipboardPayload,
+) -> Option<(StoredContent, Option<String>)> {
+    if let Some(blob) = payload.blob.as_ref() {
+        if blob.is_descriptor() {
+            // Bytes live on disk in local_clipboard_blobs (sender) — point at
+            // the staged file. If it isn't staged here, there's no backing.
+            let meta = {
+                let map = state.local_clipboard_blobs.lock().unwrap();
+                map.get(&payload.id).cloned()
+            }?;
+            let thumb = if meta.mime_type.starts_with("image/") {
+                std::fs::read(&meta.path).ok().and_then(|b| make_thumbnail(&b))
+            } else {
+                None
+            };
+            return Some((
+                StoredContent::Disk {
+                    mime: meta.mime_type,
+                    path: meta.path,
+                    width: meta.width,
+                    height: meta.height,
+                    size: meta.total_size,
+                },
+                thumb,
+            ));
+        }
+        // Inline image.
+        let bytes = blob.raw_bytes().ok()?;
+        let thumb = make_thumbnail(&bytes);
+        return Some((
+            StoredContent::Image {
+                mime: blob.mime_type.clone(),
+                bytes,
+                width: blob.width,
+                height: blob.height,
+            },
+            thumb,
+        ));
+    }
+    if let Some(formats) = payload.formats.as_ref().filter(|f| !f.is_empty()) {
+        return Some((
+            StoredContent::Rich {
+                text: payload.text.clone(),
+                formats: formats.clone(),
+            },
+            None,
+        ));
+    }
+    if !payload.text.is_empty() {
+        return Some((StoredContent::Text(payload.text.clone()), None));
+    }
+    None
+}
+
+/// For a large-text Disk entry, read up to TEXT_PREVIEW_BYTES from the staged
+/// file so History can still show a snippet.
+fn disk_text_prefix(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; crate::clipboard::preview::TEXT_PREVIEW_BYTES];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+    // A trailing byte split mid-char becomes U+FFFD via lossy decode — fine
+    // for a snippet (the full text is re-read from the file on re-call).
+    Some(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// Apply the side effects of an eviction: delete the disk file (unless an
+/// in-flight fetch still needs it), drop the local_clipboard_blobs entry, and
+/// tell the UI the item's backing is gone.
+pub(crate) fn handle_evictions(app: &AppHandle, state: &AppState, evicted: Vec<Evicted>) {
+    for e in evicted {
+        {
+            let mut map = state.local_clipboard_blobs.lock().unwrap();
+            map.remove(&e.id);
+        }
+        if let Some(path) = e.disk_path {
+            let in_flight = {
+                let slot = state.in_flight_clipboard_fetch.lock().unwrap();
+                slot.as_deref() == Some(e.id.as_str())
+            };
+            let being_served = {
+                let m = state.serving_clipboard_blobs.lock().unwrap();
+                m.contains_key(&e.id)
+            };
+            if !in_flight && !being_served {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        let _ = app.emit("history-backing-evicted", &e.id);
+    }
+}
+
+/// Persist a payload's content into the History store and emit a light
+/// `ClipboardPreview` on `event` (replacing the old full-payload emit).
+pub fn record_and_emit(
+    app: &AppHandle,
+    state: &AppState,
+    event: &str,
+    payload: &ClipboardPayload,
+) {
+    let mut evicted = Vec::new();
+    let (text_preview, text_len, blob, has_backing) =
+        match stored_content_for_payload(state, payload) {
+            Some((content, thumb)) => {
+                let (mut tp, tl, bp) = preview_parts(&content, thumb);
+                // Large-text Disk entry: fill the snippet from the staged file.
+                if tp.is_none() && bp.is_none() {
+                    if let StoredContent::Disk { path, .. } = &content {
+                        tp = disk_text_prefix(path);
+                    }
+                }
+                evicted = state.history_store.lock().unwrap().insert(payload.id.clone(), content);
+                (tp, tl, bp, true)
+            }
+            None => {
+                let (tp, tl, bp) = descriptor_preview(payload);
+                (tp, tl, bp, false)
+            }
+        };
+
+    handle_evictions(app, state, evicted);
+
+    let preview = ClipboardPreview {
+        id: payload.id.clone(),
+        sender: payload.sender.clone(),
+        sender_id: payload.sender_id.clone(),
+        timestamp: payload.timestamp,
+        text_preview,
+        text_len,
+        blob,
+        formats: formats_preview(payload),
+        files: payload.files.clone(),
+        has_backing,
+    };
+    let _ = app.emit(event, &preview);
+}
+
 pub fn broadcast_clipboard(
     app_handle: &AppHandle,
     state: &AppState,
@@ -988,11 +1136,11 @@ pub fn broadcast_clipboard(
     let auto_send = { state.settings.lock().unwrap().auto_send };
     if !auto_send {
         tracing::debug!("Auto-send disabled. Emitting monitor update only.");
-        let _ = app_handle.emit("clipboard-monitor-update", &payload_obj);
+        record_and_emit(app_handle, state, "clipboard-monitor-update", &payload_obj);
         return;
     }
 
-    let _ = app_handle.emit("clipboard-change", &payload_obj);
+    record_and_emit(app_handle, state, "clipboard-change", &payload_obj);
 
     // Send the typed payload directly. mTLS provides confidentiality
     // and sender authenticity; no app-layer encryption needed since

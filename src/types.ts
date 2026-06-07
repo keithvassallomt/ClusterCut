@@ -43,14 +43,10 @@ export type ClipboardBlobPreview = {
   width?: number;
   height?: number;
   size: number;        // byte length, for "12 KB" display
-  // Set on inline blobs that we decoded ourselves; absent for §3.3 descriptor
-  // blobs whose bytes haven't been fetched yet (no thumbnail to show until the
-  // user accepts and the file-transfer ALPN delivers the bytes).
-  object_url?: string;
-  // §3.3 descriptor — when true, `size` is the *total* expected size and
-  // `object_url` is undefined. The user must accept (via the sync modal) to
-  // trigger the file-transfer fetch; bytes then land on the OS clipboard
-  // directly without a UI thumbnail.
+  // base64 PNG thumbnail from the backend (small). Absent for a not-yet-fetched
+  // descriptor (no bytes available until the user accepts the transfer).
+  thumbnail?: string;
+  // §3.3 descriptor — bytes haven't been fetched yet; no thumbnail.
   descriptor?: boolean;
 };
 
@@ -70,11 +66,13 @@ export type HistoryItem = {
   origin: "local" | "remote";
   device: string; // The sender's hostname
   ts: number; // Unix timestamp in seconds
-  text: string;
+  text: string;        // truncated preview (≤4 KB), NOT the full content
+  text_len: number;    // true byte length of the full text
   files?: { name: string; size: number; }[];
   blob?: ClipboardBlobPreview;
   formats?: ClipboardFormatPreview[];
   sender_id?: string;
+  has_backing: boolean; // re-call possible (content still retained)
 };
 
 export interface NotificationSettings {
@@ -100,4 +98,5 @@ export interface AppSettings {
   pairing_debug_logs: boolean;
   configure_firewall: boolean;
   mdns_advertising: boolean;
+  history_store_max_bytes: number; // bytes; History content store budget
 }
