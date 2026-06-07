@@ -9,13 +9,45 @@ use super::{dbus_clipboard, set_backend, ClipboardBackend};
 use crate::state::AppState;
 use crate::transport::Transport;
 use std::sync::Arc;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tokio::sync::Notify;
 
 const EXTENSION_UUID: &str = "clustercut@keithvassallo.com";
 const SHELL_EXT_NAME: &str = "org.gnome.Shell.Extensions";
 const SHELL_EXT_PATH: &str = "/org/gnome/Shell/Extensions";
 const SHELL_EXT_IFACE: &str = "org.gnome.Shell.Extensions";
+
+// Persisted marker: present whenever we've told the user that clipboard sync is
+// currently unavailable (extension missing/disabled). The "extension is active"
+// notification fires ONLY as a recovery from that announced-down state, then
+// clears the marker — so it shows once after an install/re-login/re-enable and
+// NOT on every launch (cold start often starts Degraded before the extension's
+// D-Bus is ready, then promotes — which must stay silent).
+fn announced_down_marker(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|d| d.join("extension_sync_announced_down"))
+}
+
+fn mark_announced_down(app: &AppHandle) {
+    if let Some(p) = announced_down_marker(app) {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&p, b"1");
+    }
+}
+
+fn was_announced_down(app: &AppHandle) -> bool {
+    announced_down_marker(app).map(|p| p.exists()).unwrap_or(false)
+}
+
+fn clear_announced_down(app: &AppHandle) {
+    if let Some(p) = announced_down_marker(app) {
+        let _ = std::fs::remove_file(p);
+    }
+}
 
 pub fn start(app_handle: AppHandle, state: AppState, transport: Transport) {
     tauri::async_runtime::spawn(async move {
@@ -96,6 +128,9 @@ pub fn start(app_handle: AppHandle, state: AppState, transport: Transport) {
                 "history",
                 crate::NotificationPayload::None,
             );
+            // Remember we told the user sync is down, so the eventual
+            // "now active" recovery notification fires exactly once.
+            mark_announced_down(&app_handle);
         }
 
         loop {
@@ -152,15 +187,22 @@ async fn reconcile(
                 state.clone(),
                 transport.clone(),
             ));
-            crate::send_notification(
-                app_handle,
-                "Clipboard sync ready",
-                "The ClusterCut GNOME extension is active — clipboard sync is now running.",
-                false,
-                None,
-                "history",
-                crate::NotificationPayload::None,
-            );
+            // Only confirm "now active" if we'd previously announced sync was
+            // down (install/re-login/re-enable). A plain cold-start promotion
+            // from the early-detect race stays silent and must not re-notify
+            // on every launch.
+            if was_announced_down(app_handle) {
+                crate::send_notification(
+                    app_handle,
+                    "Clipboard sync ready",
+                    "The ClusterCut GNOME extension is active — clipboard sync is now running.",
+                    false,
+                    None,
+                    "history",
+                    crate::NotificationPayload::None,
+                );
+                clear_announced_down(app_handle);
+            }
         }
         (ClipboardBackend::GnomeExtension, false) => {
             tracing::warn!(
@@ -180,6 +222,8 @@ async fn reconcile(
                 "history",
                 crate::NotificationPayload::None,
             );
+            // We've announced sync is down — arm the one-shot recovery notice.
+            mark_announced_down(app_handle);
         }
         _ => {
             // No transition needed.

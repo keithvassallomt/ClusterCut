@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - History view no longer stalls on large clipboard items: the UI receives a light preview (truncated text or a thumbnail) while full content stays in a budgeted backend store (200 MB default, configurable under Settings → General). Copy/Send re-call large items by id. Thanks to @mdunphy for the report.
 
 ### Fixed
+- The GNOME "clipboard sync is now active" notification no longer reappears on every launch. It now fires once as a recovery after the extension was missing/disabled, instead of on each cold-start backend promotion.
 - A Windows peer could crash (heap corruption) when receiving a large text payload immediately followed by rich/HTML content. Rich-text and SVG clipboard writes now go through the same single worker thread as plain text and images, instead of opening the Windows clipboard from a second thread. Thanks to @mdunphy for the report.
 
 ## [0.3.5] — 2026-06-06
