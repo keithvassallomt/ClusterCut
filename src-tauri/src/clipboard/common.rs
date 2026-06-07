@@ -1051,7 +1051,8 @@ fn disk_text_prefix(path: &std::path::Path) -> Option<String> {
     let mut buf = vec![0u8; crate::clipboard::preview::TEXT_PREVIEW_BYTES];
     let n = f.read(&mut buf).ok()?;
     buf.truncate(n);
-    // Drop a possibly-split trailing char.
+    // A trailing byte split mid-char becomes U+FFFD via lossy decode — fine
+    // for a snippet (the full text is re-read from the file on re-call).
     Some(String::from_utf8_lossy(&buf).to_string())
 }
 
