@@ -64,6 +64,17 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.6" date="2026-06-07">
+      <description>
+        <p>A Windows crash fix, an instant History list for large items, syncing of large blocks of text, and a quieter GNOME notification.</p>
+        <ul>
+          <li>Fixed a crash on Windows that could happen when you copied formatted content — such as text from a web page or document — shortly after copying a large amount of text</li>
+          <li>Your History list now appears instantly even for very large copied items, like big images or large blocks of text, instead of taking 10–20 seconds. You can also choose how much clipboard content History keeps, under Settings → General</li>
+          <li>Large blocks of text (over 10 MB) now sync between your devices and still paste as text on the other side. Text above 100 MB isn't sent, and a note appears in your History instead</li>
+          <li>On GNOME, the "clipboard sync is now active" notification no longer pops up every time you start ClusterCut — it now appears only once, after you install or re-enable the extension</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.5" date="2026-06-06">
       <description>
         <p>A reorganised Settings page, more control on locked-down networks, a live diagnostics view, and tighter handling of your private key and PIN.</p>
