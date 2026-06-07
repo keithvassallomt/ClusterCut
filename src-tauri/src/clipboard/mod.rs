@@ -1,4 +1,5 @@
 pub mod common;
+pub mod history_store;
 mod plugin;
 mod rich;
 
