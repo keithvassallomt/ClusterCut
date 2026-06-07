@@ -97,6 +97,13 @@ pub struct AppState {
     /// bytes still drain off the wire to keep QUIC happy, but they don't
     /// overwrite the OS clipboard once they finish landing. Newest copy wins.
     pub in_flight_clipboard_fetch: Arc<Mutex<Option<String>>>,
+    /// Ids of clipboard blobs currently being streamed to a peer in response
+    /// to a `Message::FileRequest` (sender-serve). History-store eviction skips
+    /// deleting the staged file for any id in this set so an in-flight transfer
+    /// isn't yanked out from under the serve task; the orphaned file is
+    /// reclaimed by the next startup `clear_cache`. Refcounted because the same
+    /// blob can be served to multiple peers concurrently.
+    pub serving_clipboard_blobs: Arc<Mutex<HashMap<String, u32>>>,
     /// Re-callable clipboard content for the History view, keyed by payload
     /// id. Budgeted; see `clipboard::history_store`.
     pub history_store: Arc<Mutex<crate::clipboard::history_store::HistoryStore>>,
@@ -175,6 +182,7 @@ impl AppState {
             local_files: Arc::new(Mutex::new(HashMap::new())),
             local_clipboard_blobs: Arc::new(Mutex::new(HashMap::new())),
             in_flight_clipboard_fetch: Arc::new(Mutex::new(None)),
+            serving_clipboard_blobs: Arc::new(Mutex::new(HashMap::new())),
             history_store: Arc::new(Mutex::new(
                 crate::clipboard::history_store::HistoryStore::new(
                     crate::storage::AppSettings::default().history_store_max_bytes,

@@ -1070,7 +1070,11 @@ pub(crate) fn handle_evictions(app: &AppHandle, state: &AppState, evicted: Vec<E
                 let slot = state.in_flight_clipboard_fetch.lock().unwrap();
                 slot.as_deref() == Some(e.id.as_str())
             };
-            if !in_flight {
+            let being_served = {
+                let m = state.serving_clipboard_blobs.lock().unwrap();
+                m.contains_key(&e.id)
+            };
+            if !in_flight && !being_served {
                 let _ = std::fs::remove_file(&path);
             }
         }

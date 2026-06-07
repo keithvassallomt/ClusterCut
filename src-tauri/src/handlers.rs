@@ -46,6 +46,34 @@ fn stage_received_clipboard_blob(
     Some(path)
 }
 
+/// RAII refcount guard: marks a clipboard-blob id as actively being served to
+/// a peer for the lifetime of the serve task, so History-store eviction won't
+/// delete the staged file mid-transfer. Decrements (and removes at zero) on drop.
+struct ServeGuard {
+    map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    id: String,
+}
+impl ServeGuard {
+    fn new(
+        map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+        id: String,
+    ) -> Self {
+        *map.lock().unwrap().entry(id.clone()).or_insert(0) += 1;
+        ServeGuard { map, id }
+    }
+}
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap();
+        if let Some(c) = m.get_mut(&self.id) {
+            *c -= 1;
+            if *c == 0 {
+                m.remove(&self.id);
+            }
+        }
+    }
+}
+
 /// Read a §3.3 clipboard-blob stream into memory and land it on the OS
 /// clipboard. The header has already been parsed and confirmed to carry
 /// `DeliveryTarget::Clipboard{…}`. Auth-token verification mirrors the file
@@ -1202,7 +1230,12 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                       let height = meta.height;
                                       let req_id = req.id.clone();
                                       let req_file_index = req.file_index;
+                                      let serve_guard = ServeGuard::new(
+                                          listener_state.serving_clipboard_blobs.clone(),
+                                          req_id.clone(),
+                                      );
                                       tauri::async_runtime::spawn(async move {
+                                          let _serve_guard = serve_guard;
                                           let mut file = match File::open(&file_path).await {
                                               Ok(f) => f,
                                               Err(e) => {
