@@ -586,12 +586,9 @@ pub(crate) fn run() {
                 // 4. Load Settings
                 let mut settings_lock = state.settings.lock().unwrap();
                 *settings_lock = load_settings(app_handle);
-                state
-                    .history_store
-                    .lock()
-                    .unwrap()
-                    .set_max_bytes(settings_lock.history_store_max_bytes);
+                let history_cap = settings_lock.history_store_max_bytes;
                 drop(settings_lock); // Unlock to allow registration to access it if needed (though register_shortcuts locks it again)
+                state.history_store.lock().unwrap().set_max_bytes(history_cap);
 
                 // Register Shortcuts on Startup
                 crate::shortcuts::register_shortcuts(app_handle);

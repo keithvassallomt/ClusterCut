@@ -48,11 +48,13 @@ export function GeneralSettings({
             </label>
             <input
               type="number"
-              min={0}
+              min={1}
+              step={1}
               className="h-10 w-40 rounded-xl border border-zinc-900/10 bg-white px-3 text-sm text-zinc-900 outline-none focus:ring-2 focus:ring-emerald-500/40 dark:border-white/10 dark:bg-white/5 dark:text-zinc-50"
               value={Math.round(settings.history_store_max_bytes / (1024 * 1024))}
               onChange={(e) => {
-                const mb = Math.max(0, parseInt(e.target.value || "0", 10));
+                if (e.target.value === "") return;
+                const mb = Math.max(1, parseInt(e.target.value, 10) || 1);
                 setSettings({ ...settings, history_store_max_bytes: mb * 1024 * 1024 });
               }}
             />
