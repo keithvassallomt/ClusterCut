@@ -39,6 +39,12 @@ pub enum StoredContent {
 
 impl StoredContent {
     /// Bytes this entry charges against the budget.
+    ///
+    /// The accounting is intentionally approximate: for `Rich`, it counts
+    /// `ClipboardFormat.data` directly — which is already base64-encoded for
+    /// binary formats, so the byte count is the wire size, not the raw size.
+    /// Small fixed overhead (e.g. `mime_type` strings) is ignored; with the
+    /// 200 MB default cap a few hundred extra bytes per entry are immaterial.
     pub fn size(&self) -> u64 {
         match self {
             StoredContent::Text(s) => s.len() as u64,
@@ -63,6 +69,9 @@ impl StoredContent {
 #[derive(Debug, Clone)]
 pub struct StoredEntry {
     pub content: StoredContent,
+    /// Byte count cached at insert time (computed from `content.size()`).
+    /// Because the API is append-only (insert replaces, never mutates in
+    /// place), this never diverges from the live content.
     pub size: u64,
 }
 
