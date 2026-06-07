@@ -192,27 +192,46 @@ async fn handle_incoming_clipboard_blob_stream(
         };
         // Stage for re-call, then emit a light preview (record_and_emit reads
         // the staged file via local_clipboard_blobs to build the Disk entry).
-        let _ = stage_received_clipboard_blob(
+        let staged = stage_received_clipboard_blob(
             &app, &state, &header.id, &mime_type, None, None, text.as_bytes(),
         );
-        let payload_event = crate::protocol::ClipboardPayload {
-            id: header.id.clone(),
-            text: String::new(),
-            files: None,
-            blob: Some(crate::protocol::ClipboardBlob::descriptor(
-                mime_type.clone(),
-                header.id.clone(),
-                text.len() as u64,
-                None,
-                None,
-            )),
-            formats: None,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            sender: format!("{}", addr),
-            sender_id: String::new(),
+        let payload_event = if staged.is_some() {
+            // Descriptor → record_and_emit reads the staged file for the snippet.
+            crate::protocol::ClipboardPayload {
+                id: header.id.clone(),
+                text: String::new(),
+                files: None,
+                blob: Some(crate::protocol::ClipboardBlob::descriptor(
+                    mime_type.clone(),
+                    header.id.clone(),
+                    text.len() as u64,
+                    None,
+                    None,
+                )),
+                formats: None,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                sender: format!("{}", addr),
+                sender_id: String::new(),
+            }
+        } else {
+            // Staging failed — inline the full text so the item stays
+            // re-callable (record_and_emit records it as StoredContent::Text).
+            crate::protocol::ClipboardPayload {
+                id: header.id.clone(),
+                text: text.clone(),
+                files: None,
+                blob: None,
+                formats: None,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                sender: format!("{}", addr),
+                sender_id: String::new(),
+            }
         };
         if auto_recv {
             crate::clipboard::set_clipboard(&app, text);
