@@ -1099,6 +1099,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
              if let Some(meta) = clipboard_blob_meta {
                                       let file_path = meta.path.clone();
                                       let mime_type = meta.mime_type.clone();
+                                      let is_text = mime_type.starts_with("text/");
                                       let width = meta.width;
                                       let height = meta.height;
                                       let req_id = req.id.clone();
@@ -1131,7 +1132,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                                       file_index: req_file_index,
                                                       file_name,
                                                       file_size,
-                                                      compressed: false, // never compress already-compressed image bytes
+                                                      compressed: is_text,
                                                       delivery_target: crate::protocol::DeliveryTarget::Clipboard {
                                                           mime_type,
                                                           width,
@@ -1151,26 +1152,58 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                                                   let mut buf = vec![0u8; 1024 * 1024];
                                                   let start_time = std::time::Instant::now();
                                                   let mut chunks_sent = 0;
-                                                  loop {
-                                                      match file.read(&mut buf).await {
-                                                          Ok(0) => break,
-                                                          Ok(n) => {
-                                                              if let Err(e) = stream.write_all(&buf[0..n]).await {
-                                                                  tracing::error!("Clipboard-blob stream write error: {}", e);
-                                                                  break;
+                                                  if is_text {
+                                                      tracing::info!("[Sender] Starting ZSTD clipboard-blob loop. File size: {}", file_size);
+                                                      let mut encoder = async_compression::tokio::write::ZstdEncoder::with_quality(
+                                                          stream,
+                                                          async_compression::Level::Precise(crate::compression::ZSTD_LEVEL),
+                                                      );
+                                                      loop {
+                                                          match file.read(&mut buf).await {
+                                                              Ok(0) => break,
+                                                              Ok(n) => {
+                                                                  if let Err(e) = encoder.write_all(&buf[0..n]).await {
+                                                                      tracing::error!("Clipboard-blob compressed stream write error: {}", e);
+                                                                      break;
+                                                                  }
+                                                                  chunks_sent += 1;
                                                               }
-                                                              chunks_sent += 1;
+                                                              Err(e) => { tracing::error!("Clipboard-blob file read error: {}", e); break; }
                                                           }
-                                                          Err(e) => { tracing::error!("Clipboard-blob file read error: {}", e); break; }
                                                       }
+                                                      if let Err(e) = encoder.shutdown().await {
+                                                          tracing::error!("Clipboard-blob encoder shutdown error: {}", e);
+                                                      }
+                                                      let mut stream = encoder.into_inner();
+                                                      let total_time = start_time.elapsed();
+                                                      tracing::info!(
+                                                          "[Sender] Clipboard-blob ZSTD loop finished in {:?}. Chunks: {}",
+                                                          total_time, chunks_sent
+                                                      );
+                                                      let _ = stream.finish();
+                                                      drop(stream);
+                                                  } else {
+                                                      loop {
+                                                          match file.read(&mut buf).await {
+                                                              Ok(0) => break,
+                                                              Ok(n) => {
+                                                                  if let Err(e) = stream.write_all(&buf[0..n]).await {
+                                                                      tracing::error!("Clipboard-blob stream write error: {}", e);
+                                                                      break;
+                                                                  }
+                                                                  chunks_sent += 1;
+                                                              }
+                                                              Err(e) => { tracing::error!("Clipboard-blob file read error: {}", e); break; }
+                                                          }
+                                                      }
+                                                      let total_time = start_time.elapsed();
+                                                      tracing::info!(
+                                                          "[Sender] Clipboard-blob stream finished in {:?}. Chunks: {}",
+                                                          total_time, chunks_sent
+                                                      );
+                                                      let _ = stream.finish();
+                                                      drop(stream);
                                                   }
-                                                  let total_time = start_time.elapsed();
-                                                  tracing::info!(
-                                                      "[Sender] Clipboard-blob stream finished in {:?}. Chunks: {}",
-                                                      total_time, chunks_sent
-                                                  );
-                                                  let _ = stream.finish();
-                                                  drop(stream);
                                                   let _ = tokio::time::timeout(
                                                       std::time::Duration::from_secs(300),
                                                       _connection.closed(),
