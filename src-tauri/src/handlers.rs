@@ -35,9 +35,14 @@ async fn handle_incoming_clipboard_blob_stream(
     // No app-layer auth token to verify — the QUIC connection itself is
     // mTLS-pinned to the sending peer (see issue #9 follow-up).
     //
-    // Drain the stream into memory. Cap defensively at MAX_CLIPBOARD_IMAGE_BYTES
-    // so a malformed sender can't OOM the receiver.
-    let cap = crate::clipboard::common::MAX_CLIPBOARD_IMAGE_BYTES;
+    // Drain the stream into memory. Cap is MIME-dependent:
+    // text/* → MAX_CLIPBOARD_TEXT_BYTES, everything else → MAX_CLIPBOARD_IMAGE_BYTES.
+    // Enforced defensively so a malformed sender can't OOM the receiver.
+    let cap = if mime_type.starts_with("text/") {
+        crate::clipboard::common::MAX_CLIPBOARD_TEXT_BYTES
+    } else {
+        crate::clipboard::common::MAX_CLIPBOARD_IMAGE_BYTES
+    };
     let mut accum: Vec<u8> = Vec::with_capacity(header.file_size.min(cap as u64) as usize);
     let mut buf = vec![0u8; 1024 * 1024];
     let mut last_emit = std::time::Instant::now();
@@ -63,7 +68,11 @@ async fn handle_incoming_clipboard_blob_stream(
                 if last_emit.elapsed().as_millis() > 200 {
                     let _ = app.emit("file-progress", serde_json::json!({
                         "id": header.id,
-                        "fileName": format!("Clipboard image ({})", mime_type),
+                        "fileName": if mime_type.starts_with("text/") {
+                            format!("Clipboard text ({})", mime_type)
+                        } else {
+                            format!("Clipboard image ({})", mime_type)
+                        },
                         "total": header.file_size,
                         "transferred": accum.len() as u64,
                     }));
@@ -112,22 +121,58 @@ async fn handle_incoming_clipboard_blob_stream(
         return;
     }
 
-    // Reconstruct a ClipboardBlob and drive it onto the OS clipboard via the
-    // same `set_clipboard_image` that the inline path uses.
-    let blob = crate::protocol::ClipboardBlob::from_bytes(
-        mime_type.clone(),
-        &accum,
-        width,
-        height,
-    );
+    let (auto_recv, notifications) = {
+        let s = state.settings.lock().unwrap();
+        (s.auto_receive, s.notifications.clone())
+    };
+    let byte_len = accum.len();
+    let mb = byte_len as f64 / (1024.0 * 1024.0);
 
-    let auto_recv = { state.settings.lock().unwrap().auto_receive };
-    if auto_recv {
-        crate::clipboard::set_clipboard_image(&app, blob.clone());
+    if mime_type.starts_with("text/") {
+        // Decode strictly; mTLS + the size-match check above make corruption
+        // near-impossible, so on a decode failure we drop rather than paste
+        // mojibake.
+        let text = match String::from_utf8(accum) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Large clipboard text did not decode as UTF-8: {}; dropping.", e);
+                return;
+            }
+        };
+        // History entry carries the full text (consistent with small text).
+        let payload_event = crate::protocol::ClipboardPayload {
+            id: header.id.clone(),
+            text: text.clone(),
+            files: None,
+            blob: None,
+            formats: None,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            sender: format!("{}", addr),
+            sender_id: String::new(),
+        };
+        if auto_recv {
+            crate::clipboard::set_clipboard(&app, text);
+        } else {
+            let mut pending = state.pending_clipboard.lock().unwrap();
+            *pending = Some(payload_event.clone());
+        }
+        let _ = app.emit("clipboard-change", &payload_event);
+        if notifications.data_received {
+            send_notification(
+                &app,
+                "Text Available to Paste",
+                &format!("{:.1} MB of text is now on the clipboard.", mb),
+                false, Some(3), "history", NotificationPayload::None,
+            );
+        }
     } else {
-        // Manual mode — stash the now-fully-fetched blob in pending_clipboard
-        // so the user can confirm via the existing UI.
-        let payload = crate::protocol::ClipboardPayload {
+        // Reconstruct a ClipboardBlob and drive it onto the OS clipboard via the
+        // same `set_clipboard_image` that the inline path uses.
+        let blob = crate::protocol::ClipboardBlob::from_bytes(mime_type.clone(), &accum, width, height);
+        let payload_event = crate::protocol::ClipboardPayload {
             id: header.id.clone(),
             text: String::new(),
             files: None,
@@ -140,39 +185,21 @@ async fn handle_incoming_clipboard_blob_stream(
             sender: format!("{}", addr),
             sender_id: String::new(),
         };
-        let mut pending = state.pending_clipboard.lock().unwrap();
-        *pending = Some(payload);
-    }
-
-    // Surface to the history view as a normal clipboard-change event (so
-    // the entry shows up in history with a thumbnail / size).
-    let payload_event = crate::protocol::ClipboardPayload {
-        id: header.id.clone(),
-        text: String::new(),
-        files: None,
-        blob: Some(blob),
-        formats: None,
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        sender: format!("{}", addr),
-        sender_id: String::new(),
-    };
-    let _ = app.emit("clipboard-change", &payload_event);
-
-    let notifications = state.settings.lock().unwrap().notifications.clone();
-    if notifications.data_received {
-        let mb = accum.len() as f64 / (1024.0 * 1024.0);
-        send_notification(
-            &app,
-            "Image Available to Paste",
-            &format!("{:.1} MB image is now on the clipboard.", mb),
-            false,
-            Some(3),
-            "history",
-            NotificationPayload::None,
-        );
+        if auto_recv {
+            crate::clipboard::set_clipboard_image(&app, blob);
+        } else {
+            let mut pending = state.pending_clipboard.lock().unwrap();
+            *pending = Some(payload_event.clone());
+        }
+        let _ = app.emit("clipboard-change", &payload_event);
+        if notifications.data_received {
+            send_notification(
+                &app,
+                "Image Available to Paste",
+                &format!("{:.1} MB image is now on the clipboard.", mb),
+                false, Some(3), "history", NotificationPayload::None,
+            );
+        }
     }
 }
 
