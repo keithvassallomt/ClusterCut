@@ -102,6 +102,16 @@ pub fn is_passthrough_image_mime(mime: &str) -> bool {
 ///             non-empty; the text portion still distinguishes two copies
 ///             that happen to carry the same MIME set with different bytes)
 /// - Text:     the text itself (or empty string)
+/// Content-derived fingerprint for a large blob/text descriptor (see
+/// `ClipboardBlob::content_hash`). 128 bits of SHA-256 — ample to avoid
+/// collisions for realistic clipboard content, and cheap relative to the
+/// staging + transfer the descriptor path already performs.
+pub fn content_fingerprint(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest[..16].iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 pub fn payload_signature(payload: &ClipboardPayload) -> String {
     if let Some(files) = payload.files.as_ref() {
         if !files.is_empty() {
@@ -114,13 +124,16 @@ pub fn payload_signature(payload: &ClipboardPayload) -> String {
         }
     }
     if let Some(blob) = payload.blob.as_ref() {
-        // Descriptor mode (§3.3 large blob): `data` is empty and the unique
-        // identifier is the parent payload id, which sender + receiver share
-        // verbatim. Hash that plus mime + total_size so a re-broadcast of
-        // the same descriptor matches and a different one doesn't.
+        // Descriptor mode (§3.3 large blob): `data` is empty. Key the signature
+        // on the content fingerprint when present, so two transfers of
+        // byte-identical content collide (a reflected/re-copied payload is
+        // deduped) even though each carries a fresh random `fetch_id`. Fall
+        // back to `fetch_id` for inline-less descriptors from older peers that
+        // don't send `content_hash`, preserving prior behaviour.
         if let Some(fetch_id) = blob.fetch_id.as_ref() {
             let total = blob.total_size.unwrap_or(0);
-            return format!("BLOBDESC:{}:{}:{}", blob.mime_type, fetch_id, total);
+            let key = blob.content_hash.as_deref().unwrap_or(fetch_id);
+            return format!("BLOBDESC:{}:{}:{}", blob.mime_type, key, total);
         }
         let raw = blob.data.as_bytes();
         let head_len = raw.len().min(16);
@@ -676,28 +689,29 @@ pub fn process_clipboard_change(
                                 "[ClipboardText] Large text ({} bytes) — broadcasting descriptor (id={})",
                                 len, msg_id
                             );
-                            {
-                                let mut last_global = state.last_clipboard_content.lock().unwrap();
-                                if *last_global != text {
-                                    *last_global = text.clone();
-                                }
-                            }
                             let payload_obj = ClipboardPayload {
                                 id: msg_id.clone(),
                                 text: String::new(),
                                 files: None,
-                                blob: Some(ClipboardBlob::descriptor(
-                                    "text/plain",
-                                    msg_id,
-                                    len,
-                                    None,
-                                    None,
-                                )),
+                                blob: Some(
+                                    ClipboardBlob::descriptor("text/plain", msg_id, len, None, None)
+                                        .with_content_hash(content_fingerprint(text.as_bytes())),
+                                ),
                                 formats: None,
                                 timestamp: ts,
                                 sender: hostname,
                                 sender_id: local_id,
                             };
+                            // Store the descriptor's dedup *signature* (not the
+                            // raw text) so a reflected/re-copied large text —
+                            // which always arrives as a descriptor — is caught
+                            // by the inbound dedup. content_hash keeps this
+                            // stable across the fresh fetch_id every send gets.
+                            {
+                                let mut last_global =
+                                    state.last_clipboard_content.lock().unwrap();
+                                *last_global = payload_signature(&payload_obj);
+                            }
                             broadcast_clipboard(app_handle, state, transport, payload_obj);
                         }
                         Err(e) => {
@@ -891,13 +905,16 @@ pub fn process_clipboard_change(
                             id: msg_id.clone(),
                             text: String::new(),
                             files: None,
-                            blob: Some(ClipboardBlob::descriptor(
-                                blob.mime_type.clone(),
-                                msg_id,
-                                raw_bytes.len() as u64,
-                                blob.width,
-                                blob.height,
-                            )),
+                            blob: Some(
+                                ClipboardBlob::descriptor(
+                                    blob.mime_type.clone(),
+                                    msg_id,
+                                    raw_bytes.len() as u64,
+                                    blob.width,
+                                    blob.height,
+                                )
+                                .with_content_hash(content_fingerprint(&raw_bytes)),
+                            ),
                             formats: None,
                             timestamp: ts,
                             sender: hostname,
@@ -1357,6 +1374,7 @@ mod tests {
             height: h,
             fetch_id: None,
             total_size: None,
+            content_hash: None,
         }
     }
 
@@ -1476,6 +1494,50 @@ mod tests {
             sender_id: "d".to_string(),
         };
         assert_ne!(payload_signature(&pa), payload_signature(&pb));
+    }
+
+    fn descriptor_payload(blob: ClipboardBlob) -> ClipboardPayload {
+        ClipboardPayload {
+            id: "ignored-here".to_string(),
+            text: String::new(),
+            files: None,
+            blob: Some(blob),
+            formats: None,
+            timestamp: 0,
+            sender: "h".to_string(),
+            sender_id: "d".to_string(),
+        }
+    }
+
+    #[test]
+    fn descriptor_signature_keys_on_content_hash_not_transfer_id() {
+        // Two descriptors for byte-identical content but different transfer ids
+        // must dedupe as equal — otherwise a re-sent or reflected large payload
+        // gets a fresh fetch_id and escapes the broadcast-dedup safety net
+        // (Michael's #2, Defect 2).
+        let a = descriptor_payload(
+            ClipboardBlob::descriptor("text/plain", "uuid-a", 12_345, None, None)
+                .with_content_hash("c0ffee"),
+        );
+        let b = descriptor_payload(
+            ClipboardBlob::descriptor("text/plain", "uuid-b", 12_345, None, None)
+                .with_content_hash("c0ffee"),
+        );
+        assert_eq!(payload_signature(&a), payload_signature(&b));
+    }
+
+    #[test]
+    fn descriptor_signature_distinguishes_different_content_hashes() {
+        // Same transfer id, different content — must NOT dedupe.
+        let a = descriptor_payload(
+            ClipboardBlob::descriptor("text/plain", "uuid-x", 12_345, None, None)
+                .with_content_hash("aaaa"),
+        );
+        let b = descriptor_payload(
+            ClipboardBlob::descriptor("text/plain", "uuid-x", 12_345, None, None)
+                .with_content_hash("bbbb"),
+        );
+        assert_ne!(payload_signature(&a), payload_signature(&b));
     }
 
     #[test]
