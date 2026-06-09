@@ -53,6 +53,30 @@ try {
     process.exit(1);
 }
 
+// Update Cargo.lock — the clustercut package's own version entry. Cargo.toml
+// and Cargo.lock must agree; otherwise the next `cargo build` rewrites the
+// lockfile and leaves a dirty working tree after every bump.
+try {
+    const cargoLockPath = path.join(rootDir, 'src-tauri', 'Cargo.lock');
+    const cargoLock = fs.readFileSync(cargoLockPath, 'utf-8');
+    const lockRegex = /(\[\[package\]\]\nname = "clustercut"\nversion = ")[^"]*(")/;
+    if (lockRegex.test(cargoLock)) {
+        const updated = cargoLock.replace(lockRegex, `$1${version}$2`);
+        if (updated !== cargoLock) {
+            fs.writeFileSync(cargoLockPath, updated);
+            console.log(`Updated Cargo.lock to ${version}`);
+        } else {
+            console.log(`Cargo.lock already at ${version}`);
+        }
+    } else {
+        console.error('Could not find clustercut package entry in Cargo.lock');
+        process.exit(1);
+    }
+} catch (error) {
+    console.error('Error updating Cargo.lock:', error);
+    process.exit(1);
+}
+
 // Update metainfo.xml
 const metainfoPath = path.join(rootDir, 'src-tauri', 'flatpak', 'app.clustercut.clustercut.metainfo.xml');
 try {

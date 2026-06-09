@@ -64,6 +64,15 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.7" date="2026-06-09">
+      <description>
+        <p>A clipboard reliability fix and a calmer diagnostics log.</p>
+        <ul>
+          <li>Fixed large blocks of text occasionally bouncing back and reappearing on the device you copied from, when you copied something else right afterwards</li>
+          <li>The Diagnostics event log no longer fills up with routine connection messages at the Minimal level — pairing and any real connection problems still show there, and you can switch to Detailed to see everything</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.6" date="2026-06-07">
       <description>
         <p>A Windows crash fix, an instant History list for large items, syncing of large blocks of text, and a quieter GNOME notification.</p>

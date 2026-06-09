@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.7] - 2026-06-09
 
 ### Changed
 - The Diagnostics Event Log no longer shows routine mTLS connect/drop activity at the Minimal level (these fire on every heartbeat, so they were continuous); they are now Detailed. Pairing events and handshake failures still surface at Minimal. Thanks to @mdunphy for the report.
