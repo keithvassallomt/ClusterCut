@@ -1019,15 +1019,7 @@ pub(crate) fn run() {
                     });
                 },
                 move |kind: &str, addr: std::net::SocketAddr, detail: Option<String>| {
-                    let (level, msg) = match kind {
-                        "connect" => (crate::diagnostics::DiagLevel::Minimal, "mTLS connection established".to_string()),
-                        "drop" => (crate::diagnostics::DiagLevel::Minimal, "mTLS connection dropped".to_string()),
-                        "handshake_failed" => (
-                            crate::diagnostics::DiagLevel::Detailed,
-                            format!("mTLS handshake failed: {}", detail.unwrap_or_default()),
-                        ),
-                        _ => (crate::diagnostics::DiagLevel::Detailed, kind.to_string()),
-                    };
+                    let (level, msg) = crate::diagnostics::classify_mtls_event(kind, detail);
                     crate::diagnostics::push_diagnostic(&conn_state, &conn_app, level, "mtls", Some(addr.to_string()), msg);
                 }
             );

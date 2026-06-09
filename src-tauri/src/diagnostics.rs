@@ -27,6 +27,24 @@ pub struct DiagnosticEvent {
     pub message: String,
 }
 
+/// Map a transport-level mTLS event kind to its diagnostics level + display
+/// message. Routine connection churn (`connect`/`drop`) is **Detailed**, not
+/// Minimal: with the per-message connection model these fire on every 5 s
+/// heartbeat and anti-entropy cluster-name push, so surfacing them at Minimal
+/// buried the Event Log in continuous connect/drop scroll. Handshake failures
+/// stay Detailed and meaningful.
+pub fn classify_mtls_event(kind: &str, detail: Option<String>) -> (DiagLevel, String) {
+    match kind {
+        "connect" => (DiagLevel::Detailed, "mTLS connection established".to_string()),
+        "drop" => (DiagLevel::Detailed, "mTLS connection dropped".to_string()),
+        "handshake_failed" => (
+            DiagLevel::Detailed,
+            format!("mTLS handshake failed: {}", detail.unwrap_or_default()),
+        ),
+        other => (DiagLevel::Detailed, other.to_string()),
+    }
+}
+
 /// Push an event into the buffer, evicting the oldest when at capacity. Pure
 /// (no I/O) so it is unit-testable.
 pub(crate) fn push_capped(buf: &mut VecDeque<DiagnosticEvent>, ev: DiagnosticEvent, cap: usize) {
@@ -75,6 +93,28 @@ mod tests {
         assert_eq!(buf.len(), 3);
         assert_eq!(buf.front().unwrap().message, "2"); // 0,1 evicted
         assert_eq!(buf.back().unwrap().message, "4");
+    }
+
+    #[test]
+    fn routine_mtls_connect_drop_are_not_minimal() {
+        // Heartbeat/anti-entropy churn must not surface on the Minimal filter
+        // (the Event Log dropdown shows events with level <= selected level, so
+        // Minimal must be reserved for meaningful events like pairing).
+        assert_eq!(classify_mtls_event("connect", None).0, DiagLevel::Detailed);
+        assert_eq!(classify_mtls_event("drop", None).0, DiagLevel::Detailed);
+    }
+
+    #[test]
+    fn mtls_handshake_failure_stays_detailed_with_reason() {
+        let (level, msg) = classify_mtls_event("handshake_failed", Some("bad cert".into()));
+        assert_eq!(level, DiagLevel::Detailed);
+        assert!(msg.contains("bad cert"), "message should carry the reason: {msg}");
+    }
+
+    #[test]
+    fn mtls_connect_drop_messages_preserved() {
+        assert_eq!(classify_mtls_event("connect", None).1, "mTLS connection established");
+        assert_eq!(classify_mtls_event("drop", None).1, "mTLS connection dropped");
     }
 
     #[test]
