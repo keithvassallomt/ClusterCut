@@ -267,50 +267,99 @@ pub enum ClipboardContent {
     None,
 }
 
-pub static IGNORED_CONTENT: Lazy<Arc<Mutex<ClipboardContent>>> =
-    Lazy::new(|| Arc::new(Mutex::new(ClipboardContent::None)));
-
-/// Wall-clock timestamp of the most recent `IGNORED_CONTENT` set. Combined
-/// with `IGNORED_TTL`, this auto-expires a stale echo guard if the expected
-/// echo never arrives — for example, if our `set_clipboard_image` write
-/// failed silently, or the user copied something different on the local
-/// clipboard before our intended echo could bounce back through the
-/// monitor poll.
+/// Pending self-writes whose clipboard echo we still expect to see (and must
+/// suppress), each tagged with the instant it was armed. This is a small
+/// bounded *list*, not a single slot, and that distinction is the fix for the
+/// large-text dedupe-reflection bug: a receiver can write several payloads in
+/// quick succession (e.g. a large text immediately followed by an HTML
+/// fragment), and a large write's echo is observed late. With a single slot
+/// the second write clobbered the first write's still-pending entry, so the
+/// first echo no longer matched and got reflected back to the sender. Keeping
+/// every recent self-write until its own echo arrives (or the TTL lapses)
+/// removes that race.
 ///
-/// Without this, a stuck IGNORED would generate "variant differs" /
-/// "mime differs" misses on every subsequent clipboard event indefinitely,
-/// each one looping the content back to peers. Observed in the wild after
-/// an SVG paste followed by unrelated copies — the SVG IGNORED stayed
-/// referenced for the entire session.
-pub static IGNORED_SET_AT: Lazy<Arc<Mutex<Option<std::time::Instant>>>> =
-    Lazy::new(|| Arc::new(Mutex::new(None)));
+/// Each entry is consumed by the first read-back it matches, so two identical
+/// writes are suppressed by two echoes.
+static IGNORED_GUARD: Lazy<Arc<Mutex<Vec<(GuardKey, std::time::Instant)>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
-/// How long an IGNORED guard remains valid after being set. Generous enough
+/// Hard cap on retained guard entries so a pathological burst of writes can't
+/// grow the list without bound. Far above the handful of writes that can
+/// realistically be in flight within `IGNORED_TTL`.
+const IGNORED_MAX_ENTRIES: usize = 16;
+
+/// How long a guard entry remains valid after being armed. Generous enough
 /// for the slowest legitimate echo (Windows `arboard::set_image` with full
 /// retry budget can take ~1.6 s; 10 s leaves comfortable headroom on slow
 /// disks / clipboard managers / etc). Shorter than the timescales at which
 /// stale state is likely to drive observable bugs.
 pub const IGNORED_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Set both the IGNORED content and its timestamp atomically. All
-/// `set_clipboard_*_with_ignore` helpers funnel through this so the two
-/// halves can never drift.
-fn set_ignored(content: ClipboardContent) {
-    {
-        let mut ignored = IGNORED_CONTENT.lock().unwrap();
-        *ignored = content;
-    }
-    {
-        let mut at = IGNORED_SET_AT.lock().unwrap();
-        *at = Some(std::time::Instant::now());
+/// Compact, memory-bounded key for one pending self-write. `Text` is reduced
+/// to hash+len so a multi-MB clipboard write doesn't pin its bytes in the
+/// guard; other variants are small (or already size-capped) and are kept whole
+/// so the existing stable-equivalence checks apply unchanged.
+enum GuardKey {
+    Text { hash: u64, len: usize },
+    Other(ClipboardContent),
+}
+
+fn hash_text(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+fn guard_key_of(content: &ClipboardContent) -> Option<GuardKey> {
+    match content {
+        ClipboardContent::None => None,
+        ClipboardContent::Text(s) => Some(GuardKey::Text {
+            hash: hash_text(s),
+            len: s.len(),
+        }),
+        other => Some(GuardKey::Other(other.clone())),
     }
 }
 
-/// Clear the IGNORED guard and its timestamp atomically.
-fn clear_ignored(ignored: &mut ClipboardContent) {
-    *ignored = ClipboardContent::None;
-    let mut at = IGNORED_SET_AT.lock().unwrap();
-    *at = None;
+/// Stable equivalence between a stored non-text self-write and a clipboard
+/// read-back, reusing the per-variant rules (`image_blob_eq_stable`,
+/// `rich_eq_stable`) that tolerate OS round-trip mangling.
+fn stable_eq(stored: &ClipboardContent, current: &ClipboardContent) -> bool {
+    match (stored, current) {
+        (ClipboardContent::Text(a), ClipboardContent::Text(b)) => a == b,
+        (ClipboardContent::Files(a), ClipboardContent::Files(b)) => a == b,
+        (ClipboardContent::Image(a), ClipboardContent::Image(b)) => image_blob_eq_stable(a, b),
+        (
+            ClipboardContent::Rich { text: at, formats: af },
+            ClipboardContent::Rich { text: bt, formats: bf },
+        ) => rich_eq_stable(at, af, bt, bf),
+        _ => false,
+    }
+}
+
+fn guard_key_matches(key: &GuardKey, current: &ClipboardContent) -> bool {
+    match key {
+        GuardKey::Text { hash, len } => {
+            matches!(current, ClipboardContent::Text(s) if s.len() == *len && hash_text(s) == *hash)
+        }
+        GuardKey::Other(stored) => stable_eq(stored, current),
+    }
+}
+
+/// Arm the guard for a self-write. All `set_clipboard_*_with_ignore` helpers
+/// funnel through this. Prunes expired entries and bounds the list length.
+fn set_ignored(content: ClipboardContent) {
+    let Some(key) = guard_key_of(&content) else {
+        return;
+    };
+    let mut guard = IGNORED_GUARD.lock().unwrap();
+    guard.retain(|(_, at)| at.elapsed() <= IGNORED_TTL);
+    guard.push((key, std::time::Instant::now()));
+    let len = guard.len();
+    if len > IGNORED_MAX_ENTRIES {
+        guard.drain(0..len - IGNORED_MAX_ENTRIES);
+    }
 }
 
 /// One-line summary of a `ClipboardContent` for log lines. Keep it compact
@@ -436,113 +485,54 @@ pub fn should_process_content(
         return EchoVerdict::NoChange;
     }
 
-    // Expire stale IGNORED guard before the check. If the timestamp is
-    // older than IGNORED_TTL, the expected echo never bounced — most likely
-    // because the user copied something else locally before the OS clipboard
-    // round-trip completed. Keeping the stale guard would manufacture
-    // spurious "variant differs" misses for every subsequent clipboard
-    // event indefinitely (the bug that surfaced after an SVG paste).
-    {
-        let mut at = IGNORED_SET_AT.lock().unwrap();
-        if let Some(t) = *at {
-            if t.elapsed() > IGNORED_TTL {
-                let mut ignored = IGNORED_CONTENT.lock().unwrap();
-                if !matches!(*ignored, ClipboardContent::None) {
-                    tracing::info!(
-                        "[Echo] IGNORED guard expired after {:?} — clearing stale {} guard",
-                        t.elapsed(),
-                        describe_content(&ignored)
-                    );
-                }
-                *ignored = ClipboardContent::None;
-                *at = None;
-            }
-        }
-    }
+    let mut guard = IGNORED_GUARD.lock().unwrap();
 
-    let mut verdict = EchoVerdict::NoChange;
-    {
-        let mut ignored = IGNORED_CONTENT.lock().unwrap();
-        let ign_desc = describe_content(&ignored);
-        let cur_desc = describe_content(current_content);
-        match &*ignored {
-            ClipboardContent::None => {
-                if current_content != last_content {
-                    verdict = EchoVerdict::Process;
-                }
-            }
-            ClipboardContent::Text(ign_text) => {
-                if let ClipboardContent::Text(curr_text) = current_content {
-                    if curr_text == ign_text {
-                        tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
-                        clear_ignored(&mut ignored);
-                        verdict = EchoVerdict::Echo;
-                    } else if current_content != last_content {
-                        tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=text_differs)", ign_desc, cur_desc);
-                        verdict = EchoVerdict::Process;
-                    }
-                } else if current_content != last_content {
-                    tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Text but current isn't)", ign_desc, cur_desc);
-                    verdict = EchoVerdict::Process;
-                }
-            }
-            ClipboardContent::Files(ign_files) => {
-                if let ClipboardContent::Files(curr_files) = current_content {
-                    if curr_files == ign_files {
-                        tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
-                        clear_ignored(&mut ignored);
-                        verdict = EchoVerdict::Echo;
-                    } else if current_content != last_content {
-                        tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=files_differ)", ign_desc, cur_desc);
-                        verdict = EchoVerdict::Process;
-                    }
-                } else if current_content != last_content {
-                    tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Files but current isn't)", ign_desc, cur_desc);
-                    verdict = EchoVerdict::Process;
-                }
-            }
-            ClipboardContent::Image(ign_blob) => {
-                if let ClipboardContent::Image(curr_blob) = current_content {
-                    if image_blob_eq_stable(curr_blob, ign_blob) {
-                        tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
-                        clear_ignored(&mut ignored);
-                        verdict = EchoVerdict::Echo;
-                    } else if current_content != last_content {
-                        tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=mime_differs)", ign_desc, cur_desc);
-                        verdict = EchoVerdict::Process;
-                    }
-                } else if current_content != last_content {
-                    tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Image but current isn't)", ign_desc, cur_desc);
-                    verdict = EchoVerdict::Process;
-                }
-            }
-            ClipboardContent::Rich {
-                text: ign_text,
-                formats: ign_formats,
-            } => {
-                if let ClipboardContent::Rich { text, formats } = current_content {
-                    if rich_eq_stable(ign_text, ign_formats, text, formats) {
-                        tracing::info!("[Echo] Check: ignored={} current={} -> MATCH (clearing guard)", ign_desc, cur_desc);
-                        clear_ignored(&mut ignored);
-                        verdict = EchoVerdict::Echo;
-                    } else if current_content != last_content {
-                        tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=rich_differs)", ign_desc, cur_desc);
-                        verdict = EchoVerdict::Process;
-                    }
-                } else if current_content != last_content {
-                    tracing::info!("[Echo] Check: ignored={} current={} -> MISS (reason=variant_differs; ignored is Rich but current isn't)", ign_desc, cur_desc);
-                    verdict = EchoVerdict::Process;
-                }
-            }
-        }
-    }
-    if matches!(verdict, EchoVerdict::Process) {
+    // Expire entries whose echo never arrived within the TTL — e.g. a write
+    // that failed silently, or one pre-empted by a local copy before the OS
+    // round-trip completed. Without this a stuck entry could suppress an
+    // unrelated future read.
+    let before = guard.len();
+    guard.retain(|(_, at)| at.elapsed() <= IGNORED_TTL);
+    let expired = before - guard.len();
+    if expired > 0 {
         tracing::info!(
-            "[Echo] Triggering loop-back broadcast — IGNORED check missed; current={}",
-            describe_content(current_content)
+            "[Echo] Expired {} stale IGNORED guard entr{} (TTL {:?})",
+            expired,
+            if expired == 1 { "y" } else { "ies" },
+            IGNORED_TTL,
         );
     }
-    verdict
+
+    // If this read-back matches any pending self-write, it's our own echo.
+    // Consume just that one entry (not the whole list) so other in-flight
+    // self-writes stay guarded — this is what stops a second write from
+    // unmasking an earlier write's still-pending echo.
+    if let Some(idx) = guard
+        .iter()
+        .position(|(key, _)| guard_key_matches(key, current_content))
+    {
+        tracing::info!(
+            "[Echo] Check: current={} -> MATCH (consumed 1 of {} pending self-write{})",
+            describe_content(current_content),
+            guard.len(),
+            if guard.len() == 1 { "" } else { "s" },
+        );
+        guard.remove(idx);
+        return EchoVerdict::Echo;
+    }
+
+    // Not an echo of anything we wrote — new content iff it differs from what
+    // we last saw.
+    if current_content != last_content {
+        tracing::info!(
+            "[Echo] Triggering loop-back broadcast — no IGNORED match ({} pending); current={}",
+            guard.len(),
+            describe_content(current_content)
+        );
+        EchoVerdict::Process
+    } else {
+        EchoVerdict::NoChange
+    }
 }
 
 /// File extension for the §3.3 temp-file written when a large clipboard blob
@@ -1536,6 +1526,134 @@ mod tests {
         let ign = vec![ClipboardFormat::from_text("text/html", "<p>x</p>")];
         let curr = vec![ClipboardFormat::from_text("text/rtf", r"{\rtf1 x}")];
         assert!(!rich_eq_stable("hello", &ign, "", &curr));
+    }
+
+    // ─── Large-text dedupe-reflection (Michael #2) ──────────────────────────
+
+    /// Serializes the tests that mutate the process-global IGNORED guard so the
+    /// default parallel test runner can't let them clobber one another.
+    fn echo_guard_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn verdict_name(v: &EchoVerdict) -> &'static str {
+        match v {
+            EchoVerdict::Process => "Process (reflect/broadcast)",
+            EchoVerdict::Echo => "Echo (suppress)",
+            EchoVerdict::NoChange => "NoChange",
+        }
+    }
+
+    /// Reproduces Michael's large-text dedupe-reflection (#2).
+    ///
+    /// On the receiver, a payload is written to the OS clipboard and the
+    /// one-shot IGNORED guard is armed so the resulting clipboard echo is
+    /// suppressed (not re-broadcast). But a large-text write is slow, so its
+    /// echo is observed late — and if a SECOND payload of a different variant
+    /// (the interleaved HTML in Michael's repro) is written in the meantime,
+    /// it clobbers the single guard slot. When the delayed large-text echo
+    /// finally surfaces it no longer matches the guard, so the receiver
+    /// reflects its OWN write back to the sender.
+    ///
+    /// Size is irrelevant to this logic — on a real device the payload size
+    /// only widens the window before the echo is polled; the guard defect is
+    /// the single-slot clobber, reproduced here deterministically.
+    #[test]
+    fn receiver_does_not_reflect_first_write_when_second_write_clobbers_guard() {
+        let _serial = echo_guard_test_lock();
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        let first_write = ClipboardContent::Text("received large text".to_string());
+        let clobber = ClipboardContent::Rich {
+            text: "frag".to_string(),
+            formats: vec![ClipboardFormat::from_text("text/html", "<p>frag</p>")],
+        };
+        // What the receiver last saw before this pair of writes; the first
+        // write is "new" relative to it, so absent echo-suppression it
+        // broadcasts.
+        let previously_seen = ClipboardContent::Text("older content".to_string());
+
+        // Receiver writes the first payload (arming the guard), then the second
+        // payload lands before the first write's clipboard echo is polled.
+        set_ignored(first_write.clone());
+        set_ignored(clobber);
+
+        // The delayed echo of the first write finally surfaces.
+        let verdict = should_process_content(&first_write, &previously_seen);
+
+        // Reset the global guard before asserting so a failure can't leak state
+        // into another test.
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        assert!(
+            matches!(verdict, EchoVerdict::Echo),
+            "receiver reflected its own write back to the sender \
+             (verdict = {}); the single-slot IGNORED guard was clobbered by the \
+             second write and could no longer recognise the first write's echo",
+            verdict_name(&verdict),
+        );
+    }
+
+    /// Companion to the clobber case: when two self-writes are pending and
+    /// their echoes arrive in the *other* order (the second write's echo
+    /// first), both must still be suppressed. The old single-slot guard
+    /// cleared on the first echo and then reflected the second — the
+    /// orphaned-echo half of the same bug (matches the startup Files loop-back
+    /// seen in the wild).
+    #[test]
+    fn both_self_writes_suppressed_regardless_of_echo_order() {
+        let _serial = echo_guard_test_lock();
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        let text = ClipboardContent::Text("payload one".to_string());
+        let rich = ClipboardContent::Rich {
+            text: "two".to_string(),
+            formats: vec![ClipboardFormat::from_text("text/html", "<p>two</p>")],
+        };
+        let previously_seen = ClipboardContent::Text("older content".to_string());
+
+        set_ignored(text.clone());
+        set_ignored(rich.clone());
+
+        // Echoes surface in reverse order: the rich write's echo first.
+        let v_rich = should_process_content(&rich, &previously_seen);
+        let v_text = should_process_content(&text, &previously_seen);
+
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        assert!(
+            matches!(v_rich, EchoVerdict::Echo),
+            "rich self-write echo not suppressed (verdict = {})",
+            verdict_name(&v_rich),
+        );
+        assert!(
+            matches!(v_text, EchoVerdict::Echo),
+            "text self-write reflected after the rich echo consumed the slot \
+             (verdict = {})",
+            verdict_name(&v_text),
+        );
+    }
+
+    /// The guard must not over-suppress: a genuine new copy the user made
+    /// (never written by us) is still broadcast.
+    #[test]
+    fn genuinely_new_content_is_still_broadcast() {
+        let _serial = echo_guard_test_lock();
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        let verdict = should_process_content(
+            &ClipboardContent::Text("a fresh user copy".to_string()),
+            &ClipboardContent::Text("older content".to_string()),
+        );
+
+        IGNORED_GUARD.lock().unwrap().clear();
+
+        assert!(
+            matches!(verdict, EchoVerdict::Process),
+            "new user content should broadcast, not be swallowed (verdict = {})",
+            verdict_name(&verdict),
+        );
     }
 }
 
