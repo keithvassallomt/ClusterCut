@@ -41,6 +41,13 @@ pub struct ClipboardBlob {
     /// decide auto-fetch vs. user-confirm against `max_auto_download_size`.
     #[serde(default)]
     pub total_size: Option<u64>,
+    /// Content-derived fingerprint of the eventual bytes, set on descriptors so
+    /// the broadcast-dedup signature is stable across re-sends: a reflected or
+    /// re-copied identical payload collides on this instead of getting a fresh
+    /// random `fetch_id`. `None` on inline blobs and from pre-this-version peers
+    /// (dedup then falls back to `fetch_id`, i.e. prior behaviour).
+    #[serde(default)]
+    pub content_hash: Option<String>,
 }
 
 impl ClipboardBlob {
@@ -59,6 +66,7 @@ impl ClipboardBlob {
             height,
             fetch_id: None,
             total_size: None,
+            content_hash: None,
         }
     }
 
@@ -80,7 +88,15 @@ impl ClipboardBlob {
             height,
             fetch_id: Some(fetch_id.into()),
             total_size: Some(total_size),
+            content_hash: None,
         }
+    }
+
+    /// Attach a content-derived fingerprint (see `content_hash`). Builder-style
+    /// so descriptor call sites can set it inline.
+    pub fn with_content_hash(mut self, hash: impl Into<String>) -> Self {
+        self.content_hash = Some(hash.into());
+        self
     }
 
     /// True if this blob is a descriptor (no inline bytes; receiver must
