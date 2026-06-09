@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The Diagnostics Event Log no longer shows routine mTLS connect/drop activity at the Minimal level (these fire on every heartbeat, so they were continuous); they are now Detailed. Pairing events and handshake failures still surface at Minimal. Thanks to @mdunphy for the report.
+
 ### Fixed
 - Large text could occasionally be reflected back to the sender when another copy followed it quickly. The echo guard tracked only the most recent self-write, so a follow-up copy unmasked the previous one's pending echo; it now tracks all recent self-writes. Large-payload dedup also keyed on a per-transfer id rather than content, so a reflected copy escaped it — dedup identity is now content-stable. Thanks to @mdunphy for the report.
 
