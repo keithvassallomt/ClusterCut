@@ -187,11 +187,20 @@ pub(crate) async fn leave_network(
 ) -> Result<(), String> {
     let local_id = state.local_device_id.lock().unwrap().clone();
 
-    // 1. Broadcast "Self-Removal" to Network
+    // 1. Broadcast "Self-Removal" to the network and WAIT for it to go out
+    //    BEFORE wiping local state. `send_message` resolves each peer's pinned
+    //    fingerprint from `known_peers` at send time, and the factory reset in
+    //    step 2 clears `known_peers`. If we only spawn-and-forget here (as we
+    //    used to), the reset races — and usually beats — the sends: they fail
+    //    with "no pinned fingerprint" and peers never learn we left, so they
+    //    keep us pinned in their cluster (stale "My Cluster" entry that even
+    //    survives their restart, plus re-probe ghosts). Awaiting keeps the
+    //    fingerprints alive until the announcements are on the wire.
     let removal_msg = Message::PeerRemoval(local_id.clone());
     let data = serde_json::to_vec(&removal_msg).unwrap_or_default();
 
     let peers_snapshot = state.get_peers();
+    let mut sends = Vec::new();
     for (id, p) in peers_snapshot.iter() {
          if *id == local_id { continue; }
 
@@ -199,12 +208,18 @@ pub(crate) async fn leave_network(
          let transport_clone = (*transport).clone();
          let data_vec = data.clone();
 
-         tauri::async_runtime::spawn(async move {
+         sends.push(async move {
              let _ = transport_clone.send_message(addr, &data_vec).await;
          });
     }
+    // Bounded so an unreachable peer can't hang the leave; best-effort past it.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        futures::future::join_all(sends),
+    )
+    .await;
 
-    // 2. Perform Factory Reset Locally
+    // 2. Perform Factory Reset Locally (announcements are already out).
     let port = transport.local_addr().map(|a| a.port()).unwrap_or(0);
     perform_factory_reset(&app_handle, &state, port);
 
@@ -218,16 +233,22 @@ pub(crate) async fn delete_peer(
     transport: State<'_, Transport>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    // 0. Broadcast Removal (Kick) to Network
+    // 0. Broadcast Removal (Kick) to Network and WAIT before mutating
+    //    known_peers below. The kick must reach the target itself so it
+    //    factory-resets — but the target's send needs its own pinned
+    //    fingerprint, which step 1 removes. Spawning-and-forgetting raced that
+    //    removal and could drop the notification to the very device being
+    //    kicked. Awaiting keeps every fingerprint alive until the kicks are out.
     let removal_msg = Message::PeerRemoval(peer_id.clone());
     let data = serde_json::to_vec(&removal_msg).unwrap_or_default();
 
-    // We can allow gossip_peer or manual iteration.
-    // Manual iteration is safer to ensure it hits everyone including the target.
+    // Manual iteration (rather than gossip) so it hits everyone incl. the target.
+    let local_id = state.local_device_id.lock().unwrap().clone();
     let peers_snapshot = state.get_peers();
+    let mut sends = Vec::new();
     for (id, p) in peers_snapshot.iter() {
          // Don't gossip to self (obv)
-         if *id == state.local_device_id.lock().unwrap().clone() {
+         if *id == local_id {
              continue;
          }
 
@@ -235,10 +256,15 @@ pub(crate) async fn delete_peer(
          let transport_clone = (*transport).clone();
          let data_vec = data.clone();
 
-         tauri::async_runtime::spawn(async move {
+         sends.push(async move {
              let _ = transport_clone.send_message(addr, &data_vec).await;
          });
     }
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        futures::future::join_all(sends),
+    )
+    .await;
 
     // 1. Remove from Known Peers
     {
