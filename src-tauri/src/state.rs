@@ -245,16 +245,30 @@ impl AppState {
         self.shutdown.load(Ordering::SeqCst)
     }
 
-    /// Look up the pinned cert fingerprint for the peer at `addr`, used by
-    /// the *client* side of QUIC handshakes to verify the responder's cert.
-    /// Returns None for peers not in known_peers or peers without a pinned
-    /// fingerprint (those need to re-pair under the v0.3 strict mTLS model).
-    pub fn fingerprint_for(&self, addr: std::net::SocketAddr) -> Option<Vec<u8>> {
+    /// Look up every pinned cert fingerprint we hold for a peer at `addr`,
+    /// used by the *client* side of QUIC handshakes to verify the responder's
+    /// cert. Returns ALL fingerprints pinned for that IP (deduped), not just
+    /// the first: known_peers can legitimately hold more than one entry per IP
+    /// (a stale `manual-<ip>` placeholder, an old-cert record under a previous
+    /// device_id, a re-provisioned peer) and picking the first HashMap hit
+    /// resolved nondeterministically to a stale fingerprint, failing the
+    /// handshake against a peer whose current cert we *have* pinned. The
+    /// verifier accepts the presented cert if it matches any of these — the
+    /// same "known fingerprint" trust model the server side already uses.
+    /// Empty vec ⇒ no pin for this IP (peer must re-pair under strict mTLS).
+    pub fn fingerprints_for(&self, addr: std::net::SocketAddr) -> Vec<Vec<u8>> {
         let peers = self.known_peers.lock().unwrap();
-        peers
-            .values()
-            .find(|p| p.ip == addr.ip())
-            .and_then(|p| p.fingerprint.clone())
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for p in peers.values() {
+            if p.ip == addr.ip() {
+                if let Some(fp) = &p.fingerprint {
+                    if !out.contains(fp) {
+                        out.push(fp.clone());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// True if `fp` matches the pinned fingerprint of any peer in

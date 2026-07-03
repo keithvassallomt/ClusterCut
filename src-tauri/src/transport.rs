@@ -7,10 +7,13 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Maps a peer's socket address to the SHA-256 fingerprint of the cert we
-/// expect that peer to present. Used by the *client* side to pin the server
-/// cert during handshake.
-pub type FingerprintResolver = Arc<dyn Fn(SocketAddr) -> Option<Vec<u8>> + Send + Sync>;
+/// Maps a peer's socket address to every SHA-256 cert fingerprint we have
+/// pinned for a peer at that IP. Used by the *client* side to pin the server
+/// cert during handshake; the presented cert is accepted if it matches any of
+/// them (known_peers can hold several entries per IP — see
+/// `AppState::fingerprints_for`). An empty vec means we have no pin for the
+/// address and the connection must not proceed.
+pub type FingerprintResolver = Arc<dyn Fn(SocketAddr) -> Vec<Vec<u8>> + Send + Sync>;
 
 /// Predicate over fingerprints: returns true if the given SHA-256 is one of
 /// our paired peers. Used by the *server* side to validate a presented
@@ -74,21 +77,23 @@ impl Transport {
         cert_fingerprint(&self.local_cert_der)
     }
 
-    fn resolve_fingerprint(&self, addr: SocketAddr) -> Option<Vec<u8>> {
+    fn resolve_fingerprint(&self, addr: SocketAddr) -> Vec<Vec<u8>> {
         self.fingerprint_resolver
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|r| r(addr))
+            .map(|r| r(addr))
+            .unwrap_or_default()
     }
 
     fn transport_config_for(&self, addr: SocketAddr) -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
-        let fp = self.resolve_fingerprint(addr).ok_or_else(|| -> Box<dyn Error + Send + Sync> {
-            format!("no pinned fingerprint for {addr}; peer must re-pair").into()
-        })?;
+        let fps = self.resolve_fingerprint(addr);
+        if fps.is_empty() {
+            return Err(format!("no pinned fingerprint for {addr}; peer must re-pair").into());
+        }
         configure_client(
             vec![b"clustercut-transport".to_vec()],
-            fp,
+            fps,
             self.local_cert_der.clone(),
             self.local_key_der.clone(),
         )
@@ -96,12 +101,13 @@ impl Transport {
     }
 
     fn file_config_for(&self, addr: SocketAddr) -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
-        let fp = self.resolve_fingerprint(addr).ok_or_else(|| -> Box<dyn Error + Send + Sync> {
-            format!("no pinned fingerprint for {addr}; peer must re-pair").into()
-        })?;
+        let fps = self.resolve_fingerprint(addr);
+        if fps.is_empty() {
+            return Err(format!("no pinned fingerprint for {addr}; peer must re-pair").into());
+        }
         configure_client(
             vec![b"clustercut-file".to_vec()],
-            fp,
+            fps,
             self.local_cert_der.clone(),
             self.local_key_der.clone(),
         )
@@ -407,9 +413,19 @@ fn signature_algorithms() -> Result<rustls::crypto::WebPkiSupportedAlgorithms, B
 /// check to rustls's WebPKI implementation so the peer is forced to prove
 /// possession of the matching private key — fingerprint match alone is
 /// not enough (see issue #9).
+/// True if `actual` matches any fingerprint in `expected`. The client verifier
+/// accepts a server cert whose fingerprint we have pinned for the target IP
+/// under *any* known_peers entry, so a stale duplicate same-IP record can't
+/// shadow the peer's current, correctly-pinned cert.
+fn fingerprint_in_set(actual: &[u8], expected: &[Vec<u8>]) -> bool {
+    expected.iter().any(|e| e.as_slice() == actual)
+}
+
 #[derive(Debug)]
 struct PinnedFingerprintServerVerifier {
-    expected: Vec<u8>,
+    /// Every cert fingerprint we have pinned for the target IP. Non-empty by
+    /// construction (`transport_config_for` errors on an empty set).
+    expected: Vec<Vec<u8>>,
     algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
@@ -423,10 +439,16 @@ impl rustls::client::danger::ServerCertVerifier for PinnedFingerprintServerVerif
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let actual = cert_fingerprint(end_entity.as_ref());
-        if actual.as_slice() != self.expected.as_slice() {
+        if !fingerprint_in_set(&actual, &self.expected) {
+            let expected_list = self
+                .expected
+                .iter()
+                .map(|e| hex_short(e))
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(rustls::Error::General(format!(
-                "server cert fingerprint mismatch: expected {}, got {}",
-                hex_short(&self.expected),
+                "server cert fingerprint mismatch: expected one of [{}], got {}",
+                expected_list,
                 hex_short(&actual)
             )));
         }
@@ -529,13 +551,13 @@ impl rustls::server::danger::ClientCertVerifier for KnownFingerprintsClientVerif
 
 fn configure_client(
     alpn_protocols: Vec<Vec<u8>>,
-    pinned_fingerprint: Vec<u8>,
+    pinned_fingerprints: Vec<Vec<u8>>,
     local_cert_der: Vec<u8>,
     local_key_der: Vec<u8>,
 ) -> Result<ClientConfig, Box<dyn Error>> {
     let algorithms = signature_algorithms()?;
     let verifier = Arc::new(PinnedFingerprintServerVerifier {
-        expected: pinned_fingerprint,
+        expected: pinned_fingerprints,
         algorithms,
     });
 
@@ -705,4 +727,30 @@ where
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::fingerprint_in_set;
+
+    #[test]
+    fn accepts_when_actual_matches_any_pinned() {
+        let stale = vec![0xa0, 0x25, 0x77, 0xe8];
+        let current = vec![0xcd, 0xc6, 0xe7, 0x75];
+        let pinned = vec![stale.clone(), current.clone()];
+        // The peer presents its current cert; it is accepted even though a
+        // stale same-IP fingerprint is also pinned (the bug: first-match could
+        // pick the stale one and reject a legitimate current cert).
+        assert!(fingerprint_in_set(&current, &pinned));
+        assert!(fingerprint_in_set(&stale, &pinned));
+    }
+
+    #[test]
+    fn rejects_unknown_and_empty() {
+        let pinned = vec![vec![0x01, 0x02, 0x03]];
+        assert!(!fingerprint_in_set(&[0xde, 0xad, 0xbe, 0xef], &pinned));
+        // No pin at all ⇒ never accepted (caller also errors before reaching
+        // the verifier, but defend here too).
+        assert!(!fingerprint_in_set(&[0x01, 0x02, 0x03], &[]));
+    }
 }

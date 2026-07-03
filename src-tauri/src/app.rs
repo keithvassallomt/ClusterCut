@@ -898,7 +898,7 @@ pub(crate) fn run() {
             {
                 let resolver_state = listener_state.clone();
                 transport.set_fingerprint_resolver(std::sync::Arc::new(move |addr| {
-                    resolver_state.fingerprint_for(addr)
+                    resolver_state.fingerprints_for(addr)
                 }));
             }
             {
