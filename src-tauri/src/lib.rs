@@ -24,7 +24,7 @@ use peer::Peer;
 use state::AppState;
 use storage::{
     establish_network_pin, load_network_name,
-    save_cluster_id,
+    save_cluster_id, save_device_id,
     reset_network_state,
 };
 use tauri::Emitter;
@@ -804,7 +804,25 @@ pub(crate) fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppSt
         crate::storage::save_settings(app_handle, &settings);
     }
 
-    // 3. Re-register mDNS
+    // 2b. Regenerate this device's ID so peers see a genuinely NEW mDNS service
+    // instance. The mDNS instance name is the device_id; when a leaving device
+    // re-registers the *same* instance with only its TXT cluster-name changed,
+    // browsers that already have it cached do NOT re-emit ServiceResolved (and
+    // the goodbye for a same-instance re-register doesn't reliably reach/clear
+    // their cache), so the leaver's new cluster stayed invisible to
+    // already-running peers until they restarted (confirmed via device logs: a
+    // directly-paired peer received no mDNS event at all for the re-register). A
+    // fresh device_id is a brand-new instance every browser resolves cleanly.
+    // Peers were already told to drop the old id via PeerRemoval, and the TLS
+    // cert/fingerprint is unchanged, so this is a clean re-introduction.
+    {
+        let new_device_id = format!("clustercut-{}", rand::random::<u32>());
+        save_device_id(app_handle, &new_device_id);
+        *state.local_device_id.lock().unwrap() = new_device_id.clone();
+        tracing::info!("Regenerated device ID on reset: {}", new_device_id);
+    }
+
+    // 3. Re-register mDNS (under the new device_id → new instance name).
     {
         let local_id = state.local_device_id.lock().unwrap().clone();
         let new_name = state.network_name.lock().unwrap().clone();
