@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Devices in a provisioned cluster now share one PIN as intended. Previously each device kept its own (often auto-generated) PIN, so a device that joined couldn't be paired with using the admin's cluster PIN. A device that joins a provisioned cluster now automatically switches to Provisioned mode and adopts the cluster's shared PIN (which it already entered to pair), so every device converges on the same value. The PIN is not sent over the network — the joiner reuses the one it typed.
 - Fixed a pairing failure ("server cert fingerprint mismatch") that could stop a device from joining when the local peer list held more than one stale entry for the target's IP (e.g. leftover records from earlier test rounds). The mTLS client now accepts the peer's cert if it matches any fingerprint pinned for that address, instead of an arbitrary first match that could be a stale one.
+- Joining a cluster now works with the PIN of any of its online devices. Previously "Join" tried a single, arbitrarily-chosen member, so the correct PIN was rejected unless it happened to belong to that one device. Join now tries the entered PIN against each online member until one accepts it.
 
 ## [0.3.7] - 2026-06-09
 
