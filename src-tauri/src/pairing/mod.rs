@@ -429,6 +429,34 @@ pub(crate) async fn start_pairing(
         };
         runtime_peers.insert(responder_device_id.clone(), pinned.clone());
         kp_lock.insert(responder_device_id.clone(), pinned.clone());
+
+        // Prune superseded records for this IP. A successful pair
+        // authoritatively identifies the device now at `peer_addr`, so any
+        // OTHER stored entry sharing this IP under a different id (a stale
+        // old-device-id record from before the peer re-generated its id, a
+        // `manual-<ip>` placeholder) is dead weight — and previously could
+        // shadow this fresh pin during fingerprint lookup. Restrict to
+        // local-subnet IPs, where each device has a unique address so a
+        // same-IP/different-id entry is unambiguously stale; a NATed remote IP
+        // can legitimately host several distinct peers, so leave those alone.
+        let ip = peer_addr.ip();
+        if crate::net_util::is_in_local_subnet(ip) {
+            let stale: Vec<String> = kp_lock
+                .iter()
+                .filter(|(k, p)| **k != responder_device_id && p.ip == ip)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &stale {
+                kp_lock.remove(k);
+                runtime_peers.remove(k);
+                let _ = app_handle.emit("peer-remove", k);
+                tracing::info!(
+                    "Pruned stale same-IP peer {} at {} (superseded by pairing with {})",
+                    k, ip, responder_device_id
+                );
+            }
+        }
+
         crate::storage::save_known_peers(&app_handle, &kp_lock);
         let _ = app_handle.emit("peer-update", crate::peer::PeerView::from_peer(&pinned));
     }

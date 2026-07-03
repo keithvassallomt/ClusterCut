@@ -710,7 +710,14 @@ export default function App() {
     // still-untrusted members (incompatible ones would just abort with an
     // upgrade prompt). See `multiTryRef` for why per-attempt failures are
     // suppressed.
-    const candidates = (grouped[joinTarget] || []).filter((p) => p.compatible !== false);
+    //
+    // Cap the attempts at 9: each wrong try adds one failed-pairing count to
+    // that member (its lockout trips at 10), so we stay safely under it in a
+    // single round and, on a large cluster, ask the user to try a different
+    // PIN rather than spraying every node.
+    const MAX_JOIN_PROBES = 9;
+    const allCandidates = (grouped[joinTarget] || []).filter((p) => p.compatible !== false);
+    const candidates = allCandidates.slice(0, MAX_JOIN_PROBES);
     if (candidates.length === 0) {
       setJoinError("No online devices found for this cluster right now. Try again in a moment.");
       setJoinBusy(false);
@@ -734,8 +741,11 @@ export default function App() {
     }
 
     if (!joined) {
+      const capped = allCandidates.length > candidates.length;
       setJoinError(
-        "That PIN didn't match any online device in this cluster. Enter the PIN shown on any one device that's already in it."
+        capped
+          ? `That PIN didn't match any of the ${candidates.length} devices we tried. Try the PIN shown on a different device in this cluster.`
+          : "That PIN didn't match any online device in this cluster. Try the PIN shown on a different device in it."
       );
       setJoinBusy(false);
     }

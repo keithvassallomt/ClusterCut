@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Leaving a cluster now reliably removes the departing device from the other members. The "I'm leaving" broadcast was sent as a background task and then immediately raced by the local reset that wiped the very keys needed to send it, so peers usually never got the message and kept the device pinned in their cluster (a stale entry that survived restarts and spawned "Unidentified" re-probe ghosts). The departure is now sent and confirmed before the reset. The same race is fixed for kicking a device.
 - After a device leaves and re-appears under its new cluster name, already-running peers now see the new cluster without needing an app restart. The long-lived mDNS browse caches resolved services and wouldn't re-resolve a device that re-registered under a new cluster, so the new cluster stayed invisible until a restart (which starts a fresh browse). Now, when a peer is seen leaving, the app runs a fresh short-lived mDNS scan (empty cache, like a restart) that picks up the leaver's new cluster and refreshes the rest. A leaving device also takes a fresh device id so it re-appears as a brand-new service, and its mDNS de-registration is flushed before re-registering.
 
+### Changed
+- Device identifiers are now UUIDs, making it effectively impossible for two devices to independently generate the same id (the old 32-bit value could collide, especially on VMs provisioned from a shared template with correlated startup entropy).
+- Pairing now prunes stale local peer records that share the newly-paired device's IP on the local network (old device-ids from before a reset, `manual-<ip>` placeholders), so the peer list doesn't accumulate cruft. Remote/NATed addresses are left alone since they can host several devices.
+- Joining a cluster now tries at most 9 of its online devices; if none accept the PIN it asks you to try the PIN from a different device, keeping well under each device's pairing lockout threshold.
+
 ## [0.3.7] - 2026-06-09
 
 ### Changed

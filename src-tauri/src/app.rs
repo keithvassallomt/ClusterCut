@@ -8,7 +8,6 @@ use tauri::Listener;
 
 use crate::discovery::Discovery;
 use crate::peer::Peer;
-use rand::Rng;
 use crate::state::{AppState, LegacyPeerInfo};
 use crate::storage::{
     load_cluster_id, load_device_id, load_known_peers, load_network_name,
@@ -702,8 +701,12 @@ pub(crate) fn run() {
                 crate::shortcuts::register_shortcuts(app_handle);
                 let mut device_id = load_device_id(app_handle);
                 if device_id.is_empty() {
-                    let run_id: u32 = rand::thread_rng().gen();
-                    device_id = format!("clustercut-{}", run_id);
+                    // UUIDv4 (122 random bits via getrandom) rather than a 32-bit
+                    // value: makes two independently-generated ids colliding
+                    // effectively impossible, including the weak/correlated
+                    // first-boot entropy seen on VMs provisioned from one template.
+                    // Keep the `clustercut-` prefix — legacy-peer detection keys on it.
+                    device_id = format!("clustercut-{}", uuid::Uuid::new_v4());
                     save_device_id(app_handle, &device_id);
                     tracing::info!("Generated new Device ID: {}", device_id);
                 } else {

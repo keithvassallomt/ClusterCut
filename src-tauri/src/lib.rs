@@ -816,7 +816,7 @@ pub(crate) fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppSt
     // Peers were already told to drop the old id via PeerRemoval, and the TLS
     // cert/fingerprint is unchanged, so this is a clean re-introduction.
     {
-        let new_device_id = format!("clustercut-{}", rand::random::<u32>());
+        let new_device_id = format!("clustercut-{}", uuid::Uuid::new_v4());
         save_device_id(app_handle, &new_device_id);
         *state.local_device_id.lock().unwrap() = new_device_id.clone();
         tracing::info!("Regenerated device ID on reset: {}", new_device_id);
