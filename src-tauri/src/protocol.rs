@@ -313,6 +313,14 @@ pub struct ClusterInfo {
     pub network_name_version: u64,
     #[serde(default)]
     pub network_name_origin: String,
+    /// The responder's cluster mode (`"auto"` or `"provisioned"`). A joiner
+    /// uses this to decide whether to converge onto the cluster's shared PIN
+    /// and persist it (provisioned) or keep its own per-device ephemeral PIN
+    /// (auto). `#[serde(default)]` (empty string ⇒ treated as auto) keeps wire
+    /// compat with older responders that predate this field. The PIN itself is
+    /// never carried here — the joiner already typed it to complete SPAKE2.
+    #[serde(default)]
+    pub cluster_mode: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -661,6 +669,7 @@ mod tests {
             network_name: "n".to_string(),
             network_name_version: 0,
             network_name_origin: String::new(),
+            cluster_mode: String::new(),
         };
         let wrapped = Message::ClusterInfo(info);
         let s = serde_json::to_string(&wrapped).unwrap();
@@ -670,6 +679,36 @@ mod tests {
         let legacy = r#"{"Welcome":{"cluster_id":"x","known_peers":[],"network_name":"y","responder_fingerprint":[],"confirm":[]}}"#;
         let parsed: Result<PairingMessage, _> = serde_json::from_str(legacy);
         assert!(parsed.is_err(), "Welcome variant must no longer deserialise on the pairing channel");
+    }
+
+    #[test]
+    fn cluster_info_mode_round_trips_and_defaults_to_empty() {
+        // Provisioned mode survives a Message round-trip so a joiner can learn
+        // the cluster is provisioned.
+        let info = ClusterInfo {
+            cluster_id: "c".to_string(),
+            known_peers: vec![],
+            network_name: "n".to_string(),
+            network_name_version: 0,
+            network_name_origin: String::new(),
+            cluster_mode: "provisioned".to_string(),
+        };
+        let s = serde_json::to_string(&Message::ClusterInfo(info)).unwrap();
+        match serde_json::from_str::<Message>(&s).unwrap() {
+            Message::ClusterInfo(got) => assert_eq!(got.cluster_mode, "provisioned"),
+            other => panic!("expected ClusterInfo, got {:?}", other),
+        }
+
+        // An older responder omits `cluster_mode`; it must default to empty
+        // (⇒ treated as auto, no PIN adoption) rather than fail to parse.
+        let legacy = r#"{"ClusterInfo":{"cluster_id":"c","known_peers":[],"network_name":"n"}}"#;
+        match serde_json::from_str::<Message>(legacy).expect("legacy ClusterInfo must parse") {
+            Message::ClusterInfo(got) => {
+                assert_eq!(got.cluster_mode, "");
+                assert!(!crate::storage::should_adopt_cluster_pin(&got.cluster_mode));
+            }
+            other => panic!("expected ClusterInfo, got {:?}", other),
+        }
     }
 
     #[test]

@@ -514,6 +514,7 @@ pub(crate) async fn start_pairing(
         network_name,
         network_name_version,
         network_name_origin,
+        cluster_mode: responder_cluster_mode,
     } = cluster_info;
     tracing::info!("Joined Network: {} (cluster {})", network_name, cluster_id);
     {
@@ -579,31 +580,49 @@ pub(crate) async fn start_pairing(
         crate::storage::save_known_peers(&app_handle, &kp_lock);
     }
 
-    // Provisioned-mode PIN convergence. In a provisioned cluster every device
-    // shares one PIN, but the join handshake never carried it — so a joiner
-    // kept its own randomly-generated PIN and later devices couldn't pair with
-    // it using the admin's PIN. The joiner already typed the cluster PIN to
-    // complete SPAKE2 above (it IS the responder's == the cluster's PIN), so we
-    // adopt it here without any wire-protocol change. Auto mode keeps per-device
-    // ephemeral PINs and is left untouched.
-    {
-        let cluster_mode = state.settings.lock().unwrap().cluster_mode.clone();
-        if crate::storage::should_adopt_cluster_pin(&cluster_mode) {
-            let changed = {
-                let mut np = state.network_pin.lock().unwrap();
-                if *np != pin {
-                    *np = pin.clone();
-                    true
-                } else {
-                    false
-                }
-            };
-            if changed {
-                crate::storage::save_network_pin(&app_handle, &pin);
-                tracing::info!("Adopted provisioned cluster PIN on join.");
-                // Refresh the UI's displayed PIN (App-level listener re-fetches).
-                let _ = app_handle.emit("network-update", ());
+    // Provisioned-cluster PIN convergence. In a provisioned cluster every
+    // device shares one PIN, but the join handshake never carried it — so a
+    // joiner kept its own (usually auto-generated) PIN and later devices
+    // couldn't pair with it using the admin's PIN. We gate on the *cluster's*
+    // mode (reported by the responder in ClusterInfo), NOT the joiner's local
+    // mode, because a joiner is typically still in auto mode when it pairs in.
+    //
+    // The joiner already typed the cluster PIN to complete SPAKE2 above (it IS
+    // the responder's == the cluster's PIN), so we adopt that value without
+    // putting the PIN on the wire. Adopting also requires flipping the joiner
+    // into provisioned mode: otherwise the next launch's
+    // `establish_network_pin("auto")` would delete the adopted PIN and generate
+    // a fresh ephemeral one, breaking the cluster again on restart.
+    if crate::storage::should_adopt_cluster_pin(&responder_cluster_mode) {
+        let pin_changed = {
+            let mut np = state.network_pin.lock().unwrap();
+            if *np != pin {
+                *np = pin.clone();
+                true
+            } else {
+                false
             }
+        };
+        let settings_snapshot = {
+            let mut s = state.settings.lock().unwrap();
+            let mode_changed = s.cluster_mode != "provisioned";
+            s.cluster_mode = "provisioned".to_string();
+            if mode_changed || pin_changed {
+                Some(s.clone())
+            } else {
+                None
+            }
+        };
+        if pin_changed {
+            crate::storage::save_network_pin(&app_handle, &pin);
+        }
+        if let Some(snapshot) = settings_snapshot {
+            crate::storage::save_settings(&app_handle, &snapshot);
+            tracing::info!("Joined provisioned cluster: adopted shared PIN and switched to provisioned mode.");
+            // Refresh the UI: `network-update` re-fetches the displayed PIN,
+            // `settings-changed` updates the mode toggle in Settings.
+            let _ = app_handle.emit("network-update", ());
+            let _ = app_handle.emit("settings-changed", snapshot);
         }
     }
 

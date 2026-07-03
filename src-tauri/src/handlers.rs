@@ -1492,12 +1492,17 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
             let network_name = listener_state.network_name.lock().unwrap().clone();
             let network_name_version = *listener_state.network_name_version.lock().unwrap();
             let network_name_origin = listener_state.network_name_origin.lock().unwrap().clone();
+            // Tell the joiner whether this cluster is provisioned so it can
+            // converge onto the shared PIN (and persist it) rather than keep
+            // its own per-device one. See ClusterInfo::cluster_mode.
+            let cluster_mode = listener_state.settings.lock().unwrap().cluster_mode.clone();
             let info = crate::protocol::ClusterInfo {
                 cluster_id,
                 known_peers: known_peers_vec,
                 network_name,
                 network_name_version,
                 network_name_origin,
+                cluster_mode,
             };
             tracing::debug!("Replying to ClusterInfoRequest from {}", addr);
             match serde_json::to_vec(&Message::ClusterInfo(info)) {

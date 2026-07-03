@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- Devices in a provisioned cluster now share one PIN as intended. Previously each device kept its own (often auto-generated) PIN, so a device that joined couldn't be paired with using the admin's cluster PIN. A joiner in provisioned mode now adopts the PIN it paired with, so every device converges on the shared value.
+- Devices in a provisioned cluster now share one PIN as intended. Previously each device kept its own (often auto-generated) PIN, so a device that joined couldn't be paired with using the admin's cluster PIN. A device that joins a provisioned cluster now automatically switches to Provisioned mode and adopts the cluster's shared PIN (which it already entered to pair), so every device converges on the same value. The PIN is not sent over the network — the joiner reuses the one it typed.
 
 ## [0.3.7] - 2026-06-09
 
