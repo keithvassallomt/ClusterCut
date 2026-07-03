@@ -579,6 +579,34 @@ pub(crate) async fn start_pairing(
         crate::storage::save_known_peers(&app_handle, &kp_lock);
     }
 
+    // Provisioned-mode PIN convergence. In a provisioned cluster every device
+    // shares one PIN, but the join handshake never carried it — so a joiner
+    // kept its own randomly-generated PIN and later devices couldn't pair with
+    // it using the admin's PIN. The joiner already typed the cluster PIN to
+    // complete SPAKE2 above (it IS the responder's == the cluster's PIN), so we
+    // adopt it here without any wire-protocol change. Auto mode keeps per-device
+    // ephemeral PINs and is left untouched.
+    {
+        let cluster_mode = state.settings.lock().unwrap().cluster_mode.clone();
+        if crate::storage::should_adopt_cluster_pin(&cluster_mode) {
+            let changed = {
+                let mut np = state.network_pin.lock().unwrap();
+                if *np != pin {
+                    *np = pin.clone();
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                crate::storage::save_network_pin(&app_handle, &pin);
+                tracing::info!("Adopted provisioned cluster PIN on join.");
+                // Refresh the UI's displayed PIN (App-level listener re-fetches).
+                let _ = app_handle.emit("network-update", ());
+            }
+        }
+    }
+
     // Signal pairing completion to the UI. Distinct from `peer-update`
     // (which also fires on mDNS rediscovery and would race the PIN dialog).
     let _ = app_handle.emit("pairing-success", &responder_device_id);

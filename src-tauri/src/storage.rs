@@ -425,6 +425,15 @@ pub(crate) fn pin_should_persist(mode: &str) -> bool {
     mode == "provisioned"
 }
 
+/// Whether a device joining a cluster should adopt the PIN it just paired with
+/// as its own `network_pin`. Only provisioned clusters share a single PIN: the
+/// joiner already typed the responder's (== the cluster's) PIN to complete
+/// SPAKE2, so adopting it makes every device converge onto the admin's common
+/// PIN. Auto clusters keep per-device ephemeral PINs, so they never adopt.
+pub(crate) fn should_adopt_cluster_pin(mode: &str) -> bool {
+    mode == "provisioned"
+}
+
 /// Establish this device's pairing PIN for the given cluster mode.
 ///
 /// Provisioned mode persists the PIN (a user-set, memorable value must survive
@@ -690,7 +699,7 @@ mod settings_tests {
 
 #[cfg(test)]
 mod pin_tests {
-    use super::{generate_pin, pin_should_persist};
+    use super::{generate_pin, pin_should_persist, should_adopt_cluster_pin};
 
     #[test]
     fn generate_pin_is_six_lowercase_alnum() {
@@ -708,5 +717,14 @@ mod pin_tests {
         assert!(pin_should_persist("provisioned"));
         assert!(!pin_should_persist("auto"));
         assert!(!pin_should_persist("something-else"));
+    }
+
+    #[test]
+    fn only_provisioned_adopts_cluster_pin_on_join() {
+        // A joiner only converges onto the cluster's shared PIN when it is in
+        // provisioned mode. Auto mode keeps its per-device ephemeral PIN.
+        assert!(should_adopt_cluster_pin("provisioned"));
+        assert!(!should_adopt_cluster_pin("auto"));
+        assert!(!should_adopt_cluster_pin("something-else"));
     }
 }

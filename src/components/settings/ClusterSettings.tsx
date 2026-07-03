@@ -75,7 +75,7 @@ export function ClusterSettings({
                 />
                 {provPin.length > 0 && provPin.length < 6 && <span className="text-[10px] text-rose-500">PIN must be at least 6 characters.</span>}
                 <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                  This PIN is local to this device — it's what other devices enter to pair <em>with</em> this one. Each device in a cluster keeps its own PIN; pairing doesn't share it.
+                  Set the same PIN on every device in this provisioned cluster. When a device joins, it adopts the cluster PIN it paired with, so they all converge on this shared value.
                 </span>
               </div>
             </div>
