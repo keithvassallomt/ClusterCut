@@ -64,6 +64,19 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.4.0" date="2026-07-03">
+      <description>
+        <p>Big improvements to joining and leaving clusters, plus shared PINs for provisioned clusters.</p>
+        <ul>
+          <li>Provisioned clusters now share a single PIN. When you set up a cluster with a name and PIN, every device that joins picks up that same PIN automatically — you no longer need to set it separately on each device</li>
+          <li>You can now join a cluster using the PIN of any device already in it, rather than one specific device. Enter any member's PIN and ClusterCut pairs with the right one; if it doesn't match any device that's online, it asks you to try another device's PIN</li>
+          <li>Leaving a cluster is now reliable — the device you leave on disappears from your other devices right away, and removing a device from your cluster works properly too</li>
+          <li>When a device leaves and starts a fresh cluster, that new cluster now appears in your nearby list straight away, without having to restart the app</li>
+          <li>Fixed a problem where a device could sometimes refuse to join because of leftover records from earlier connection attempts — ClusterCut now clears those out automatically so they don't cause trouble later</li>
+          <li>Devices are now identified in a way that rules out two of them ever being mistaken for the same one</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.7" date="2026-06-09">
       <description>
         <p>A clipboard reliability fix and a calmer diagnostics log.</p>
