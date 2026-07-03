@@ -46,12 +46,31 @@ impl Discovery {
         network_name: &str,
         port: u16,
     ) -> Result<(), Box<dyn Error>> {
-        // If already registered, unregister first
+        // If already registered, unregister first — and WAIT for the daemon to
+        // actually send the "goodbye" before re-registering the same instance.
+        //
+        // The mDNS service instance name is the (stable) device_id, and the
+        // cluster name rides in the TXT record ("n"). When a device leaves and
+        // re-registers under a new name, only the TXT changes. If we unregister
+        // and immediately re-register, the two operations race inside the
+        // daemon and the goodbye often never goes out — so browsers that
+        // already had us cached keep the stale record and never re-resolve the
+        // new name (a leaving device's new cluster stays invisible to
+        // already-running peers until they restart the app). Blocking on the
+        // unregister receiver guarantees the removal is on the wire first, so
+        // receivers do a clean remove → re-add and surface the new name. Only
+        // hit on re-registration (rename/leave/netmon), never first startup.
         if let Some(fullname) = &self.registered_service {
             tracing::info!("Unregistering old service: {}", fullname);
-            let _ = self.daemon.unregister(fullname);
-            // Short pause to ensure unregistration propagates locally if needed
-            // std::thread::sleep(std::time::Duration::from_millis(100));
+            match self.daemon.unregister(fullname) {
+                Ok(receiver) => {
+                    // Bounded: don't hang registration if the daemon never
+                    // confirms; the goodbye is normally acknowledged in well
+                    // under this window.
+                    let _ = receiver.recv_timeout(std::time::Duration::from_secs(1));
+                }
+                Err(e) => tracing::warn!("Failed to unregister old service {}: {}", fullname, e),
+            }
         }
 
         // Get the local IP address
