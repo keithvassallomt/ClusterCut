@@ -25,6 +25,7 @@ use state::AppState;
 use storage::{
     establish_network_pin, load_network_name,
     save_cluster_id, save_device_id,
+    save_network_name_origin, save_network_name_version,
     reset_network_state,
 };
 use tauri::Emitter;
@@ -820,6 +821,16 @@ pub(crate) fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppSt
         save_device_id(app_handle, &new_device_id);
         *state.local_device_id.lock().unwrap() = new_device_id.clone();
         tracing::info!("Regenerated device ID on reset: {}", new_device_id);
+
+        // This is a brand-new cluster with a freshly-generated name, so reset
+        // the cluster-name convergence register too: origin = this (new) device,
+        // version = 0. Otherwise it kept the OLD origin (a now-dead device id)
+        // and version from the previous cluster, which could skew name
+        // convergence once the fresh cluster gains peers.
+        *state.network_name_version.lock().unwrap() = 0;
+        *state.network_name_origin.lock().unwrap() = new_device_id.clone();
+        save_network_name_version(app_handle, 0);
+        save_network_name_origin(app_handle, &new_device_id);
     }
 
     // 3. Re-register mDNS (under the new device_id → new instance name).
