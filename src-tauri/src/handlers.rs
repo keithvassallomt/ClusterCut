@@ -1202,6 +1202,14 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                     }
                 }
                 let _ = listener_handle.emit("peer-remove", &target_id);
+
+                // The peer explicitly left. Our long-lived mDNS browse caches
+                // and won't reliably re-resolve it when it re-appears under a
+                // new cluster/identity, so kick off a fresh scan to pick up its
+                // new cluster (and refresh everyone else) without needing an
+                // app restart. Waits a couple seconds first so the leaver has
+                // re-registered before we scan.
+                crate::app::spawn_mdns_rescan(listener_state.clone(), listener_handle.clone());
             }
         }
 

@@ -132,6 +132,114 @@ fn init_logging() -> Args {
 
 const MAX_REMOVAL_RETRIES: u32 = 3;
 
+/// Force a fresh mDNS re-scan after a peer explicitly leaves the cluster.
+///
+/// Our long-lived browse caches resolved services and does NOT reliably
+/// re-emit `ServiceResolved` when a device re-registers under a new
+/// cluster/identity — so a leaver's *new* cluster stayed invisible to
+/// already-running peers until an app restart (which starts a fresh browse).
+/// This reproduces that restart cheaply: a throwaway `ServiceDaemon` begins
+/// with an empty cache, so browsing it resolves the CURRENT advertised state
+/// of every peer (including the leaver's new cluster) and we fold those into
+/// our peer list.
+///
+/// The leaver announces `PeerRemoval` *before* it factory-resets and
+/// re-registers, so we wait a couple of seconds for it to establish its new
+/// cluster before scanning, then keep the browse open long enough to catch the
+/// new announcement. The daemon is dropped when the window closes.
+pub(crate) fn spawn_mdns_rescan(state: AppState, handle: tauri::AppHandle) {
+    // Give the leaver time to finish its reset + re-register before we scan.
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+    // How long to keep the fresh browse open collecting responses.
+    const SCAN_WINDOW: std::time::Duration = std::time::Duration::from_secs(6);
+
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(SETTLE).await;
+
+        let daemon = match mdns_sd::ServiceDaemon::new() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("[Discovery] rescan: failed to start daemon: {}", e);
+                return;
+            }
+        };
+        let receiver = match daemon.browse(crate::discovery::SERVICE_TYPE) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("[Discovery] rescan: failed to browse: {}", e);
+                return;
+            }
+        };
+        let local_id = state.local_device_id.lock().unwrap().clone();
+        tracing::info!("[Discovery] Fresh mDNS rescan started (a peer left).");
+
+        let deadline = tokio::time::Instant::now() + SCAN_WINDOW;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, receiver.recv_async()).await {
+                Ok(Ok(mdns_sd::ServiceEvent::ServiceResolved(info))) => {
+                    let Some(ip_raw) = info.get_addresses().iter().next() else {
+                        continue;
+                    };
+                    let ip: std::net::IpAddr = ip_raw.to_string().parse().unwrap_or(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                    );
+                    let id = info.get_property_val_str("id").unwrap_or("").to_string();
+                    if id.is_empty() || id == local_id {
+                        continue;
+                    }
+                    let network_name = info.get_property_val_str("n").map(|s| s.to_string());
+                    let proto = info.get_property_val_str("proto").map(|s| s.to_string());
+                    let hostname = info
+                        .get_property_val_str("h")
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| info.get_hostname().to_string());
+
+                    let (is_trusted, fingerprint) = {
+                        let kp = state.known_peers.lock().unwrap();
+                        match kp.get(&id) {
+                            Some(p) => (p.fingerprint.is_some(), p.fingerprint.clone()),
+                            None => (false, None),
+                        }
+                    };
+
+                    let peer = crate::peer::Peer {
+                        id: id.clone(),
+                        ip,
+                        port: info.get_port(),
+                        hostname,
+                        last_seen: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        is_trusted,
+                        is_manual: false,
+                        network_name,
+                        signature: None,
+                        fingerprint,
+                        protocol_version: proto,
+                    };
+
+                    // Something we just re-resolved is clearly alive; cancel any
+                    // pending debounced removal so it isn't dropped moments later.
+                    {
+                        state.pending_removals.lock().unwrap().remove(&id);
+                    }
+                    state.add_peer(peer.clone());
+                    let _ = handle.emit("peer-update", crate::peer::PeerView::from_peer(&peer));
+                }
+                Ok(Ok(_)) => {}                 // ignore ServiceRemoved etc. mid-rescan
+                Ok(Err(_)) | Err(_) => break,    // channel closed or window elapsed
+            }
+        }
+        tracing::info!("[Discovery] Fresh mDNS rescan finished.");
+        // `daemon` dropped here → browse stops, socket released.
+    });
+}
+
 async fn removal_debounce_task(
     state: AppState,
     handle: tauri::AppHandle,
