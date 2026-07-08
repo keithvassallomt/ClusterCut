@@ -133,13 +133,19 @@ pub(crate) fn broadcast_cluster_name(
 }
 
 // Helper to probe a specific IP/Port
+/// Probe `ip:port` with a `PeerDiscovery` carrying our own info. Returns
+/// `true` iff the QUIC send succeeded. `notify: false` suppresses all probe
+/// notifications — background probes (anti-entropy, netmon recovery, focus
+/// kicks) would otherwise toast "Connection Failed" for every offline peer
+/// on every pass.
 pub(crate) async fn probe_ip(
     ip: std::net::IpAddr,
     port: u16,
     state: AppState,
     transport: Transport,
     app_handle: tauri::AppHandle,
-) {
+    notify: bool,
+) -> bool {
     let addr = std::net::SocketAddr::new(ip, port);
 
     // Attempt connection loop (simple probe)
@@ -192,7 +198,7 @@ pub(crate) async fn probe_ip(
                     tracing::debug!("Probe to {} SUCCESS (Packet Sent)", addr);
 
                    // NOTIFY SUCCESS (Only if not startup)
-                   if state.should_notify() {
+                   if notify && state.should_notify() {
                        crate::send_notification(&app_handle, "Connection Established", &format!("Successfully contacted {}.", ip), false, None, "devices", crate::NotificationPayload::None);
                    }
 
@@ -225,7 +231,7 @@ pub(crate) async fn probe_ip(
                           let notifications = state.settings.lock().unwrap().notifications.clone();
                           if notifications.device_join {
                              // Check startup timer
-                             if state.should_notify() {
+                             if notify && state.should_notify() {
                                  tracing::info!("[Notification] Triggering 'Device Joined' for manual peer: {}", peer.hostname);
                                  crate::send_notification(&app_handle, "Device Joined", &format!("Found manual peer: {}", peer.hostname), false, Some(1), "devices", crate::NotificationPayload::None);
                              } else {
@@ -236,22 +242,25 @@ pub(crate) async fn probe_ip(
                          // Already exists
                          tracing::debug!("Manual peer {} already exists.", id);
                          // Still notify success to confirm connectivity (if not startup)
-                         if state.should_notify() {
+                         if notify && state.should_notify() {
                              crate::send_notification(&app_handle, "Connection Verified", &format!("Connection to {} is active.", ip), false, None, "devices", crate::NotificationPayload::None);
                          }
                      }
+                     true
                 },
                 Ok(Err(e)) => {
                     tracing::warn!("Probe to {} FAILED (Send Error): {}", addr, e);
-                    if state.should_notify() {
+                    if notify && state.should_notify() {
                         crate::send_notification(&app_handle, "Connection Failed", &format!("Failed to send packet to {}: {}", ip, e), true, None, "devices", crate::NotificationPayload::None);
                     }
+                    false
                 },
                 Err(_) => {
                     tracing::warn!("Probe to {} FAILED (Timeout)", addr);
-                    if state.should_notify() {
+                    if notify && state.should_notify() {
                         crate::send_notification(&app_handle, "Connection Failed", &format!("Connection to {} timed out. Check firewall/VPN.", ip), true, None, "devices", crate::NotificationPayload::None);
                     }
+                    false
                 }
             }
 }

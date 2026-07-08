@@ -120,7 +120,7 @@ pub(crate) async fn add_remote_peer(
     };
 
     if already_paired {
-        net_util::probe_ip(addr, port, (*state).clone(), (*transport).clone(), app_handle).await;
+        net_util::probe_ip(addr, port, (*state).clone(), (*transport).clone(), app_handle, true).await;
         Ok(AddRemoteOutcome::Connected)
     } else {
         Ok(AddRemoteOutcome::NeedsPairing)
@@ -156,7 +156,7 @@ pub(crate) async fn add_manual_peer(
                  }
 
                  tasks.push(tauri::async_runtime::spawn(async move {
-                     net_util::probe_ip(addr, 4654, s, t, a).await; // Fixed Port 4654
+                     net_util::probe_ip(addr, 4654, s, t, a, true).await; // Fixed Port 4654
                  }));
             }
             futures::future::join_all(tasks).await;
@@ -174,7 +174,7 @@ pub(crate) async fn add_manual_peer(
         };
 
         // For single IP, PROBE IT.
-        net_util::probe_ip(addr, port, (*state).clone(), (*transport).clone(), app_handle).await;
+        net_util::probe_ip(addr, port, (*state).clone(), (*transport).clone(), app_handle, true).await;
         Ok(())
     }
 }
@@ -372,7 +372,7 @@ pub(crate) async fn retry_connection(
                  let a = app_handle_clone.clone();
 
                  tauri::async_runtime::spawn(async move {
-                     net_util::probe_ip(peer.ip, peer.port, s, t, a).await;
+                     net_util::probe_ip(peer.ip, peer.port, s, t, a, true).await;
                  });
              }
          } else {

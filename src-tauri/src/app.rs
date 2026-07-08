@@ -800,7 +800,7 @@ pub(crate) fn run() {
 
                              tauri::async_runtime::spawn(async move {
                                  // We use the last known IP/Port
-                                 crate::net_util::probe_ip(peer.ip, peer.port, s, t, a).await;
+                                 crate::net_util::probe_ip(peer.ip, peer.port, s, t, a, true).await;
                              });
                          }
                      }
