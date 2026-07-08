@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - The peer list now self-heals: network changes (e.g. connecting a VPN), suspend/resume, and missed probes recover automatically instead of requiring "Retry Connection" or an app restart. Recovery probes previously used a message that never repopulated the list, and a peer that missed its single 2-second probe window was never probed again.
-- Resuming from standby no longer briefly wipes the peer list, and removing a peer now requires 3 failed probes instead of 1, so transient Wi-Fi hiccups don't make devices vanish and reappear.
+- Resuming from standby no longer briefly wipes the peer list, and removing a peer now requires 3 failed probes instead of 1, so transient Wi-Fi hiccups don't make devices vanish and reappear. Waking on a different network silently clears the old network's list and immediately re-probes, instead of showing unreachable peers as online.
+- Reconnecting to a known device no longer briefly shows a duplicate "Manual (ip)" entry or rewrites the peer store twice per recovery.
 
 ### Added
-- Membership sync: devices that joined the cluster while you were offline now become reachable automatically (previously they required a manual re-pair).
+- Membership sync: devices that joined the cluster while you were offline now become reachable automatically (previously they required a manual re-pair). A device you kicked can't be gossiped back by a member that missed the removal.
+- The peer list is silently refreshed when the window regains focus (at most once per 30s), so bringing the app to the front after connecting a VPN shows the cluster without any clicks.
 
 ## [0.4.0] - 2026-07-03
 
