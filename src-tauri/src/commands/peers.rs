@@ -353,34 +353,13 @@ pub(crate) async fn retry_connection(
     transport: State<'_, Transport>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    // Clone inner values to own them for the async task
-    let state_owned = (*state).clone();
-    let transport_owned = (*transport).clone();
-    let app_handle_clone = app_handle.clone();
-
-    // Re-run the startup probe logic
-    tauri::async_runtime::spawn(async move {
-         let known_peers = {
-             state_owned.known_peers.lock().unwrap().clone()
-         };
-
-         if !known_peers.is_empty() {
-             tracing::info!("Retry Connection: Probing {} known peers...", known_peers.len());
-             for (_id, peer) in known_peers {
-                 let s = state_owned.clone();
-                 let t = transport_owned.clone();
-                 let a = app_handle_clone.clone();
-
-                 tauri::async_runtime::spawn(async move {
-                     net_util::probe_ip(peer.ip, peer.port, s, t, a, true).await;
-                 });
-             }
-         } else {
-             // If no known peers, maybe we should try scanning?
-             // But for now, we only care about reconnecting to knowns.
-             tracing::warn!("Retry Connection: No known peers to probe.");
-         }
-    });
-
+    tracing::info!("Retry Connection: probing absent known peers...");
+    crate::presence::reprobe_known_peers(
+        (*state).clone(),
+        (*transport).clone(),
+        app_handle,
+        true,
+        3,
+    );
     Ok(())
 }

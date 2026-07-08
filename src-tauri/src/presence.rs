@@ -10,6 +10,7 @@
 
 use crate::peer::Peer;
 use crate::state::AppState;
+use crate::transport::Transport;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
@@ -93,6 +94,71 @@ pub(crate) fn peers_needing_probe(
         .filter(|p| !online_ips.contains(&p.ip))
         .cloned()
         .collect()
+}
+
+/// Burst re-probe of every known peer that is absent from the runtime map.
+///
+/// Sends the `PeerDiscovery` probe (`net_util::probe_ip`) — NOT `Ping` —
+/// because only `PeerDiscovery` makes the far side record us and heartbeat
+/// back, which is what actually repopulates both peer lists. Each absent
+/// peer gets up to `attempts` tries (2s, then 4s apart): right after a VPN
+/// or resume the first packets often race route/ARP/firewall setup.
+///
+/// `notify: true` surfaces the final attempt's outcome as notifications
+/// (user-initiated retry); earlier attempts are always silent.
+pub(crate) fn reprobe_known_peers(
+    state: AppState,
+    transport: Transport,
+    app_handle: tauri::AppHandle,
+    notify: bool,
+    attempts: u32,
+) {
+    let targets = {
+        // Lock order: known_peers before peers (matches prune/reset).
+        let kp = state.known_peers.lock().unwrap();
+        let rt = state.peers.lock().unwrap();
+        peers_needing_probe(&kp, &rt)
+    };
+    if targets.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "[Presence] Re-probing {} absent known peer(s) ({} attempt(s) each)",
+        targets.len(),
+        attempts.max(1)
+    );
+    for peer in targets {
+        let s = state.clone();
+        let t = transport.clone();
+        let a = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            let attempts = attempts.max(1);
+            for attempt in 0..attempts {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+                    // The peer may have surfaced meanwhile (e.g. its own
+                    // heartbeat reached us) — stop burning probes on it.
+                    let surfaced = s.peers.lock().unwrap().values().any(|p| p.ip == peer.ip);
+                    if surfaced {
+                        return;
+                    }
+                }
+                let last = attempt + 1 == attempts;
+                if crate::net_util::probe_ip(
+                    peer.ip,
+                    peer.port,
+                    s.clone(),
+                    t.clone(),
+                    a.clone(),
+                    notify && last,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+        });
+    }
 }
 
 #[cfg(test)]

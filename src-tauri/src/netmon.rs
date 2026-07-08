@@ -1,6 +1,4 @@
 use crate::state::AppState;
-use crate::protocol::Message;
-use crate::peer::Peer;
 use std::sync::atomic::Ordering;
 use tauri::Manager;
 
@@ -87,7 +85,7 @@ fn check_ip_changed(state: &AppState) -> bool {
 /// Must be called from an async context with access to AppHandle.
 pub fn start_recovery_tasks(app_handle: &tauri::AppHandle) {
     let state: AppState = (*app_handle.state::<AppState>()).clone();
-    let _handle = app_handle.clone();
+    let handle = app_handle.clone();
 
     tauri::async_runtime::spawn(async move {
         // Re-register mDNS
@@ -109,29 +107,20 @@ pub fn start_recovery_tasks(app_handle: &tauri::AppHandle) {
             }
         }
 
-        // Re-probe all known peers
+        // Re-probe absent known peers with PeerDiscovery bursts. The old code
+        // sent bare `Message::Ping`s here — but Ping/Pong are presence-inert
+        // on both sides, so recovery "succeeded" without ever repopulating
+        // the peer list (the VPN-reconnect bug).
         {
-            let known_peers: Vec<Peer> = {
-                state.known_peers.lock().unwrap().values().cloned().collect()
-            };
             let transport_opt = state.transport.lock().unwrap().clone();
-
             if let Some(transport) = transport_opt {
-                if !known_peers.is_empty() {
-                    tracing::info!("[Netmon] Re-probing {} known peers", known_peers.len());
-                    for peer in known_peers {
-                        let addr = std::net::SocketAddr::new(peer.ip, peer.port);
-                        if let Ok(ping_data) = serde_json::to_vec(&Message::Ping) {
-                            let t = transport.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_secs(3),
-                                    t.send_message(addr, &ping_data),
-                                ).await;
-                            });
-                        }
-                    }
-                }
+                crate::presence::reprobe_known_peers(
+                    state.clone(),
+                    transport,
+                    handle.clone(),
+                    false,
+                    3,
+                );
             }
         }
     });

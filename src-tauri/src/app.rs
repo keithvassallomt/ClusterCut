@@ -785,25 +785,15 @@ pub(crate) fn run() {
                          save_known_peers(&app_handle_clone, &known_peers);
                      }
 
-                     // Clone to vector for iteration (drop lock)
-                     let peers_to_probe: Vec<(String, Peer)> = known_peers.clone().into_iter().collect();
                      drop(known_peers);
 
-                     if !peers_to_probe.is_empty() {
-                         tracing::info!("Startup: Probing {} known peers for reconnection...", peers_to_probe.len());
-                         for (id, peer) in peers_to_probe {
-                             tracing::info!("Startup: Peer {} (Manual: {}) - {}", id, peer.is_manual, peer.ip);
-
-                             let s = state_owned.clone();
-                             let t = transport_clone.clone();
-                             let a = app_handle_clone.clone();
-
-                             tauri::async_runtime::spawn(async move {
-                                 // We use the last known IP/Port
-                                 crate::net_util::probe_ip(peer.ip, peer.port, s, t, a, true).await;
-                             });
-                         }
-                     }
+                     crate::presence::reprobe_known_peers(
+                         state_owned.clone(),
+                         transport_clone.clone(),
+                         app_handle_clone.clone(),
+                         true,
+                         3,
+                     );
                 });
 
                 // 4. Register Discovery. Browsing always runs so we can still
