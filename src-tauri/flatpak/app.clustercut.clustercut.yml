@@ -40,6 +40,6 @@ modules:
     sources:
       - type: git
         url: https://github.com/keithvassallomt/ClusterCut.git
-        tag: v0.4.0
+        tag: v0.4.1
       - cargo-sources.json
       - node-sources.json
