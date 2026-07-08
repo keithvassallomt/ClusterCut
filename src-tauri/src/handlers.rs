@@ -1476,6 +1476,10 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
         }
         Message::Ping => {
             tracing::debug!("Received Ping from {}. Sending Pong.", addr);
+            // An authenticated Ping proves the sender is alive — refresh its
+            // runtime entry so debounced removals/pruning don't fire on a
+            // peer that is actively probing us.
+            crate::presence::touch_peer_by_addr(&listener_state, addr);
             if let Ok(pong_data) = serde_json::to_vec(&Message::Pong) {
                 let _ = transport_inside.send_message(addr, &pong_data).await;
             }
@@ -1607,6 +1611,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
         }
         Message::Pong => {
              tracing::debug!("Received Pong from {}. Connection Verified.", addr);
+             crate::presence::touch_peer_by_addr(&listener_state, addr);
              // Fire deferred join notification if the responding peer was pending
              let peer_id_opt = {
                  let peers = listener_state.peers.lock().unwrap();
