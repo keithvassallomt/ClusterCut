@@ -1266,6 +1266,10 @@ pub(crate) fn run() {
                 }
             });
 
+            // Background Task: Anti-Entropy (self-healing peer list +
+            // membership sync — see presence.rs)
+            crate::presence::spawn_anti_entropy_loop(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -207,6 +207,65 @@ pub(crate) fn reprobe_known_peers(
     }
 }
 
+/// Anti-entropy cadence. 30s bounds how long a missed peer stays invisible
+/// (the old behavior was "forever, until app restart"). Traffic cost per
+/// tick: one 2s QUIC dial per absent peer + one tiny ClusterInfoRequest.
+const ANTI_ENTROPY_PERIOD_SECS: u64 = 30;
+
+/// Periodic self-healing for the peer list. Every tick (while presence is
+/// not paused): re-probe absent known peers (single silent attempt — the
+/// tick period is the retry cadence), then ask one online trusted member
+/// for its known_peers so membership converges (see
+/// `merge_cluster_membership` for why).
+pub(crate) fn spawn_anti_entropy_loop(app_handle: tauri::AppHandle) {
+    use tauri::Manager;
+    let state: AppState = (*app_handle.state::<AppState>()).clone();
+    tauri::async_runtime::spawn(async move {
+        let mut tick: u64 = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(ANTI_ENTROPY_PERIOD_SECS)).await;
+            tick = tick.wrapping_add(1);
+            if presence_paused(&state) {
+                continue;
+            }
+            let transport_opt = state.transport.lock().unwrap().clone();
+            let Some(transport) = transport_opt else { continue };
+
+            reprobe_known_peers(state.clone(), transport.clone(), app_handle.clone(), false, 1);
+
+            // Membership sync — skip while a pairing is waiting on
+            // ClusterInfo, so we can't swallow its T7 reply.
+            if state.pending_cluster_info.lock().unwrap().is_some() {
+                continue;
+            }
+            let mut online: Vec<Peer> = state
+                .peers
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|p| p.is_trusted && !p.id.starts_with("manual-"))
+                .cloned()
+                .collect();
+            if online.is_empty() {
+                continue;
+            }
+            online.sort_by(|a, b| a.id.cmp(&b.id));
+            let target = &online[(tick as usize) % online.len()];
+            let addr = std::net::SocketAddr::new(target.ip, target.port);
+            if let Ok(bytes) = serde_json::to_vec(&crate::protocol::Message::ClusterInfoRequest) {
+                let t = transport.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        t.send_message(addr, &bytes),
+                    )
+                    .await;
+                });
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
