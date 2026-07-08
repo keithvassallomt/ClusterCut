@@ -96,6 +96,52 @@ pub(crate) fn peers_needing_probe(
         .collect()
 }
 
+/// Merge cluster membership from an authenticated `ClusterInfo` snapshot.
+///
+/// Closes the "joined while I was away" hole: pairing-time gossip goes only
+/// to peers online at that instant and never repeats, so a member that
+/// paired in while we were offline is mutually unreachable forever (neither
+/// side has the other's fingerprint pinned) until a manual re-pair.
+///
+/// Conservative by design — inserts only entries that are new to us,
+/// fingerprinted, not ourselves, and not `manual-<ip>` placeholders (those
+/// are the sender's local reachability hints, not members). Existing entries
+/// are never overwritten: direct contact refreshes those. Runtime presence
+/// is untouched; the caller probes imports to surface them. Cluster
+/// name/id/PIN adoption is pairing-only and does NOT happen here.
+///
+/// Returns the imported peers. Caller persists `known_peers` if non-empty.
+pub(crate) fn merge_cluster_membership(
+    state: &AppState,
+    info: &crate::protocol::ClusterInfo,
+) -> Vec<Peer> {
+    let local_id = state.local_device_id.lock().unwrap().clone();
+    let mut kp = state.known_peers.lock().unwrap();
+    let mut imported = Vec::new();
+    for peer in &info.known_peers {
+        if peer.id == local_id {
+            continue;
+        }
+        if peer.id.starts_with("manual-") {
+            continue;
+        }
+        if peer.fingerprint.is_none() {
+            // Unusable under strict mTLS, and importing it would trip the
+            // "needs re-pair" banner for a device we never actually paired.
+            continue;
+        }
+        if kp.contains_key(&peer.id) {
+            continue;
+        }
+        let mut p = peer.clone();
+        p.is_trusted = true; // same transitive trust as PeerDiscovery gossip
+        p.is_manual = false;
+        kp.insert(p.id.clone(), p.clone());
+        imported.push(p);
+    }
+    imported
+}
+
 /// Burst re-probe of every known peer that is absent from the runtime map.
 ///
 /// Sends the `PeerDiscovery` probe (`net_util::probe_ip`) — NOT `Ping` —
@@ -311,6 +357,70 @@ mod tests {
         );
 
         assert!(peers_needing_probe(&known, &runtime).is_empty());
+    }
+
+    // ── merge_cluster_membership ───────────────────────────────────────
+
+    fn cluster_info(peers: Vec<Peer>) -> crate::protocol::ClusterInfo {
+        crate::protocol::ClusterInfo {
+            cluster_id: "cluster-uuid-1".to_string(),
+            known_peers: peers,
+            network_name: "TestNet".to_string(),
+            network_name_version: 0,
+            network_name_origin: String::new(),
+            cluster_mode: "auto".to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_imports_new_fingerprinted_member() {
+        let state = AppState::new();
+        *state.local_device_id.lock().unwrap() = "clustercut-me".to_string();
+        let info = cluster_info(vec![peer("clustercut-new", "192.168.1.20", 4654)]);
+
+        let imported = merge_cluster_membership(&state, &info);
+
+        assert_eq!(imported.len(), 1);
+        let kp = state.known_peers.lock().unwrap();
+        let entry = &kp["clustercut-new"];
+        assert!(entry.is_trusted);
+        assert!(!entry.is_manual);
+        assert_eq!(entry.fingerprint, Some(vec![1, 2, 3]));
+        // Membership import is bookkeeping, not presence: runtime untouched.
+        drop(kp);
+        assert!(state.peers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_skips_self_existing_placeholder_and_unfingerprinted() {
+        let state = AppState::new();
+        *state.local_device_id.lock().unwrap() = "clustercut-me".to_string();
+        state.known_peers.lock().unwrap().insert(
+            "clustercut-known".to_string(),
+            peer("clustercut-known", "192.168.1.30", 4654),
+        );
+
+        let me = peer("clustercut-me", "10.8.0.5", 4654);
+        let existing = peer("clustercut-known", "192.168.1.99", 4654); // sender's differing view
+        let placeholder = {
+            let mut p = peer("manual-192.168.1.40", "192.168.1.40", 4654);
+            p.is_manual = true;
+            p
+        };
+        let unfingerprinted = {
+            let mut p = peer("clustercut-legacy", "192.168.1.50", 4654);
+            p.fingerprint = None;
+            p
+        };
+        let info = cluster_info(vec![me, existing, placeholder, unfingerprinted]);
+
+        let imported = merge_cluster_membership(&state, &info);
+
+        assert!(imported.is_empty());
+        let kp = state.known_peers.lock().unwrap();
+        assert_eq!(kp.len(), 1);
+        // Existing entry not clobbered by the sender's differing view.
+        assert_eq!(kp["clustercut-known"].ip.to_string(), "192.168.1.30");
     }
 
     #[test]

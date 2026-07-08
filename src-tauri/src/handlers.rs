@@ -1537,7 +1537,38 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                     let _ = tx.send(info);
                 }
                 None => {
-                    tracing::warn!("Received unsolicited ClusterInfo from {}; ignoring", addr);
+                    // Unsolicited ClusterInfo = reply to an anti-entropy
+                    // membership-sync request (the sender passed mTLS, so it
+                    // is a paired member). Merge members we're missing.
+                    let local_cluster = listener_state.cluster_id.lock().unwrap().clone();
+                    if local_cluster.is_empty() || info.cluster_id != local_cluster {
+                        tracing::warn!(
+                            "Ignoring ClusterInfo from {} for foreign/unset cluster ({})",
+                            addr,
+                            info.cluster_id
+                        );
+                        return;
+                    }
+                    let imported = crate::presence::merge_cluster_membership(&listener_state, &info);
+                    if imported.is_empty() {
+                        return;
+                    }
+                    {
+                        let kp = listener_state.known_peers.lock().unwrap();
+                        storage::save_known_peers(listener_handle.app_handle(), &kp);
+                    }
+                    for peer in imported {
+                        tracing::info!(
+                            "[Presence] Membership sync: learned {} ({}) from {}",
+                            peer.hostname, peer.id, addr
+                        );
+                        let s = listener_state.clone();
+                        let t = transport_inside.clone();
+                        let a = listener_handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = crate::net_util::probe_ip(peer.ip, peer.port, s, t, a, false).await;
+                        });
+                    }
                 }
             }
         }
