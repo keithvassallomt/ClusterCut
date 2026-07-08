@@ -12,6 +12,7 @@ mod pairing;
 mod discovery;
 mod netmon;
 mod peer;
+mod presence;
 mod protocol;
 mod shortcuts;
 mod state;
