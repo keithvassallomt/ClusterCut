@@ -764,6 +764,10 @@ pub(crate) fn perform_factory_reset(app_handle: &tauri::AppHandle, state: &AppSt
     // 1. Reset Config on Disk
     reset_network_state(app_handle);
 
+    // Fresh identity, fresh cluster: tombstones from the previous cluster
+    // life must not suppress membership sync in the next one.
+    state.removed_peer_tombstones.lock().unwrap().clear();
+
     // 2. Update Runtime State
     {
         let mut kp = state.known_peers.lock().unwrap();
