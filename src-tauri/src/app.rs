@@ -1207,6 +1207,12 @@ pub(crate) fn run() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    // last_seen can't refresh while we're offline/suspended or
+                    // in the post-resume grace window — pruning then would
+                    // remove peers for our outage, not theirs.
+                    if crate::presence::presence_paused(&prune_state) {
+                        continue;
+                    }
                     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
                     let timeout = 300; // 300 seconds (5 minutes) timeout to allow for network hiccups
 

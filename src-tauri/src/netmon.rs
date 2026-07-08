@@ -39,6 +39,12 @@ fn resume_recovery(state: &AppState, from_suspend: bool) {
     }
     tracing::info!("[Netmon] Grace period set to {}s", GRACE_PERIOD_SECS);
 
+    // Sleep/outage time must not count as peer absence: the prune loop
+    // compares wall-clock last_seen, so after a >5min suspend every peer
+    // looks stale and gets wiped ~10s after wake — usually before Wi-Fi is
+    // even up. Stamp them now; heartbeats/re-probes re-verify from here.
+    crate::presence::refresh_peer_liveness(state);
+
     // 2. Check for network change (different IP = wifi changed)
     let ip_changed = check_ip_changed(state);
     if ip_changed {
