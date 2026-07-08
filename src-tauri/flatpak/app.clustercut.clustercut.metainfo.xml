@@ -64,6 +64,19 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.4.1" date="2026-07-08">
+      <description>
+        <p>Your cluster now heals itself — devices come back on their own after VPNs, sleep, and network hiccups.</p>
+        <ul>
+          <li>Connect to your cluster over a VPN and your devices appear on their own — no more "Retry Connection" clicks or restarting the app to see everyone</li>
+          <li>Devices no longer vanish from the list for no reason, or go missing until you restart — if one is briefly unreachable, ClusterCut quietly keeps checking and brings it back as soon as it responds</li>
+          <li>Waking your computer from sleep no longer empties the device list while the network reconnects; and if you wake up on a different network, the list updates to show what's actually reachable there</li>
+          <li>A device that joined your cluster while one of your machines was off or away is now recognised automatically when that machine comes back — previously it had to be paired again</li>
+          <li>A device you removed from the cluster stays removed, and reconnecting to a device no longer briefly shows a duplicate "Manual" entry</li>
+          <li>Bringing the ClusterCut window to the front now quietly refreshes the device list, so what you see is always current</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-07-03">
       <description>
         <p>Big improvements to joining and leaving clusters, plus shared PINs for provisioned clusters.</p>
