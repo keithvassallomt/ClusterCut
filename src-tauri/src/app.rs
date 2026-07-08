@@ -1357,6 +1357,36 @@ pub(crate) fn run() {
                          let _ = window.set_badge_count(Some(0));
                      }
                 }
+
+                // The user is looking at the window — cheap moment to heal
+                // the peer list (e.g. VPN connected while we were showing
+                // a stale/empty list). Silent, debounced, and a no-op when
+                // no known peer is absent.
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    let due = {
+                        let mut last = state.last_focus_reprobe.lock().unwrap();
+                        let now = std::time::Instant::now();
+                        match *last {
+                            Some(prev) if now.duration_since(prev) < std::time::Duration::from_secs(30) => false,
+                            _ => {
+                                *last = Some(now);
+                                true
+                            }
+                        }
+                    };
+                    if due {
+                        let transport_opt = state.transport.lock().unwrap().clone();
+                        if let Some(transport) = transport_opt {
+                            crate::presence::reprobe_known_peers(
+                                (*state).clone(),
+                                transport,
+                                app_handle.clone(),
+                                false,
+                                1,
+                            );
+                        }
+                    }
+                }
             }
             tauri::RunEvent::Exit => {
                 tracing::info!("App exiting, signaling shutdown to background threads...");

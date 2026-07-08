@@ -120,6 +120,9 @@ pub struct AppState {
     pub network_suspended: Arc<AtomicBool>,
     pub resume_grace_until: Arc<Mutex<Option<std::time::Instant>>>,
     pub last_known_local_ip: Arc<Mutex<Option<std::net::IpAddr>>>,
+    /// Debounce stamp for the focus-triggered silent re-probe (app.rs run
+    /// loop): at most one kick per 30s regardless of focus churn.
+    pub last_focus_reprobe: Arc<Mutex<Option<std::time::Instant>>>,
     // Deferred join notifications (peer IDs awaiting ping verification)
     pub pending_join_notifications: Arc<Mutex<HashSet<String>>>,
     // Heartbeat fallback counter (consecutive rounds where all sends failed)
@@ -196,6 +199,7 @@ impl AppState {
             network_suspended: Arc::new(AtomicBool::new(false)),
             resume_grace_until: Arc::new(Mutex::new(None)),
             last_known_local_ip: Arc::new(Mutex::new(None)),
+            last_focus_reprobe: Arc::new(Mutex::new(None)),
             pending_join_notifications: Arc::new(Mutex::new(HashSet::new())),
             consecutive_heartbeat_failures: Arc::new(AtomicU32::new(0)),
             pairing_failure_count: Arc::new(AtomicU32::new(0)),
