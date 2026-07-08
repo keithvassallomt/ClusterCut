@@ -266,7 +266,13 @@ pub(crate) async fn delete_peer(
     )
     .await;
 
-    // 1. Remove from Known Peers
+    // 1. Remove from Known Peers. Tombstone first so a member that missed
+    //    the kick broadcast can't gossip the device back via membership sync.
+    state
+        .removed_peer_tombstones
+        .lock()
+        .unwrap()
+        .insert(peer_id.clone());
     {
         let mut kp = state.known_peers.lock().unwrap();
         if kp.remove(&peer_id).is_some() {
@@ -350,16 +356,13 @@ mod add_remote_tests {
 #[tauri::command]
 pub(crate) async fn retry_connection(
     state: State<'_, AppState>,
-    transport: State<'_, Transport>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    tracing::info!("Retry Connection: probing absent known peers...");
-    crate::presence::reprobe_known_peers(
-        (*state).clone(),
-        (*transport).clone(),
-        app_handle,
-        true,
-        3,
-    );
+    let probed = crate::presence::reprobe_known_peers((*state).clone(), app_handle, true, 3, true);
+    if probed == 0 {
+        tracing::warn!("Retry Connection: no absent known peers to probe.");
+    } else {
+        tracing::info!("Retry Connection: probing {} absent known peer(s)...", probed);
+    }
     Ok(())
 }

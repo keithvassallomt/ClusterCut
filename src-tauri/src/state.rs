@@ -123,6 +123,11 @@ pub struct AppState {
     /// Debounce stamp for the focus-triggered silent re-probe (app.rs run
     /// loop): at most one kick per 30s regardless of focus churn.
     pub last_focus_reprobe: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Set by `resume_recovery` when the local IP changed across a
+    /// suspend/outage: the runtime peer list belongs to the OLD network and
+    /// must be silently cleared. Consumed by `start_recovery_tasks`, which
+    /// has the AppHandle needed to emit the `peer-remove` events.
+    pub pending_network_wipe: Arc<AtomicBool>,
     // Deferred join notifications (peer IDs awaiting ping verification)
     pub pending_join_notifications: Arc<Mutex<HashSet<String>>>,
     // Heartbeat fallback counter (consecutive rounds where all sends failed)
@@ -153,7 +158,21 @@ pub struct AppState {
     /// only one pairing flow runs at a time (matches the cap=1 invariant on
     /// the responder side, plus our typical "one user, one device joining at
     /// a time" workflow on the initiator side).
-    pub pending_cluster_info: Arc<Mutex<Option<tokio::sync::oneshot::Sender<crate::protocol::ClusterInfo>>>>,
+    ///
+    /// Tagged with the responder's address: the anti-entropy loop also sends
+    /// `ClusterInfoRequest`s, so a reply must only be handed to the pairing
+    /// waiter when it comes from the peer being paired — an in-flight
+    /// anti-entropy reply landing mid-pairing would otherwise be mistaken
+    /// for the responder's bootstrap (wrong cluster_id/name adoption).
+    pub pending_cluster_info: Arc<Mutex<Option<(std::net::SocketAddr, tokio::sync::oneshot::Sender<crate::protocol::ClusterInfo>)>>>,
+    /// Device ids removed this session via `delete_peer` (kick) or an
+    /// inbound `PeerRemoval`. The membership-sync merge consults this so a
+    /// member that missed the removal broadcast can't gossip the deleted
+    /// device straight back into `known_peers`. In-memory only: after a
+    /// restart a device that every OTHER member still trusts is treated as
+    /// a member again, which is the best guess available without a
+    /// replicated tombstone log.
+    pub removed_peer_tombstones: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Lockout threshold per WIRE-PROTOCOL-0.3.1 §H1 (picked from Michael's 10–20
@@ -200,12 +219,14 @@ impl AppState {
             resume_grace_until: Arc::new(Mutex::new(None)),
             last_known_local_ip: Arc::new(Mutex::new(None)),
             last_focus_reprobe: Arc::new(Mutex::new(None)),
+            pending_network_wipe: Arc::new(AtomicBool::new(false)),
             pending_join_notifications: Arc::new(Mutex::new(HashSet::new())),
             consecutive_heartbeat_failures: Arc::new(AtomicU32::new(0)),
             pairing_failure_count: Arc::new(AtomicU32::new(0)),
             pairing_locked_out: Arc::new(AtomicBool::new(false)),
             pairing_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             pending_cluster_info: Arc::new(Mutex::new(None)),
+            removed_peer_tombstones: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -300,17 +321,8 @@ impl AppState {
         if self.startup_time.elapsed() < std::time::Duration::from_secs(60) {
             return false;
         }
-        if !self.network_available.load(Ordering::Relaxed) {
-            return false;
-        }
-        if self.network_suspended.load(Ordering::Relaxed) {
-            return false;
-        }
-        if let Some(end) = *self.resume_grace_until.lock().unwrap() {
-            if std::time::Instant::now() < end {
-                return false;
-            }
-        }
-        true
+        // Outage/suspend/grace suppression shares one definition with the
+        // presence machinery so the two can't drift apart.
+        !crate::presence::presence_paused(self)
     }
 }

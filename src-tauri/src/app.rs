@@ -258,10 +258,12 @@ async fn removal_debounce_task(
         return;
     }
 
-    // Layer 2: If network is down, retry instead of falsely confirming removal
-    if !state.network_available.load(std::sync::atomic::Ordering::Relaxed) {
+    // Layer 2: presence is paused (outage/suspend/resume grace) — retry
+    // instead of falsely confirming removal while peers are unreachable
+    // for OUR reasons, not theirs.
+    if crate::presence::presence_paused(&state) {
         if retry_count < MAX_REMOVAL_RETRIES {
-            tracing::info!("[Discovery] Network down — re-queuing removal for {} (retry {}/{})", peer_id, retry_count + 1, MAX_REMOVAL_RETRIES);
+            tracing::info!("[Discovery] Presence paused — re-queuing removal for {} (retry {}/{})", peer_id, retry_count + 1, MAX_REMOVAL_RETRIES);
             let new_nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
             {
                 let mut pending = state.pending_removals.lock().unwrap();
@@ -271,7 +273,7 @@ async fn removal_debounce_task(
             return;
         }
         // Max retries reached — remove silently (can't verify either way)
-        tracing::warn!("[Discovery] Max retries reached for {} with network down — removing silently", peer_id);
+        tracing::warn!("[Discovery] Max retries reached for {} while presence paused — removing silently", peer_id);
         let mut pending = state.pending_removals.lock().unwrap();
         pending.remove(&peer_id);
         drop(pending);
@@ -760,11 +762,12 @@ pub(crate) fn run() {
                 // --- NEW: Startup Reconnection Probe ---
                 // We want to try reconnecting to manual peers or trusted peers.
                 let state_owned = (*state).clone();
-                let transport_clone = transport.clone();
                 let app_handle_clone = app_handle.clone();
 
                 tauri::async_runtime::spawn(async move {
-                     // Wait a moment for transport/discovery to settle
+                     // Wait a moment for transport/discovery to settle (also
+                     // covers state.transport being wired later in setup —
+                     // reprobe_known_peers reads it from state).
                      tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
                      // Retroactive Fix: If a peer is on a different subnet, mark it as manual.
@@ -802,10 +805,10 @@ pub(crate) fn run() {
 
                      crate::presence::reprobe_known_peers(
                          state_owned.clone(),
-                         transport_clone.clone(),
                          app_handle_clone.clone(),
                          true,
                          3,
+                         true,
                      );
                 });
 
@@ -1236,10 +1239,12 @@ pub(crate) fn run() {
 
                     let mut to_remove = Vec::new();
 
-                    // Iterate over peers to find stale ones
+                    // Iterate over peers to find stale ones. saturating_sub:
+                    // a backward wall-clock step (NTP) must not underflow
+                    // into a mass prune.
                     for (id, p) in peers_lock.iter() {
-                        if now - p.last_seen > timeout {
-                            tracing::info!("Pruning stale peer: {} ({}) - Last seen {}s ago", p.hostname, id, now - p.last_seen);
+                        if now.saturating_sub(p.last_seen) > timeout {
+                            tracing::info!("Pruning stale peer: {} ({}) - Last seen {}s ago", p.hostname, id, now.saturating_sub(p.last_seen));
                             to_remove.push(p.clone());
                         }
                     }
@@ -1361,28 +1366,30 @@ pub(crate) fn run() {
                 // The user is looking at the window — cheap moment to heal
                 // the peer list (e.g. VPN connected while we were showing
                 // a stale/empty list). Silent, debounced, and a no-op when
-                // no known peer is absent.
+                // no known peer is absent. Skipped entirely (without burning
+                // the debounce slot) while presence is paused — a focus during
+                // the resume grace window must not eat the kick that would
+                // be useful seconds later when the network is actually back.
                 if let Some(state) = app_handle.try_state::<AppState>() {
-                    let due = {
-                        let mut last = state.last_focus_reprobe.lock().unwrap();
-                        let now = std::time::Instant::now();
-                        match *last {
-                            Some(prev) if now.duration_since(prev) < std::time::Duration::from_secs(30) => false,
-                            _ => {
-                                *last = Some(now);
-                                true
+                    if !crate::presence::presence_paused(&state) {
+                        let due = {
+                            let mut last = state.last_focus_reprobe.lock().unwrap();
+                            let now = std::time::Instant::now();
+                            match *last {
+                                Some(prev) if now.duration_since(prev) < std::time::Duration::from_secs(30) => false,
+                                _ => {
+                                    *last = Some(now);
+                                    true
+                                }
                             }
-                        }
-                    };
-                    if due {
-                        let transport_opt = state.transport.lock().unwrap().clone();
-                        if let Some(transport) = transport_opt {
+                        };
+                        if due {
                             crate::presence::reprobe_known_peers(
                                 (*state).clone(),
-                                transport,
                                 app_handle.clone(),
                                 false,
                                 1,
+                                false,
                             );
                         }
                     }

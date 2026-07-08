@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use std::sync::atomic::Ordering;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 const GRACE_PERIOD_SECS: u64 = 45;
 
@@ -39,21 +39,25 @@ fn resume_recovery(state: &AppState, from_suspend: bool) {
     }
     tracing::info!("[Netmon] Grace period set to {}s", GRACE_PERIOD_SECS);
 
-    // Sleep/outage time must not count as peer absence: the prune loop
-    // compares wall-clock last_seen, so after a >5min suspend every peer
-    // looks stale and gets wiped ~10s after wake — usually before Wi-Fi is
-    // even up. Stamp them now; heartbeats/re-probes re-verify from here.
-    crate::presence::refresh_peer_liveness(state);
-
     // 2. Check for network change (different IP = wifi changed)
     let ip_changed = check_ip_changed(state);
     if ip_changed {
-        tracing::info!("[Netmon] Local IP changed — peers on old network will be silently removed");
-        // Don't clear pending removals: old-network peers are genuinely gone.
-        // The grace period suppresses their notifications.
+        tracing::info!("[Netmon] Local IP changed — runtime peers belong to the old network");
+        // The runtime list is stale from the new vantage point. Flag a
+        // silent wipe for start_recovery_tasks (it has the AppHandle needed
+        // to emit peer-remove); its re-probe then re-adds whatever is still
+        // reachable within seconds. Do NOT refresh liveness here — bumping
+        // last_seen would keep unreachable old-network peers "online" for a
+        // full prune timeout and hide them from the re-probe.
+        state.pending_network_wipe.store(true, Ordering::Relaxed);
     } else {
-        // 3. Clear pending removals only if IP didn't change
-        // (same network, peers are likely still there — cancel stale removals)
+        // 3. Same network: sleep/outage time must not count as peer absence.
+        // The prune loop compares wall-clock last_seen, so after a >5min
+        // suspend every peer looks stale and gets wiped ~10s after wake —
+        // usually before Wi-Fi is even up. Stamp them now; heartbeats and
+        // re-probes re-verify from here. Also cancel stale removals (peers
+        // are likely still there).
+        crate::presence::refresh_peer_liveness(state);
         let mut pending = state.pending_removals.lock().unwrap();
         let count = pending.len();
         pending.clear();
@@ -94,6 +98,26 @@ pub fn start_recovery_tasks(app_handle: &tauri::AppHandle) {
     let handle = app_handle.clone();
 
     tauri::async_runtime::spawn(async move {
+        // Silent wipe requested by resume_recovery (local IP changed): the
+        // runtime list is the OLD network's view. No leave notifications —
+        // we moved, the peers didn't.
+        if state.pending_network_wipe.swap(false, Ordering::Relaxed) {
+            let removed: Vec<String> = {
+                let mut peers = state.peers.lock().unwrap();
+                let ids: Vec<String> = peers.keys().cloned().collect();
+                peers.clear();
+                ids
+            };
+            state.pending_removals.lock().unwrap().clear();
+            for id in &removed {
+                let _ = handle.emit("peer-remove", id);
+            }
+            tracing::info!(
+                "[Netmon] Cleared {} runtime peer(s) from the old network; re-probing.",
+                removed.len()
+            );
+        }
+
         // Re-register mDNS
         {
             let device_id = state.local_device_id.lock().unwrap().clone();
@@ -114,21 +138,10 @@ pub fn start_recovery_tasks(app_handle: &tauri::AppHandle) {
         }
 
         // Re-probe absent known peers with PeerDiscovery bursts. The old code
-        // sent bare `Message::Ping`s here — but Ping/Pong are presence-inert
+        // sent bare `Message::Ping`s here — but Ping/Pong were presence-inert
         // on both sides, so recovery "succeeded" without ever repopulating
         // the peer list (the VPN-reconnect bug).
-        {
-            let transport_opt = state.transport.lock().unwrap().clone();
-            if let Some(transport) = transport_opt {
-                crate::presence::reprobe_known_peers(
-                    state.clone(),
-                    transport,
-                    handle.clone(),
-                    false,
-                    3,
-                );
-            }
-        }
+        crate::presence::reprobe_known_peers(state.clone(), handle.clone(), false, 3, true);
     });
 }
 

@@ -1188,6 +1188,13 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                     transport_inside.local_addr().map(|a| a.port()).unwrap_or(0)
                 );
             } else {
+                // Tombstone the removed device so a member that missed this
+                // broadcast can't gossip it back via membership sync.
+                listener_state
+                    .removed_peer_tombstones
+                    .lock()
+                    .unwrap()
+                    .insert(target_id.clone());
                 {
                     let mut kp = listener_state.known_peers.lock().unwrap();
                     if kp.remove(&target_id).is_some() {
@@ -1531,7 +1538,18 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
             // authenticated the responder; we just hand off into the
             // pending oneshot. A stray ClusterInfo with no waiter is a
             // protocol-level no-op (logged + dropped).
-            let waiter = listener_state.pending_cluster_info.lock().unwrap().take();
+            // Only the pairing responder's reply may satisfy the pairing
+            // waiter — the anti-entropy loop also requests ClusterInfo, and
+            // one of its replies landing mid-pairing must not be mistaken
+            // for the responder's bootstrap (wrong cluster adoption).
+            let waiter = {
+                let mut slot = listener_state.pending_cluster_info.lock().unwrap();
+                if slot.as_ref().map_or(false, |(expected, _)| *expected == addr) {
+                    slot.take().map(|(_, tx)| tx)
+                } else {
+                    None
+                }
+            };
             match waiter {
                 Some(tx) => {
                     let _ = tx.send(info);

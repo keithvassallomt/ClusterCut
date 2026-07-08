@@ -148,18 +148,9 @@ pub(crate) async fn probe_ip(
 ) -> bool {
     let addr = std::net::SocketAddr::new(ip, port);
 
-    // Attempt connection loop (simple probe)
-    // Transport::send_message initiates a connection.
-    // We send a lightweight "PeerDiscovery" with our own info.
-    // If it succeeds, we add them as Untrusted.
-
-    // Wait... if we send 'PeerDiscovery', they will receive it and add US.
-    // But how do we add THEM?
-    // We don't get a response from send_message other than Ok/Err.
-    // We need a request/response.
-    // Or we rely on them reacting to our PeerDiscovery by connecting back?
-    // Let's implement a 'Hello' ping.
-
+    // The probed peer records us from this PeerDiscovery and its next
+    // heartbeat (<=5s) carries its own record back, which is what actually
+    // surfaces it in our list — send_message alone can't tell us who's there.
     let local_id = state.local_device_id.lock().unwrap().clone();
     let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
     let network_name = state.network_name.lock().unwrap().clone();
@@ -180,12 +171,11 @@ pub(crate) async fn probe_ip(
     };
 
     let msg = Message::PeerDiscovery(my_peer);
-    let _data = serde_json::to_vec(&msg).unwrap_or_default();
+    let data_vec = serde_json::to_vec(&msg).unwrap_or_default();
 
             tracing::debug!("Probing {}...", addr);
 
             // Send Peer Discovery via QUIC/UDP
-            let data_vec = _data.clone();
             let transport_clone = transport.clone();
 
             // We use a small timeout for the send operation
@@ -207,10 +197,20 @@ pub(crate) async fn probe_ip(
                    // BUT `send_message` in our Transport uses `open_bi` which implies a handshake.
                    // If handshake succeeds, they are there.
 
-                   // Add to manual peers list
+                   // Add to manual peers list — but only for genuinely
+                   // unknown addresses. Recovery probes (startup, retry,
+                   // netmon, anti-entropy) hit IPs of REAL known peers; a
+                   // placeholder there would ghost a duplicate "Manual (ip)"
+                   // row until the peer's next heartbeat and churn
+                   // known_peers.json twice per reconnection.
                      let mut peers = state.known_peers.lock().unwrap();
                      let id = format!("manual-{}", ip);
-                     if !peers.contains_key(&id) {
+                     let ip_belongs_to_known_peer = peers
+                         .values()
+                         .any(|p| p.ip == ip && !p.id.starts_with("manual-"));
+                     if ip_belongs_to_known_peer {
+                         tracing::debug!("Probe to {} OK — IP belongs to a known peer; no placeholder.", addr);
+                     } else if !peers.contains_key(&id) {
                          let peer = Peer {
                              id: id.clone(),
                              ip,

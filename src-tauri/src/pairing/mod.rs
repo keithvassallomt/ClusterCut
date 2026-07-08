@@ -480,7 +480,9 @@ pub(crate) async fn start_pairing(
     let (info_tx, info_rx) = tokio::sync::oneshot::channel::<crate::protocol::ClusterInfo>();
     {
         let mut slot = state.pending_cluster_info.lock().unwrap();
-        *slot = Some(info_tx);
+        // Tagged with the responder's address so the handler can't hand us
+        // an anti-entropy ClusterInfo reply from some other cluster member.
+        *slot = Some((peer_addr, info_tx));
     }
     let req_bytes = serde_json::to_vec(&crate::protocol::Message::ClusterInfoRequest)
         .map_err(|e| format!("Failed to serialise ClusterInfoRequest: {}", e))?;

@@ -2,15 +2,16 @@
 //! recovery, the anti-entropy loop (absent-peer re-probe + membership sync),
 //! and helpers that pause presence bookkeeping around suspend/outages.
 //!
-//! Background: `Message::Ping`/`Pong` are deliberately presence-inert, the 5s
-//! heartbeat only targets peers already in the runtime map, and mdns-sd's
-//! long-lived browse won't re-emit `ServiceResolved` for records it still
-//! caches. So any peer that drops out of the runtime map needs an active
-//! `PeerDiscovery` re-probe to come back — that's this module's job.
+//! Background: the 5s heartbeat only targets peers already in the runtime
+//! map, and mdns-sd's long-lived browse won't re-emit `ServiceResolved` for
+//! records it still caches. So any peer that drops out of the runtime map
+//! needs an active `PeerDiscovery` re-probe to come back — that's this
+//! module's job. (Ping/Pong used to be presence-inert, which is why the old
+//! netmon recovery never repopulated the list; they now refresh liveness via
+//! `touch_peer_by_addr`, but only `PeerDiscovery` can ADD a peer.)
 
 use crate::peer::Peer;
 use crate::state::AppState;
-use crate::transport::Transport;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
@@ -80,18 +81,28 @@ pub(crate) fn touch_peer_by_addr(state: &AppState, addr: std::net::SocketAddr) -
 }
 
 /// Known peers worth an active probe: not in the runtime map by id, and not
-/// reachable at an IP some runtime peer already answers on (a `manual-<ip>`
-/// placeholder and its real peer share an IP).
+/// listening on an (ip, port) endpoint some runtime peer already answers on
+/// (a `manual-<ip>` placeholder and its real peer share an endpoint). The
+/// match is on the full endpoint, not the IP alone — several distinct
+/// devices can share one NATed/port-forwarded IP.
+///
+/// `include_placeholders: false` also skips `manual-<ip>` entries: those are
+/// reachability hints for addresses that once accepted QUIC (e.g. a VPN
+/// gateway) and are never garbage-collected, so a periodic caller would dial
+/// dead ones forever. Event-driven bursts (startup, retry, netmon recovery)
+/// pass true to preserve the old probe-everything behavior.
 pub(crate) fn peers_needing_probe(
     known: &HashMap<String, Peer>,
     runtime: &HashMap<String, Peer>,
+    include_placeholders: bool,
 ) -> Vec<Peer> {
-    let online_ips: std::collections::HashSet<std::net::IpAddr> =
-        runtime.values().map(|p| p.ip).collect();
+    let online: std::collections::HashSet<(std::net::IpAddr, u16)> =
+        runtime.values().map(|p| (p.ip, p.port)).collect();
     known
         .values()
+        .filter(|p| include_placeholders || !p.id.starts_with("manual-"))
         .filter(|p| !runtime.contains_key(&p.id))
-        .filter(|p| !online_ips.contains(&p.ip))
+        .filter(|p| !online.contains(&(p.ip, p.port)))
         .cloned()
         .collect()
 }
@@ -104,11 +115,13 @@ pub(crate) fn peers_needing_probe(
 /// side has the other's fingerprint pinned) until a manual re-pair.
 ///
 /// Conservative by design — inserts only entries that are new to us,
-/// fingerprinted, not ourselves, and not `manual-<ip>` placeholders (those
-/// are the sender's local reachability hints, not members). Existing entries
-/// are never overwritten: direct contact refreshes those. Runtime presence
-/// is untouched; the caller probes imports to surface them. Cluster
-/// name/id/PIN adoption is pairing-only and does NOT happen here.
+/// fingerprinted, not ourselves, not `manual-<ip>` placeholders (those
+/// are the sender's local reachability hints, not members), and not
+/// tombstoned (deleted this session — a member that missed the removal
+/// broadcast must not gossip the deleted device straight back). Existing
+/// entries are never overwritten: direct contact refreshes those. Runtime
+/// presence is untouched; the caller probes imports to surface them.
+/// Cluster name/id/PIN adoption is pairing-only and does NOT happen here.
 ///
 /// Returns the imported peers. Caller persists `known_peers` if non-empty.
 pub(crate) fn merge_cluster_membership(
@@ -116,6 +129,7 @@ pub(crate) fn merge_cluster_membership(
     info: &crate::protocol::ClusterInfo,
 ) -> Vec<Peer> {
     let local_id = state.local_device_id.lock().unwrap().clone();
+    let tombstones = state.removed_peer_tombstones.lock().unwrap().clone();
     let mut kp = state.known_peers.lock().unwrap();
     let mut imported = Vec::new();
     for peer in &info.known_peers {
@@ -123,6 +137,9 @@ pub(crate) fn merge_cluster_membership(
             continue;
         }
         if peer.id.starts_with("manual-") {
+            continue;
+        }
+        if tombstones.contains(&peer.id) {
             continue;
         }
         if peer.fingerprint.is_none() {
@@ -143,6 +160,7 @@ pub(crate) fn merge_cluster_membership(
 }
 
 /// Burst re-probe of every known peer that is absent from the runtime map.
+/// Returns how many peers were queued for probing.
 ///
 /// Sends the `PeerDiscovery` probe (`net_util::probe_ip`) — NOT `Ping` —
 /// because only `PeerDiscovery` makes the far side record us and heartbeat
@@ -152,39 +170,53 @@ pub(crate) fn merge_cluster_membership(
 ///
 /// `notify: true` surfaces the final attempt's outcome as notifications
 /// (user-initiated retry); earlier attempts are always silent.
+/// `include_placeholders` — see [`peers_needing_probe`].
 pub(crate) fn reprobe_known_peers(
     state: AppState,
-    transport: Transport,
     app_handle: tauri::AppHandle,
     notify: bool,
     attempts: u32,
-) {
+    include_placeholders: bool,
+) -> usize {
+    let Some(transport) = state.transport.lock().unwrap().clone() else {
+        return 0;
+    };
     let targets = {
         // Lock order: known_peers before peers (matches prune/reset).
         let kp = state.known_peers.lock().unwrap();
         let rt = state.peers.lock().unwrap();
-        peers_needing_probe(&kp, &rt)
+        peers_needing_probe(&kp, &rt, include_placeholders)
     };
     if targets.is_empty() {
-        return;
+        return 0;
     }
+    let attempts = attempts.max(1);
     tracing::info!(
         "[Presence] Re-probing {} absent known peer(s) ({} attempt(s) each)",
         targets.len(),
-        attempts.max(1)
+        attempts
     );
+    let count = targets.len();
     for peer in targets {
+        tracing::debug!(
+            "[Presence] Re-probe target: {} ({}:{}, manual: {})",
+            peer.id, peer.ip, peer.port, peer.is_manual
+        );
         let s = state.clone();
         let t = transport.clone();
         let a = app_handle.clone();
         tauri::async_runtime::spawn(async move {
-            let attempts = attempts.max(1);
             for attempt in 0..attempts {
                 if attempt > 0 {
                     tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
                     // The peer may have surfaced meanwhile (e.g. its own
                     // heartbeat reached us) — stop burning probes on it.
-                    let surfaced = s.peers.lock().unwrap().values().any(|p| p.ip == peer.ip);
+                    let surfaced = s
+                        .peers
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .any(|p| p.ip == peer.ip && p.port == peer.port);
                     if surfaced {
                         return;
                     }
@@ -205,18 +237,22 @@ pub(crate) fn reprobe_known_peers(
             }
         });
     }
+    count
 }
 
-/// Anti-entropy cadence. 30s bounds how long a missed peer stays invisible
-/// (the old behavior was "forever, until app restart"). Traffic cost per
-/// tick: one 2s QUIC dial per absent peer + one tiny ClusterInfoRequest.
+/// Anti-entropy cadence. One tick bounds how long a missed-but-reachable
+/// KNOWN peer stays invisible (the old behavior was "forever, until app
+/// restart"). Membership sync converges slower: one member is queried per
+/// tick round-robin, so a brand-new member propagates in O(cluster size)
+/// ticks worst case. Traffic per tick: one 2s QUIC dial per absent peer +
+/// one small ClusterInfoRequest/reply.
 const ANTI_ENTROPY_PERIOD_SECS: u64 = 30;
 
 /// Periodic self-healing for the peer list. Every tick (while presence is
 /// not paused): re-probe absent known peers (single silent attempt — the
-/// tick period is the retry cadence), then ask one online trusted member
-/// for its known_peers so membership converges (see
-/// `merge_cluster_membership` for why).
+/// tick period is the retry cadence; `manual-<ip>` placeholders are skipped,
+/// see `peers_needing_probe`), then ask one online trusted member for its
+/// known_peers so membership converges (see `merge_cluster_membership`).
 pub(crate) fn spawn_anti_entropy_loop(app_handle: tauri::AppHandle) {
     use tauri::Manager;
     let state: AppState = (*app_handle.state::<AppState>()).clone();
@@ -231,7 +267,7 @@ pub(crate) fn spawn_anti_entropy_loop(app_handle: tauri::AppHandle) {
             let transport_opt = state.transport.lock().unwrap().clone();
             let Some(transport) = transport_opt else { continue };
 
-            reprobe_known_peers(state.clone(), transport.clone(), app_handle.clone(), false, 1);
+            reprobe_known_peers(state.clone(), app_handle.clone(), false, 1, false);
 
             // Membership sync — skip while a pairing is waiting on
             // ClusterInfo, so we can't swallow its T7 reply.
@@ -393,9 +429,53 @@ mod tests {
             peer("clustercut-a", "192.168.1.10", 4654),
         );
 
-        let need = peers_needing_probe(&known, &runtime);
+        let need = peers_needing_probe(&known, &runtime, true);
         assert_eq!(need.len(), 1);
         assert_eq!(need[0].id, "clustercut-b");
+    }
+
+    #[test]
+    fn same_ip_different_port_is_still_probed() {
+        // Two distinct devices can share one NATed/port-forwarded IP; the
+        // online one must not mask the absent one.
+        let mut known = HashMap::new();
+        known.insert(
+            "clustercut-a".to_string(),
+            peer("clustercut-a", "203.0.113.9", 4654),
+        );
+        known.insert(
+            "clustercut-b".to_string(),
+            peer("clustercut-b", "203.0.113.9", 4655),
+        );
+        let mut runtime = HashMap::new();
+        runtime.insert(
+            "clustercut-a".to_string(),
+            peer("clustercut-a", "203.0.113.9", 4654),
+        );
+
+        let need = peers_needing_probe(&known, &runtime, true);
+        assert_eq!(need.len(), 1);
+        assert_eq!(need[0].id, "clustercut-b");
+    }
+
+    #[test]
+    fn placeholders_skipped_when_excluded() {
+        let mut known = HashMap::new();
+        known.insert("manual-192.168.1.40".to_string(), {
+            let mut p = peer("manual-192.168.1.40", "192.168.1.40", 4654);
+            p.is_manual = true;
+            p
+        });
+        known.insert(
+            "clustercut-b".to_string(),
+            peer("clustercut-b", "192.168.1.11", 4654),
+        );
+        let runtime = HashMap::new();
+
+        let need = peers_needing_probe(&known, &runtime, false);
+        assert_eq!(need.len(), 1);
+        assert_eq!(need[0].id, "clustercut-b");
+        assert_eq!(peers_needing_probe(&known, &runtime, true).len(), 2);
     }
 
     #[test]
@@ -415,7 +495,7 @@ mod tests {
             peer("clustercut-a", "192.168.1.10", 4654),
         );
 
-        assert!(peers_needing_probe(&known, &runtime).is_empty());
+        assert!(peers_needing_probe(&known, &runtime, true).is_empty());
     }
 
     // ── merge_cluster_membership ───────────────────────────────────────
@@ -494,6 +574,31 @@ mod tests {
             peer("clustercut-b", "192.168.1.11", 4654),
         );
         let runtime = HashMap::new();
-        assert_eq!(peers_needing_probe(&known, &runtime).len(), 2);
+        assert_eq!(peers_needing_probe(&known, &runtime, true).len(), 2);
+    }
+
+    #[test]
+    fn merge_skips_tombstoned_peer() {
+        let state = AppState::new();
+        *state.local_device_id.lock().unwrap() = "clustercut-me".to_string();
+        state
+            .removed_peer_tombstones
+            .lock()
+            .unwrap()
+            .insert("clustercut-kicked".to_string());
+        let info = cluster_info(vec![
+            peer("clustercut-kicked", "192.168.1.60", 4654),
+            peer("clustercut-new", "192.168.1.61", 4654),
+        ]);
+
+        let imported = merge_cluster_membership(&state, &info);
+
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].id, "clustercut-new");
+        assert!(!state
+            .known_peers
+            .lock()
+            .unwrap()
+            .contains_key("clustercut-kicked"));
     }
 }
