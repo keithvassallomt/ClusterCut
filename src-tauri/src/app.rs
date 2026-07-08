@@ -296,19 +296,32 @@ async fn removal_debounce_task(
 
         if let Some(transport) = transport_opt {
             if let Ok(ping_data) = serde_json::to_vec(&Message::Ping) {
-                let send_fut = async {
-                    match transport.send_message(addr, &ping_data).await {
-                        Ok(_) => true,
-                        Err(e) => {
-                            tracing::warn!("[Discovery] Active probe to {} failed: {}", addr, e);
-                            false
+                // One 2s attempt was deciding removal — a single lost
+                // handshake under Wi-Fi power-save removed a live peer.
+                const PROBE_ATTEMPTS: u32 = 3;
+                for attempt in 1..=PROBE_ATTEMPTS {
+                    let send_fut = async {
+                        match transport.send_message(addr, &ping_data).await {
+                            Ok(_) => true,
+                            Err(e) => {
+                                tracing::warn!("[Discovery] Active probe to {} failed (attempt {}/{}): {}", addr, attempt, PROBE_ATTEMPTS, e);
+                                false
+                            }
+                        }
+                    };
+                    match tokio::time::timeout(std::time::Duration::from_secs(2), send_fut).await {
+                        Ok(true) => {
+                            is_alive = true;
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            tracing::warn!("[Discovery] Active probe to {} timed out (attempt {}/{}).", addr, attempt, PROBE_ATTEMPTS);
                         }
                     }
-                };
-                if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(2), send_fut).await {
-                    is_alive = result;
-                } else {
-                    tracing::warn!("[Discovery] Active probe to {} timed out.", addr);
+                    if attempt < PROBE_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
                 }
             }
         }
