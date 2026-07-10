@@ -34,6 +34,66 @@ pub(crate) fn presence_paused(state: &AppState) -> bool {
     false
 }
 
+/// Outcome of observing the local IP for a possible network change.
+/// `changed` drives recovery (silent wipe + re-probe); `notify` drives the
+/// one-shot user-facing "network changed" toast (debounced).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NetworkChange {
+    pub changed: bool,
+    pub notify: bool,
+}
+
+/// Record the current local IP and react if it differs from the last one we
+/// saw. A changed IP means the machine switched networks or a VPN came
+/// up/down — the OS connectivity monitor often does NOT flag these because
+/// full internet access is preserved, so the peer left/joined suppression
+/// (which keys off [`presence_paused`]) would otherwise stay off and every
+/// now-unreachable peer would emit a spurious "left the cluster" toast
+/// (issue #19).
+///
+/// On a real change this opens the `grace` window (silences left/joined via
+/// `should_notify` → `presence_paused`) and flags a silent peer wipe
+/// (`pending_network_wipe`, consumed by `start_recovery_tasks`), exactly like
+/// the IP-changed branch of `resume_recovery`. `notify` is true only when we
+/// were NOT already inside a grace window, so a flapping VPN or a change
+/// right after a resume refreshes the window without firing a second toast.
+///
+/// `current_ip == None` (we couldn't read an address, e.g. mid-outage) is a
+/// no-op that leaves the last-known IP intact — the next observation decides.
+pub(crate) fn note_ip_change(
+    state: &AppState,
+    current_ip: Option<std::net::IpAddr>,
+    now: std::time::Instant,
+    grace: std::time::Duration,
+) -> NetworkChange {
+    let Some(current_ip) = current_ip else {
+        return NetworkChange { changed: false, notify: false };
+    };
+    let changed = {
+        let mut last = state.last_known_local_ip.lock().unwrap();
+        let changed = last.map_or(false, |prev| prev != current_ip);
+        *last = Some(current_ip);
+        changed
+    };
+    if !changed {
+        return NetworkChange { changed: false, notify: false };
+    }
+    // Debounce the toast: only the change that OPENS a grace window announces
+    // itself. A change while one is still open (flapping VPN, or right after a
+    // resume) refreshes the window and re-flags the wipe, but stays silent.
+    let already_in_grace = state
+        .resume_grace_until
+        .lock()
+        .unwrap()
+        .map_or(false, |end| now < end);
+    *state.resume_grace_until.lock().unwrap() = Some(now + grace);
+    state.pending_network_wipe.store(true, Ordering::Relaxed);
+    NetworkChange {
+        changed: true,
+        notify: !already_in_grace,
+    }
+}
+
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -365,6 +425,75 @@ mod tests {
         *state.resume_grace_until.lock().unwrap() =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
         assert!(!presence_paused(&state));
+    }
+
+    // ── note_ip_change ─────────────────────────────────────────────────
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(45);
+
+    #[test]
+    fn note_ip_change_records_first_ip_without_reacting() {
+        // Fresh state has no last-known IP; the first observation just records
+        // it — no "change", no grace, no wipe, no notification.
+        let state = AppState::new();
+        let out = note_ip_change(&state, Some(ip("192.168.1.10")), std::time::Instant::now(), GRACE);
+        assert_eq!(out, NetworkChange { changed: false, notify: false });
+        assert_eq!(*state.last_known_local_ip.lock().unwrap(), Some(ip("192.168.1.10")));
+        assert!(!presence_paused(&state));
+        assert!(!state.pending_network_wipe.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn note_ip_change_same_ip_is_noop() {
+        let state = AppState::new();
+        *state.last_known_local_ip.lock().unwrap() = Some(ip("192.168.1.10"));
+        let out = note_ip_change(&state, Some(ip("192.168.1.10")), std::time::Instant::now(), GRACE);
+        assert_eq!(out, NetworkChange { changed: false, notify: false });
+        assert!(!presence_paused(&state));
+        assert!(!state.pending_network_wipe.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn note_ip_change_none_current_is_noop_and_preserves_last() {
+        let state = AppState::new();
+        *state.last_known_local_ip.lock().unwrap() = Some(ip("192.168.1.10"));
+        let out = note_ip_change(&state, None, std::time::Instant::now(), GRACE);
+        assert_eq!(out, NetworkChange { changed: false, notify: false });
+        // Must NOT clobber the last-known IP just because we couldn't read one.
+        assert_eq!(*state.last_known_local_ip.lock().unwrap(), Some(ip("192.168.1.10")));
+        assert!(!presence_paused(&state));
+    }
+
+    #[test]
+    fn note_ip_change_detects_change_sets_grace_wipe_and_notifies() {
+        let state = AppState::new();
+        *state.last_known_local_ip.lock().unwrap() = Some(ip("192.168.1.10"));
+        let out = note_ip_change(&state, Some(ip("10.8.0.5")), std::time::Instant::now(), GRACE);
+        assert_eq!(out, NetworkChange { changed: true, notify: true });
+        assert_eq!(*state.last_known_local_ip.lock().unwrap(), Some(ip("10.8.0.5")));
+        // Grace window silences peer left/joined via should_notify -> presence_paused.
+        assert!(presence_paused(&state));
+        // Old-network peers get silently wiped + re-probed by start_recovery_tasks.
+        assert!(state.pending_network_wipe.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn note_ip_change_debounces_notification_when_already_in_grace() {
+        // A second change while a grace window is still open (flapping VPN, or a
+        // change right after a resume) refreshes the window but must NOT fire a
+        // second toast.
+        let state = AppState::new();
+        *state.last_known_local_ip.lock().unwrap() = Some(ip("192.168.1.10"));
+        *state.resume_grace_until.lock().unwrap() =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+        let out = note_ip_change(&state, Some(ip("10.8.0.5")), std::time::Instant::now(), GRACE);
+        assert_eq!(out, NetworkChange { changed: true, notify: false });
+        assert!(presence_paused(&state));
+        assert!(state.pending_network_wipe.load(Ordering::Relaxed));
     }
 
     // ── refresh_peer_liveness ──────────────────────────────────────────

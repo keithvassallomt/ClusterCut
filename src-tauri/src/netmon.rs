@@ -2,7 +2,7 @@ use crate::state::AppState;
 use std::sync::atomic::Ordering;
 use tauri::{Emitter, Manager};
 
-const GRACE_PERIOD_SECS: u64 = 45;
+pub(crate) const GRACE_PERIOD_SECS: u64 = 45;
 
 // ── Shared Recovery Logic ──────────────────────────────────────────────────
 
@@ -89,6 +89,56 @@ fn check_ip_changed(state: &AppState) -> bool {
             false
         }
     }
+}
+
+/// Poll the local IP and, if it changed, run network-change recovery.
+///
+/// The OS connectivity monitors below only react when connectivity crosses
+/// the up↔down threshold. A VPN connect/disconnect or a switch between two
+/// working networks keeps full internet access, so none of them fire — yet
+/// the local IP (and routing) changed and every peer on the old network is
+/// now unreachable. Without this, each of those peers is pruned and emits a
+/// spurious "left the cluster" toast, and the new network's peers each emit
+/// "joined" (issue #19).
+///
+/// `note_ip_change` opens the grace window (which silences peer left/joined
+/// via `should_notify` → `presence_paused`) and flags the silent peer wipe;
+/// here we surface one debounced "network changed" toast and kick recovery.
+/// Cheap enough to call on a timer — a no-op unless the routed IP moved.
+pub fn check_and_handle_network_change(state: &AppState, app_handle: &tauri::AppHandle) {
+    let current_ip = local_ip_address::local_ip().ok();
+    let change = crate::presence::note_ip_change(
+        state,
+        current_ip,
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(GRACE_PERIOD_SECS),
+    );
+    if !change.changed {
+        return;
+    }
+
+    // Nothing to re-probe or announce if there's no cluster to look for.
+    // Locked separately (never both at once) to respect the known_peers →
+    // peers lock order used elsewhere.
+    let runtime_empty = state.peers.lock().unwrap().is_empty();
+    let known_empty = state.known_peers.lock().unwrap().is_empty();
+    if runtime_empty && known_empty {
+        return;
+    }
+
+    tracing::info!("[Netmon] Local IP changed — network switch/VPN; opening grace window and re-probing");
+    if change.notify && state.past_startup_grace() {
+        crate::send_notification(
+            app_handle,
+            "Network Changed",
+            "Your network has changed. ClusterCut will continue looking for peers.",
+            false,
+            Some(1),
+            "devices",
+            crate::NotificationPayload::None,
+        );
+    }
+    start_recovery_tasks(app_handle);
 }
 
 /// Spawns async tasks for mDNS re-registration and peer re-probing.

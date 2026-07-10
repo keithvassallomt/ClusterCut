@@ -317,8 +317,14 @@ impl AppState {
         peers.clone()
     }
 
+    /// True once we're past the startup quiet period. Peer join/leave toasts
+    /// are held back until then so the initial discovery burst doesn't spam.
+    pub fn past_startup_grace(&self) -> bool {
+        self.startup_time.elapsed() >= std::time::Duration::from_secs(60)
+    }
+
     pub fn should_notify(&self) -> bool {
-        if self.startup_time.elapsed() < std::time::Duration::from_secs(60) {
+        if !self.past_startup_grace() {
             return false;
         }
         // Outage/suspend/grace suppression shares one definition with the

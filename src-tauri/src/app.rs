@@ -1160,6 +1160,13 @@ pub(crate) fn run() {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
+                    // Issue #19: catch VPN/network switches the OS connectivity
+                    // monitor misses (internet stays up, but the local IP moved).
+                    // Opens the grace window before the ~20s removal debounce can
+                    // confirm, so no per-peer left/joined spam. No-op unless the
+                    // routed IP actually changed.
+                    crate::netmon::check_and_handle_network_change(&hb_state, &hb_handle);
+
                     let peers: Vec<Peer> = {
                         // FIX: Heartbeat ALL runtime peers, not just known (connected) ones.
                         // This prevents pruning of discovered-but-not-yet-trusted peers.
