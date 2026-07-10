@@ -64,6 +64,15 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.4.2" date="2026-07-10">
+      <description>
+        <p>No more notification pile-ups when your network changes.</p>
+        <ul>
+          <li>Switching Wi-Fi networks, or connecting or disconnecting a VPN, no longer sends you a "device left" notification for every device in your cluster — and a "device joined" for each one as they come back</li>
+          <li>Instead, ClusterCut notices your network has changed, quietly keeps looking for your devices in the background, and shows a single "Your network has changed" message</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.1" date="2026-07-08">
       <description>
         <p>Your cluster now heals itself — devices come back on their own after VPNs, sleep, and network hiccups.</p>

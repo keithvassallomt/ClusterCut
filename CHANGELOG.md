@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.2] - 2026-07-10
 
 ### Fixed
 - Switching networks or connecting/disconnecting a VPN no longer fires a "left the cluster" notification for every peer (and a "joined" for each when they return). ClusterCut now notices the local IP change, silences per-peer join/leave notifications during a short grace window while it re-probes, and shows one "Your network has changed. ClusterCut will continue looking for peers." instead (issue #19).
