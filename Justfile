@@ -474,13 +474,19 @@ aur-publish:
 
     cp "${STAGING}/PKGBUILD" "${STAGING}/.SRCINFO" "${CHECKOUT}/"
     cd "${CHECKOUT}"
-    if git diff --quiet && git diff --cached --quiet; then
+    # Stage first, then ask porcelain. On the very first push the AUR repo is empty:
+    # both files are untracked and there is no HEAD to diff against, so the plain
+    # `git diff`/`git diff --cached` pair reports "no changes" and skips the push.
+    git add PKGBUILD .SRCINFO
+    if [ -z "$(git status --porcelain)" ]; then
         echo "==> AUR already up to date at ${VERSION}; nothing to push."
         exit 0
     fi
-    git add PKGBUILD .SRCINFO
     git commit --quiet -m "clustercut-bin ${VERSION}"
-    git push --quiet origin master
+    # The AUR's branch is master. A clone of an *empty* repo takes its branch name
+    # from init.defaultBranch locally, which may well be main -- so name the remote
+    # ref explicitly rather than relying on the local branch being called master.
+    git push --quiet origin HEAD:refs/heads/master
     echo ""
     echo "==> Published clustercut-bin ${VERSION} to the AUR."
     echo "    https://aur.archlinux.org/packages/clustercut-bin"

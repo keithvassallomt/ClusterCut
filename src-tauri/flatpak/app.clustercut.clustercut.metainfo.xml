@@ -67,7 +67,7 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
-    <release version="0.4.3" date="2026-07-31" />
+    <release version="0.4.3" date="2026-07-31">
       <description>
         <p>
           Maintenance release.
@@ -78,6 +78,7 @@
           <li>ClusterCut is now also available on AUR.</li>
         </ul>
       </description>
+    </release>
     <release version="0.4.2" date="2026-07-10">
       <description>
         <p>No more notification pile-ups when your network changes.</p>
