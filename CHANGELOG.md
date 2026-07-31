@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.3] - 2026-07-31
 
 ### Added
 - Arch Linux packaging: ClusterCut is now on the AUR as [`clustercut-bin`](https://aur.archlinux.org/packages/clustercut-bin), a repack of the official amd64 `.deb` (so it carries the same binary, desktop entry, and tray icon). Install with `paru -S clustercut-bin` or your AUR helper of choice. 
