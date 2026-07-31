@@ -165,17 +165,32 @@ release output_dir="~/Downloads":
     # has to resolve the moment it is pushed. So the release goes live with whatever
     # has been built so far, and the macOS/Windows runs add their installers when
     # they happen.
+    # Notes = packaging/release-notes-template.md with @VERSION@ substituted and
+    # @CHANGELOG@ replaced by this version's CHANGELOG.md section, so every release
+    # keeps the same shape (install instructions, tips, Full Changelog footer).
     echo "==> Publishing GitHub release ${TAG}..."
-    NOTES_FILE=$(mktemp)
+    CHANGELOG_SECTION=$(mktemp)
     awk -v ver="${VERSION}" '
         $0 ~ "^## \\[" ver "\\]" { inside = 1; next }
         inside && /^## \[/ { exit }
-        inside { print }
-    ' CHANGELOG.md > "${NOTES_FILE}"
-    if [ ! -s "${NOTES_FILE}" ]; then
+        inside {
+            # Drop the blank line that follows the version heading; the template
+            # already spaces the changelog away from the title.
+            if (!started && $0 ~ /^[[:space:]]*$/) next
+            started = 1
+            print
+        }
+    ' CHANGELOG.md > "${CHANGELOG_SECTION}"
+    if [ ! -s "${CHANGELOG_SECTION}" ]; then
         echo "ERROR: no CHANGELOG.md section for ${VERSION} to use as release notes."
         exit 1
     fi
+    NOTES_FILE=$(mktemp)
+    awk -v ver="${VERSION}" -v sect="${CHANGELOG_SECTION}" '
+        /@CHANGELOG@/ { while ((getline line < sect) > 0) print line; next }
+        { gsub(/@VERSION@/, ver); print }
+    ' packaging/release-notes-template.md > "${NOTES_FILE}"
+    rm -f "${CHANGELOG_SECTION}"
     if gh release view "${TAG}" >/dev/null 2>&1; then
         gh release edit "${TAG}" --notes-file "${NOTES_FILE}" >/dev/null
         echo "    updated existing release"
