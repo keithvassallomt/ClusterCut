@@ -53,6 +53,45 @@ pub fn start(app_handle: AppHandle, state: AppState, transport: Transport) {
     tauri::async_runtime::spawn(async move {
         let mut monitor_cancel: Option<Arc<Notify>> = None;
 
+        // The extension bridge is GNOME-only. On any other compositor there is no
+        // extension to install, enable, or watch for, so the GNOME-flavoured
+        // messaging below would be actively misleading — a Flatpak install on
+        // Hyprland lands here and used to be told to install a GNOME extension.
+        // Report the real reason instead and skip the Shell signal subscription.
+        if !super::is_gnome() {
+            if super::get_backend() == ClipboardBackend::Degraded {
+                let desktop = super::desktop_name();
+                let (title, body) = if super::is_flatpak() {
+                    (
+                        "Clipboard sync unavailable in Flatpak",
+                        format!(
+                            "{desktop} does not give sandboxed apps access to the clipboard, \
+                             so the Flatpak build cannot sync clipboards here. The native \
+                             ClusterCut package (deb/rpm) is not sandboxed and does work."
+                        ),
+                    )
+                } else {
+                    (
+                        "Clipboard sync unavailable",
+                        format!(
+                            "ClusterCut could not access the Wayland clipboard on {desktop}: \
+                             neither wlr-data-control nor ext-data-control is available."
+                        ),
+                    )
+                };
+                crate::send_notification(
+                    &app_handle,
+                    title,
+                    &body,
+                    true,
+                    None,
+                    "history",
+                    crate::NotificationPayload::None,
+                );
+            }
+            return;
+        }
+
         // Start the monitor immediately if the extension is already live.
         if super::get_backend() == ClipboardBackend::GnomeExtension {
             monitor_cancel = Some(dbus_clipboard::start_monitor(

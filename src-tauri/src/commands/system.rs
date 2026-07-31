@@ -15,6 +15,43 @@ pub(crate) struct ExtensionStatus {
     pub(crate) clipboard_requires_extension: bool,
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct ClipboardSandboxStatus {
+    /// True when the Flatpak sandbox cannot reach a clipboard at all: a Wayland
+    /// session, not GNOME (so the extension bridge doesn't apply), and backend
+    /// detection came back Degraded. Compositors implementing
+    /// `wp_security_context_v1` withhold the data-control globals from sandboxed
+    /// clients, so clipboard sync cannot work in Flatpak there — the native
+    /// package can. Reported so the UI can say so instead of failing silently.
+    pub(crate) sandbox_blocked: bool,
+    /// `XDG_CURRENT_DESKTOP`, e.g. "Hyprland" — named in the warning.
+    pub(crate) desktop: String,
+}
+
+#[tauri::command]
+pub(crate) async fn check_clipboard_sandbox_status() -> ClipboardSandboxStatus {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::clipboard;
+        let sandbox_blocked = clipboard::is_flatpak()
+            && clipboard::is_wayland()
+            && !clipboard::is_gnome()
+            && clipboard::get_backend() == clipboard::ClipboardBackend::Degraded;
+        ClipboardSandboxStatus {
+            sandbox_blocked,
+            desktop: clipboard::desktop_name(),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        ClipboardSandboxStatus {
+            sandbox_blocked: false,
+            desktop: String::new(),
+        }
+    }
+}
+
 #[tauri::command]
 pub(crate) fn log_frontend(message: String, level: Option<String>) {
     match level.as_deref() {

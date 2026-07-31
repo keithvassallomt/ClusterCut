@@ -125,6 +125,8 @@ On Linux, ClusterCut uses a three-path clipboard backend:
 
 The backend is detected automatically at startup. On GNOME Wayland, the [ClusterCut extension](https://extensions.gnome.org/extension/9341/clustercut/) is required for clipboard sync to function.
 
+> **Flatpak on non-GNOME Wayland compositors:** clipboard sync does not work in the Flatpak build on Hyprland (measured), and is expected to fail the same way on any compositor that implements `wp_security_context_v1` and filters privileged globals — Sway and KWin are both likely, but unverified. Flatpak 1.16+ tags every sandbox with a security context, and the compositor then withholds privileged Wayland globals — including both `wlr-data-control` and `ext-data-control` — from sandboxed clients, so there is no clipboard for ClusterCut to read. Exposing the host socket via `--filesystem` does not help; the security-context socket mount wins. Use the native package (deb/rpm/binary) on those desktops; it is not sandboxed and has full access. There is no GNOME-extension equivalent to fall back to off GNOME.
+
 ### Recommended IDE Setup
 
 - [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)

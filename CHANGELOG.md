@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - The window is no longer fixed-size, which fixes it becoming stuck in an unmovable, monitor-filling state on tiling Wayland compositors (Hyprland). `resizable: false` made GTK pin the window's minimum and maximum size to 800x600; Hyprland auto-floats fixed-size windows, and dragging one put it into a compositor-driven maximized state that filled the screen while the UI stayed at 800x600 inside it and couldn't be dragged back out.
+- Flatpak users on non-GNOME Wayland compositors are now warned at launch that clipboard sync cannot work, and pointed at the native package instead of being left to discover it silently. Compositors implementing `wp_security_context_v1` (measured on Hyprland) withhold the `wlr-data-control` and `ext-data-control` globals from sandboxed clients, so the Flatpak build has no clipboard to read and no in-sandbox workaround; the native deb/rpm is unaffected. Exposing the host Wayland socket with `--filesystem` does not help.
+- Non-GNOME Wayland sessions are no longer told to install the ClusterCut GNOME extension when clipboard sync is unavailable. The cold-start "clipboard sync needs the extension" notification fired on any degraded Wayland backend, so a Flatpak install on Hyprland (where there is no extension to install) was sent looking for one. Off GNOME it now reports the actual reason, and skips subscribing to GNOME Shell signals that can never fire.
 
 ### Changed
 - The window can now be resized (default 800x600, minimum 640x520) and maximized on all platforms.

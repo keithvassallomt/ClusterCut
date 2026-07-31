@@ -56,6 +56,28 @@ pub fn is_wayland() -> bool {
             .unwrap_or(false)
 }
 
+/// True on a GNOME session. The extension bridge — and every user-facing prompt
+/// about it — only applies here; on any other compositor there is no extension
+/// to install, so clipboard messaging must not mention one.
+#[cfg(target_os = "linux")]
+pub fn is_gnome() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|v| v.to_ascii_uppercase().contains("GNOME"))
+        .unwrap_or(false)
+}
+
+/// True when running inside a Flatpak sandbox.
+#[cfg(target_os = "linux")]
+pub fn is_flatpak() -> bool {
+    std::path::Path::new("/.flatpak-info").exists()
+}
+
+/// Human-readable desktop name for diagnostics, e.g. "Hyprland".
+#[cfg(target_os = "linux")]
+pub fn desktop_name() -> String {
+    std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".to_string())
+}
+
 /// Detect and store the appropriate clipboard backend.
 /// Must be called early in app startup, after the tokio runtime is available.
 #[cfg(target_os = "linux")]
@@ -73,12 +95,33 @@ pub fn detect_backend() -> ClipboardBackend {
             "Wayland + wlr-data-control detected, using wl-clipboard-rs backend"
         );
         ClipboardBackend::WlrDataControl
+    } else if is_gnome() {
+        tracing::warn!(
+            "GNOME Wayland session with no clipboard backend. Clipboard monitoring \
+             will not work until the ClusterCut extension is installed and enabled. \
+             Will watch for the extension to become available."
+        );
+        ClipboardBackend::Degraded
+    } else if is_flatpak() {
+        // Compositors implementing wp_security_context_v1 (Hyprland, Sway, KDE)
+        // filter privileged protocols out of sandboxed clients, and Flatpak 1.16+
+        // tags every sandbox with one. Both data-control variants are among the
+        // globals withheld, so the sandboxed build cannot see a clipboard here even
+        // though the native build can. There is no extension to fall back to off
+        // GNOME, so this is terminal for the Flatpak on this desktop.
+        tracing::warn!(
+            "Wayland session ({}) exposes no data-control protocol to the Flatpak \
+             sandbox — privileged Wayland globals are filtered for sandboxed clients. \
+             Clipboard monitoring cannot work in Flatpak on this desktop; the native \
+             package (deb/rpm/binary) is not sandboxed and does have access.",
+            desktop_name()
+        );
+        ClipboardBackend::Degraded
     } else {
         tracing::warn!(
-            "Wayland session detected but no clipboard backend available. \
-             Clipboard monitoring will not work. \
-             On GNOME, install the ClusterCut extension for clipboard support. \
-             Will watch for the extension to become available."
+            "Wayland session ({}) exposes neither wlr-data-control nor \
+             ext-data-control. Clipboard monitoring will not work.",
+            desktop_name()
         );
         ClipboardBackend::Degraded
     };
@@ -219,7 +262,10 @@ pub fn read_text(app: &AppHandle) -> Result<String, String> {
             ClipboardBackend::WlrDataControl => wayland::read_text(app),
             ClipboardBackend::GnomeExtension => dbus_clipboard::read_text(app),
             ClipboardBackend::Degraded => {
-                Err("No clipboard backend available (Wayland without extension)".to_string())
+                Err(format!(
+                    "No clipboard backend available on this Wayland session ({})",
+                    desktop_name()
+                ))
             }
         }
     }
@@ -239,7 +285,10 @@ pub fn write_text_direct(app: &AppHandle, text: String) -> Result<(), String> {
             ClipboardBackend::WlrDataControl => wayland::write_text_direct(app, text),
             ClipboardBackend::GnomeExtension => dbus_clipboard::write_text_direct(app, text),
             ClipboardBackend::Degraded => {
-                Err("No clipboard backend available (Wayland without extension)".to_string())
+                Err(format!(
+                    "No clipboard backend available on this Wayland session ({})",
+                    desktop_name()
+                ))
             }
         }
     }

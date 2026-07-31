@@ -6,7 +6,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Monitor, History, LogOut,
   Settings, Lock, Unlock,
-  Puzzle, Loader2, Unplug
+  Puzzle, Loader2, Unplug, ClipboardX
 } from "lucide-react";
 import clsx from "clsx";
 import { Card, Button, IconButton } from "./components/ui";
@@ -47,6 +47,10 @@ export default function App() {
   const [activeView, setActiveView] = useState<View>("devices");
   const [showExtensionDialog, setShowExtensionDialog] = useState(false);
   const [clipboardRequiresExtension, setClipboardRequiresExtension] = useState(false);
+  // Flatpak on a non-GNOME Wayland compositor: the sandbox is denied the
+  // data-control protocols, so clipboard sync cannot work at all here.
+  const [showSandboxDialog, setShowSandboxDialog] = useState(false);
+  const [sandboxDesktop, setSandboxDesktop] = useState("");
 
 
   const [myNetworkName, setMyNetworkName] = useState("Loading...");
@@ -359,6 +363,35 @@ export default function App() {
         .catch(e => console.error("Failed to check extension status:", e));
     }
   }, [settings]);
+
+  // Flatpak sandbox clipboard check. Independent of the GNOME extension check
+  // above: on GNOME the extension is the answer, everywhere else the answer is
+  // the native package, so the two cases never overlap.
+  const hasCheckedSandbox = useRef(false);
+
+  useEffect(() => {
+    if (hasCheckedSandbox.current) return;
+    hasCheckedSandbox.current = true;
+
+    invoke<{ sandbox_blocked: boolean, desktop: string }>('check_clipboard_sandbox_status')
+      .then(status => {
+        if (status.sandbox_blocked) {
+          internalLogToBackend("warn", `Flatpak sandbox has no clipboard access on ${status.desktop}; warning the user.`);
+          setSandboxDesktop(status.desktop);
+          setShowSandboxDialog(true);
+        }
+      })
+      .catch(e => console.error("Failed to check clipboard sandbox status:", e));
+  }, []);
+
+  const handleGetNativeVersion = () => {
+    const url = "https://github.com/keithvassallomt/ClusterCut/releases";
+    openUrl(url).catch((e: unknown) => {
+      console.error("Failed to open URL via plugin-opener:", e);
+      window.open(url, "_blank");
+    });
+    setShowSandboxDialog(false);
+  };
 
   const handleInstallExtension = () => {
     const extUrl = "https://extensions.gnome.org/extension/9341/clustercut/";
@@ -1001,6 +1034,48 @@ export default function App() {
           setConnectionCheckDismissed(true);
         }}
       />
+
+      {/* Flatpak sandbox has no clipboard access (non-GNOME Wayland) */}
+      {showSandboxDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+          <Card className="max-w-md w-full p-6 space-y-4 shadow-2xl border-amber-500/40">
+            <div className="flex items-center gap-3 text-amber-500">
+              <div className="p-3 rounded-full bg-amber-500/10">
+                <ClipboardX className="w-8 h-8" />
+              </div>
+              <h2 className="text-xl font-semibold text-slate-900 dark:text-white">
+                Clipboard Sync Won't Work in Flatpak
+              </h2>
+            </div>
+
+            <p className="text-slate-600 dark:text-zinc-400">
+              <strong>Copy and paste will not sync</strong> on this desktop
+              {sandboxDesktop ? ` (${sandboxDesktop})` : ""} when ClusterCut runs as a Flatpak.
+            </p>
+            <p className="text-slate-600 dark:text-zinc-400 text-sm">
+              Your compositor does not give sandboxed apps access to the clipboard, and there
+              is no way for ClusterCut to work around it from inside the sandbox. Installing the
+              native package (deb/rpm) fixes this — it is not sandboxed and has full clipboard
+              access. Everything else, including sending files, keeps working either way.
+            </p>
+
+            <div className="flex justify-end gap-3 pt-2">
+              <Button
+                variant="primary"
+                onClick={handleGetNativeVersion}
+              >
+                Get the Native Version
+              </Button>
+              <Button
+                variant="default"
+                onClick={() => setShowSandboxDialog(false)}
+              >
+                Continue Without Clipboard
+              </Button>
+            </div>
+          </Card>
+        </div>
+      )}
 
       {/* GNOME Extension Dialog */}
       {showExtensionDialog && (
