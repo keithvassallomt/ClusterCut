@@ -15,8 +15,10 @@
         "title": "ClusterCut",
         "width": 800,
         "height": 600,
-        "resizable": false,
-        "maximizable": false,
+        "minWidth": 640,
+        "minHeight": 520,
+        "resizable": true,
+        "maximizable": true,
         "minimizable": false,
         "visible": false
       }

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The window is no longer fixed-size, which fixes it becoming stuck in an unmovable, monitor-filling state on tiling Wayland compositors (Hyprland). `resizable: false` made GTK pin the window's minimum and maximum size to 800x600; Hyprland auto-floats fixed-size windows, and dragging one put it into a compositor-driven maximized state that filled the screen while the UI stayed at 800x600 inside it and couldn't be dragged back out.
+
+### Changed
+- The window can now be resized (default 800x600, minimum 640x520) and maximized on all platforms.
+- Removed the Linux `tauri://focus` workaround that toggled the window's resizable flag and force-unmaximized it. Its premise was a fixed-size window: the toggle cleared the GTK size hints on every focus, and the unmaximize half never fired because GTK doesn't report a compositor-imposed maximized state.
+
 ## [0.4.2] - 2026-07-10
 
 ### Fixed

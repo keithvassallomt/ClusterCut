@@ -3,8 +3,6 @@
 
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-#[cfg(target_os = "linux")]
-use tauri::Listener;
 
 use crate::discovery::Discovery;
 use crate::peer::Peer;
@@ -592,25 +590,20 @@ pub(crate) fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            #[cfg(target_os = "linux")]
-            {
-                // Workaround for Flatpak/GTK unresponsive titlebar buttons.
-                // Toggling resizable property on focus seems to "wake up" the window manager.
-                if let Some(window) = app.get_webview_window("main") {
-                    let win_clone = window.clone();
-                    window.listen("tauri://focus", move |_event| {
-                         // Fix: Explicitly unmaximize in case the WM forced it
-                         if let Ok(true) = win_clone.is_maximized() {
-                             let _ = win_clone.unmaximize();
-                         }
-
-                         // We want the window to be non-resizable (to hide maximize button).
-                         // So we toggle True -> False. This forces a frame update on some WMs.
-                         let _ = win_clone.set_resizable(true);
-                         let _ = win_clone.set_resizable(false);
-                    });
-                }
-            }
+            // NOTE: there used to be a Linux-only `tauri://focus` listener here that
+            // force-unmaximized the window and toggled `set_resizable(true/false)` to
+            // work around unresponsive Flatpak/GTK titlebar buttons. Both halves were
+            // tied to the window being fixed-size, which is no longer the case:
+            //   - the resizable toggle cleared the GTK min/max size hints on every
+            //     focus, and a fixed-size window is what made tiling compositors
+            //     (Hyprland) auto-float the window and then strand it in a
+            //     compositor-driven maximized state on drag, at 800x600 content
+            //     inside a monitor-sized frame;
+            //   - the unmaximize call never fired anyway, since GTK does not report
+            //     a compositor-imposed fullscreen/maximized state via `is_maximized`,
+            //     and now that the window is genuinely maximizable it would be wrong
+            //     to undo a maximize the user asked for.
+            // The window is resizable with a min size instead (see tauri.conf.json).
 
             let app_handle = app.handle();
 
@@ -1299,6 +1292,7 @@ pub(crate) fn run() {
             crate::commands::clipboard::recall_copy_history_item,
             crate::commands::clipboard::recall_send_history_item,
             crate::commands::system::check_gnome_extension_status,
+            crate::commands::system::check_clipboard_sandbox_status,
             crate::commands::identity::get_network_pin,
             crate::commands::identity::get_device_id,
             crate::commands::identity::get_hostname,
