@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Arch Linux packaging: ClusterCut is now on the AUR as [`clustercut-bin`](https://aur.archlinux.org/packages/clustercut-bin), a repack of the official amd64 `.deb` (so it carries the same binary, desktop entry, and tray icon). Install with `paru -S clustercut-bin` or your AUR helper of choice. This is the install to use on Hyprland, Sway, and other non-GNOME Wayland compositors, where the Flatpak build cannot access the clipboard at all.
+
 ### Fixed
 - The window is no longer fixed-size, which fixes it becoming stuck in an unmovable, monitor-filling state on tiling Wayland compositors (Hyprland). `resizable: false` made GTK pin the window's minimum and maximum size to 800x600; Hyprland auto-floats fixed-size windows, and dragging one put it into a compositor-driven maximized state that filled the screen while the UI stayed at 800x600 inside it and couldn't be dragged back out.
 - Flatpak users on non-GNOME Wayland compositors are now warned at launch that clipboard sync cannot work, and pointed at the native package instead of being left to discover it silently. Compositors implementing `wp_security_context_v1` (measured on Hyprland) withhold the `wlr-data-control` and `ext-data-control` globals from sandboxed clients, so the Flatpak build has no clipboard to read and no in-sandbox workaround; the native deb/rpm is unaffected. Exposing the host Wayland socket with `--filesystem` does not help.

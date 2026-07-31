@@ -19,7 +19,9 @@ We use `just` to standardize build commands across platforms.
 | `just run-flatpak` | Run the locally-installed Flatpak |
 | `just extension-zip` | Build the GNOME extension ZIP for EGO submission |
 | `just bump-version` | Interactively bump the version across all project files |
-| `just release` | Full release workflow: version sync, commit, tag, push, build native + Flatpak |
+| `just release` | Full release workflow: version sync, commit, tag, push, build native + Flatpak, publish the GitHub release, push to the AUR |
+| `just aur` | Build + validate the `clustercut-bin` AUR package locally (Arch host) |
+| `just aur-publish` | Push the current version's AUR package to the AUR |
 | `just friendlyhub-update` | Prepare a FriendlyHub submission (manifest, sources, metainfo) |
 | `just clean` | Remove all build artifacts |
 
@@ -85,6 +87,20 @@ gnome-extensions enable clustercut@keithvassallo.com
    ```bash
    just release
    ```
+
+   Run it **on Linux first**. That run creates the GitHub release — notes taken from the
+   `CHANGELOG.md` section for this version — uploads the `.deb`, `.rpm` and `.flatpak`,
+   and then pushes `clustercut-bin` to the AUR. Running it later on macOS and Windows
+   adds the `.dmg` and `.exe` to the same release.
+
+   The release is published straight away rather than held as a draft, because assets on
+   a draft release are not publicly downloadable and the AUR package's source URL points
+   at the `.deb`. So the release is briefly live with only the Linux installers on it.
+
+   The AUR step needs an Arch host with `base-devel`, `just`, and an AUR account whose
+   SSH key is configured (see `just aur-publish` for the setup it prints). It is
+   non-fatal: if it fails, the release still completes and `just aur-publish` can be
+   re-run on its own.
 
 4. Update the FriendlyHub submission:
    ```bash

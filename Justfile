@@ -159,7 +159,70 @@ release output_dir="~/Downloads":
         just flatpak "{{output_dir}}"
     fi
 
-    # 10. Summary
+    # 10. Create (or update) the GitHub release and upload THIS platform's artifacts.
+    # The release is published immediately rather than kept as a draft: assets on a
+    # draft release are not publicly downloadable, and the AUR package's source URL
+    # has to resolve the moment it is pushed. So the release goes live with whatever
+    # has been built so far, and the macOS/Windows runs add their installers when
+    # they happen.
+    echo "==> Publishing GitHub release ${TAG}..."
+    NOTES_FILE=$(mktemp)
+    awk -v ver="${VERSION}" '
+        $0 ~ "^## \\[" ver "\\]" { inside = 1; next }
+        inside && /^## \[/ { exit }
+        inside { print }
+    ' CHANGELOG.md > "${NOTES_FILE}"
+    if [ ! -s "${NOTES_FILE}" ]; then
+        echo "ERROR: no CHANGELOG.md section for ${VERSION} to use as release notes."
+        exit 1
+    fi
+    if gh release view "${TAG}" >/dev/null 2>&1; then
+        gh release edit "${TAG}" --notes-file "${NOTES_FILE}" >/dev/null
+        echo "    updated existing release"
+    else
+        gh release create "${TAG}" --title "${TAG}" --notes-file "${NOTES_FILE}" >/dev/null
+        echo "    created release"
+    fi
+    rm -f "${NOTES_FILE}"
+
+    # No bash arrays here on purpose: macOS ships bash 3.2, where expanding an
+    # empty array under `set -u` is an error. Unmatched globs fall through as
+    # literals, which the -f test filters out.
+    UPLOADED=0
+    upload_if_present() {
+        for f in "$@"; do
+            if [ -f "${f}" ]; then
+                echo "    uploading $(basename "${f}")..."
+                gh release upload "${TAG}" "${f}" --clobber
+                UPLOADED=$((UPLOADED + 1))
+            fi
+        done
+    }
+    case "${OS}" in
+        Linux)
+            upload_if_present src-tauri/target/release/bundle/deb/*.deb \
+                              src-tauri/target/release/bundle/rpm/*.rpm \
+                              "${OUTPUT_DIR}/ClusterCut_${VERSION}_x86_64.flatpak"
+            ;;
+        Darwin)
+            upload_if_present src-tauri/target/release/bundle/dmg/*.dmg
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            upload_if_present src-tauri/target/release/bundle/nsis/*.exe
+            ;;
+    esac
+    if [ "${UPLOADED}" -eq 0 ]; then
+        echo "WARNING: no ${OS} artifacts found to upload."
+    fi
+
+    # 11. AUR (Linux only — needs the .deb to be on the release, which step 10 just
+    # did). Non-fatal: a missing AUR setup must not fail an otherwise good release.
+    if [ "${OS}" = "Linux" ]; then
+        echo "==> Publishing to the AUR..."
+        just aur-publish || echo "WARNING: AUR publish failed (see above). Fix it and run 'just aur-publish'."
+    fi
+
+    # 12. Summary
     echo ""
     echo "============================================"
     echo " Release ${TAG} built successfully!"
@@ -326,3 +389,121 @@ friendlyhub-update submission_dir="/home/keith/LocalCode/keithvassallomt/app.clu
     echo "Submission directory: {{submission_dir}}"
     echo "Contents:"
     ls -1 "{{submission_dir}}/"
+
+# ── AUR (clustercut-bin) ──────────────────────────────────────────────────────
+# Repackages the published amd64 .deb, so the release must already be tagged and
+# its .deb uploaded to the GitHub release before either recipe will work.
+
+# Render + validate the AUR package for the current version. Output: <output_dir>/clustercut-bin-<version>/
+aur output_dir="~/Downloads":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    OUTPUT_DIR="{{output_dir}}"
+    OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
+
+    VERSION=$(node -p "require('./package.json').version")
+    STAGING=$(mktemp -d)
+    trap 'rm -rf "${STAGING}"' EXIT
+
+    just _aur-stage "${STAGING}"
+
+    echo "==> Building package with makepkg (validates the PKGBUILD)..."
+    (cd "${STAGING}" && makepkg -f --noconfirm --nocheck)
+
+    DEST="${OUTPUT_DIR}/clustercut-bin-${VERSION}"
+    mkdir -p "${DEST}"
+    cp "${STAGING}/PKGBUILD" "${STAGING}/.SRCINFO" "${DEST}/"
+    cp "${STAGING}"/*.pkg.tar.zst "${DEST}/"
+
+    echo ""
+    echo "============================================"
+    echo " AUR package for ${VERSION} built"
+    echo "============================================"
+    echo ""
+    echo "${DEST}:"
+    ls -1 "${DEST}"
+    echo ""
+    echo "Install locally:  sudo pacman -U ${DEST}/*.pkg.tar.zst"
+    echo "Publish to AUR:   just aur-publish"
+
+# Render, validate, and push the current version to the AUR. Needs an AUR account with your SSH key.
+aur-publish:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VERSION=$(node -p "require('./package.json').version")
+    AUR_REPO="ssh://aur@aur.archlinux.org/clustercut-bin.git"
+
+    STAGING=$(mktemp -d)
+    CHECKOUT=$(mktemp -d)
+    trap 'rm -rf "${STAGING}" "${CHECKOUT}"' EXIT
+
+    just _aur-stage "${STAGING}"
+
+    # Validate before publishing — a broken PKGBUILD on the AUR is public.
+    echo "==> Validating with makepkg..."
+    (cd "${STAGING}" && makepkg -f --noconfirm --nocheck >/dev/null)
+    echo "==> Package builds cleanly."
+
+    echo "==> Cloning ${AUR_REPO}..."
+    if ! git clone --quiet "${AUR_REPO}" "${CHECKOUT}" 2>/dev/null; then
+        echo ""
+        echo "ERROR: could not reach the AUR over SSH. One-time setup:"
+        echo "  1. Create an account at https://aur.archlinux.org/register"
+        echo "  2. Add your public key (~/.ssh/id_ed25519.pub) under My Account -> SSH Public Key"
+        echo "  3. Add to ~/.ssh/config:"
+        echo "       Host aur.archlinux.org"
+        echo "         User aur"
+        echo "         IdentityFile ~/.ssh/id_ed25519"
+        exit 1
+    fi
+
+    cp "${STAGING}/PKGBUILD" "${STAGING}/.SRCINFO" "${CHECKOUT}/"
+    cd "${CHECKOUT}"
+    if git diff --quiet && git diff --cached --quiet; then
+        echo "==> AUR already up to date at ${VERSION}; nothing to push."
+        exit 0
+    fi
+    git add PKGBUILD .SRCINFO
+    git commit --quiet -m "clustercut-bin ${VERSION}"
+    git push --quiet origin master
+    echo ""
+    echo "==> Published clustercut-bin ${VERSION} to the AUR."
+    echo "    https://aur.archlinux.org/packages/clustercut-bin"
+
+# Internal: render PKGBUILD + .SRCINFO for the current version into <staging_dir>
+_aur-stage staging_dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    STAGING="{{staging_dir}}"
+
+    if [ "$(uname -s)" != "Linux" ] || ! command -v makepkg >/dev/null 2>&1; then
+        echo "ERROR: the AUR recipes need an Arch host with base-devel (makepkg not found)."
+        exit 1
+    fi
+
+    VERSION=$(node -p "require('./package.json').version")
+    TAG="v${VERSION}"
+    DEB="ClusterCut_${VERSION}_amd64.deb"
+    URL="https://github.com/keithvassallomt/ClusterCut/releases/download/${TAG}/${DEB}"
+
+    # The PKGBUILD points at the release asset, so it has to exist before we can
+    # checksum it — catch that here rather than emitting a broken PKGBUILD.
+    echo "==> Checking ${TAG} for ${DEB}..."
+    if ! gh release view "${TAG}" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx "${DEB}"; then
+        echo "ERROR: ${DEB} is not attached to release ${TAG}."
+        echo "       Run 'just release' and upload the artifacts first:"
+        echo "       gh release upload ${TAG} ~/Downloads/${DEB}"
+        exit 1
+    fi
+
+    echo "==> Downloading ${DEB} to checksum it..."
+    curl -sSfL -o "${STAGING}/${DEB}" "${URL}"
+    SHA256=$(sha256sum "${STAGING}/${DEB}" | cut -d' ' -f1)
+    echo "    sha256: ${SHA256}"
+
+    sed -e "s/@PKGVER@/${VERSION}/g" -e "s/@SHA256@/${SHA256}/g" \
+        packaging/aur/PKGBUILD.in > "${STAGING}/PKGBUILD"
+
+    # makepkg reuses the already-downloaded deb instead of fetching it again.
+    (cd "${STAGING}" && makepkg --printsrcinfo > .SRCINFO)
+    echo "==> Rendered PKGBUILD + .SRCINFO for ${VERSION}"
