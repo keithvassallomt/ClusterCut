@@ -452,6 +452,14 @@ aur-publish:
     CHECKOUT=$(mktemp -d)
     trap 'rm -rf "${STAGING}" "${CHECKOUT}"' EXIT
 
+    # Resolve the signing identity HERE, in the project tree, where any
+    # per-directory includeIf still applies. The AUR checkout below lives in a temp
+    # dir that only sees global config, so whatever it would resolve there may not
+    # be the key you actually sign with (or may not resolve at all).
+    SIGN_FORMAT=$(git config --get gpg.format || echo "")
+    SIGN_KEY=$(git config --get user.signingkey || echo "")
+    SIGN_ON=$(git config --get commit.gpgsign || echo "false")
+
     just _aur-stage "${STAGING}"
 
     # Validate before publishing — a broken PKGBUILD on the AUR is public.
@@ -482,11 +490,17 @@ aur-publish:
         echo "==> AUR already up to date at ${VERSION}; nothing to push."
         exit 0
     fi
-    # Signing is disabled explicitly: this checkout is a temp dir, so it inherits
-    # global git config rather than any per-directory includeIf, and the AUR does
-    # not verify commit signatures anyway. Without this, a global commit.gpgsign
-    # whose signingkey doesn't resolve outside the project tree fails the commit.
-    git -c commit.gpgsign=false commit --quiet -m "clustercut-bin ${VERSION}"
+    # Sign with the same key the project signs with, carried in from above. Without
+    # this the commit inherits global config, where a signingkey that doesn't
+    # resolve outside the project tree aborts the commit outright.
+    if [ "${SIGN_ON}" = "true" ] && [ -n "${SIGN_KEY}" ]; then
+        git -c commit.gpgsign=true \
+            -c gpg.format="${SIGN_FORMAT}" \
+            -c user.signingkey="${SIGN_KEY}" \
+            commit --quiet -m "clustercut-bin ${VERSION}"
+    else
+        git commit --quiet -m "clustercut-bin ${VERSION}"
+    fi
     # The AUR's branch is master. A clone of an *empty* repo takes its branch name
     # from init.defaultBranch locally, which may well be main -- so name the remote
     # ref explicitly rather than relying on the local branch being called master.
