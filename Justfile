@@ -482,7 +482,11 @@ aur-publish:
         echo "==> AUR already up to date at ${VERSION}; nothing to push."
         exit 0
     fi
-    git commit --quiet -m "clustercut-bin ${VERSION}"
+    # Signing is disabled explicitly: this checkout is a temp dir, so it inherits
+    # global git config rather than any per-directory includeIf, and the AUR does
+    # not verify commit signatures anyway. Without this, a global commit.gpgsign
+    # whose signingkey doesn't resolve outside the project tree fails the commit.
+    git -c commit.gpgsign=false commit --quiet -m "clustercut-bin ${VERSION}"
     # The AUR's branch is master. A clone of an *empty* repo takes its branch name
     # from init.defaultBranch locally, which may well be main -- so name the remote
     # ref explicitly rather than relying on the local branch being called master.
