@@ -67,6 +67,15 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.4.4" date="2026-09-24">
+      <description>
+        <p>Faster clipboard sync.</p>
+        <ul>
+          <li>Copies are now sent to your other devices the moment you make them, instead of up to half a second later. This applies on X11, on KDE, Sway, Hyprland and other wlroots desktops, and on Windows and macOS. GNOME was already instant.</li>
+          <li>A device with a slow or unreliable connection no longer holds up clipboard updates from your other devices.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.3" date="2026-07-31">
       <description>
         <p>
