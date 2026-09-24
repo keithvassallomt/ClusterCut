@@ -1,7 +1,10 @@
 /// Clipboard backend using wl-clipboard-rs (wlr-data-control protocol).
 /// Used on Wayland with compositors that support wlr-data-control (KDE, Sway, Hyprland).
 ///
-/// Uses polling with get_contents (not subprocess spawning), so no flickering.
+/// Reads with get_contents (not subprocess spawning), so no flickering. The
+/// monitor is woken by data-control selection events (`change_events`) and
+/// polls as a fallback.
+use super::change_events;
 use super::common::{self, ClipboardContent};
 use crate::protocol::{ClipboardBlob, ClipboardFormat};
 use crate::state::AppState;
@@ -81,6 +84,11 @@ const MAX_RICH_TEXT_READ_BYTES: u64 = 16 * 1024 * 1024;
 /// pumping a giant selection through the compositor on every poll (the thing
 /// that wedges the Wayland session when a 100 MB+ payload sits on the clipboard).
 const CLIP_PROBE_BYTES: u64 = 64 * 1024;
+
+/// Longest the monitor waits between clipboard checks. Selection events from
+/// the data-control listener wake it sooner, so this is only the fallback if
+/// the listener misses something or can't start.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Check if wlr-data-control is available by attempting a paste.
 pub fn is_available() -> bool {
@@ -544,6 +552,10 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
         let mut last_content = ClipboardContent::None;
         let mut last_fp: Option<(Vec<String>, Vec<u8>)> = None;
 
+        // Selection events cut the wait between checks short (issue #20).
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
+        change_events::spawn_data_control_listener(wake_tx);
+
         loop {
             if state.is_shutdown() {
                 tracing::info!("Wayland clipboard monitor shutting down.");
@@ -557,7 +569,7 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
             // fingerprint actually changes.
             let fp = clipboard_fingerprint();
             if fp == last_fp {
-                thread::sleep(Duration::from_millis(500));
+                change_events::wait_for_change(&wake_rx, POLL_INTERVAL);
                 continue;
             }
             last_fp = fp;
@@ -580,7 +592,7 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 common::EchoVerdict::NoChange => {}
             }
 
-            thread::sleep(Duration::from_millis(500));
+            change_events::wait_for_change(&wake_rx, POLL_INTERVAL);
         }
     });
 }

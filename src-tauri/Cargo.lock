@@ -960,8 +960,12 @@ dependencies = [
  "url",
  "user-notify",
  "uuid",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
  "windows 0.61.3",
  "wl-clipboard-rs",
+ "x11rb",
  "zbus 4.4.0",
 ]
 

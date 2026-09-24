@@ -71,6 +71,13 @@ user-notify = { git = "https://github.com/Simon-Laux/user-notify" }
 [target.'cfg(target_os = "linux")'.dependencies]
 libappindicator = "0.9"
 wl-clipboard-rs = "0.9.3"
+# Clipboard change listeners (clipboard/change_events.rs). All already in the
+# tree via clipboard-rs (x11rb) and wl-clipboard-rs (wayland-*); named here so
+# we can use them directly.
+x11rb = { version = "0.13", features = ["xfixes"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -83,7 +90,8 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Networking_Connectivity",
 ] }
-clipboard-win = "5.4"
+# `monitor` for the WM_CLIPBOARDUPDATE listener in clipboard/change_events.rs.
+clipboard-win = { version = "5.4", features = ["monitor"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 system-configuration = "0.6"

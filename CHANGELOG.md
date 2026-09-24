@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Copies are now picked up as soon as they happen on X11, Windows, and wlroots/KDE Wayland, instead of waiting for the next 500 ms clipboard poll (issue #20). ClusterCut listens for the OS clipboard change event (XFixes on X11, `WM_CLIPBOARDUPDATE` on Windows, data-control selection events on Wayland) and keeps the old poll as a fallback. macOS has no change event, so it now checks the pasteboard's change counter every 50 ms instead of every 500 ms. GNOME Wayland was already event-driven and is unchanged.
+- A slow or lossy incoming handshake no longer holds up connections from other peers. Inbound handshakes were completed one at a time, so a single lost handshake packet (about 1 s of QUIC retransmit timer) delayed every peer queued behind it.
+
 ## [0.4.3] - 2026-07-31
 
 ### Added

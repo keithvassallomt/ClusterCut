@@ -218,123 +218,139 @@ impl Transport {
         let endpoint = self.endpoint.clone();
         tauri::async_runtime::spawn(async move {
             tracing::info!("Starting transport listener loop...");
-            while let Some(conn) = endpoint.accept().await {
-                // Capture the peer's address before the handshake-future
-                // consumes `conn`. Without this, a failed handshake logs an
-                // anonymous "rejected" line and you have no way to tell
-                // which host on the LAN tried to reach you.
-                let remote_for_log = conn.remote_address();
-                let connection = conn.await;
-                match connection {
-                    Ok(conn) => {
-                        let remote_addr = conn.remote_address();
-                        on_conn_event("connect", remote_addr, None);
-                        // tracing::info!("Transport established connection with {}", remote_addr);
-
-                        // Check Protocol (ALPN)
-                        let protocol = conn
-                            .handshake_data()
-                            .unwrap()
-                            .downcast::<quinn::crypto::rustls::HandshakeData>()
-                            .unwrap()
-                            .protocol
-                            .map(|p| String::from_utf8_lossy(&p).to_string());
-
-                        // Default to transport if unknown
-                        let proto = protocol.unwrap_or_else(|| "clustercut-transport".to_string());
-
-                        tracing::debug!("Connection from {} using ALPN: {}", remote_addr, proto);
-
-                        if proto == "clustercut-file" {
-                            // File Stream Handler
-                            let on_receive_file = on_receive_file.clone();
-                            tauri::async_runtime::spawn(async move {
-                                tracing::debug!("Handling FILE connection from {}", remote_addr);
-                                loop {
-                                    // Accept Uni streams for files
-                                    match conn.accept_uni().await {
-                                        Ok(recv) => {
-                                            tracing::info!(
-                                                "Accepted FILE stream from {}",
-                                                remote_addr
-                                            );
-                                            on_receive_file(recv, remote_addr);
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                "File connection closed/error from {}: {}",
-                                                remote_addr,
-                                                e
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                            });
-                        } else {
-                            // Standard Message Handler (clustercut-transport)
-                            let on_receive_message = on_receive_message.clone();
-                            let on_conn_event = on_conn_event.clone();
-                            tauri::async_runtime::spawn(async move {
-                                // tracing::debug!("Handling MESSAGE connection from {}", remote_addr);
-                                loop {
-                                    match conn.accept_bi().await {
-                                        Ok((_, mut recv)) => {
-                                            // Cap each message at 64 MB. Sized to fit a 10 MB raw
-                                            // clipboard image after the wire-format expansion:
-                                            // base64 (1.33×) inside ClipboardPayload JSON, then the
-                                            // encrypted ciphertext re-wrapped in
-                                            // Message::Clipboard(Vec<u8>) which serde_json emits
-                                            // as an integer array (~3.5×). Net ~50 MB worst case.
-                                            const MESSAGE_BYTE_CAP: usize = 1024 * 1024 * 64;
-                                            match recv.read_to_end(MESSAGE_BYTE_CAP).await {
-                                                Ok(buf) => {
-                                                    if !buf.is_empty() {
-                                                        on_receive_message(buf, remote_addr);
-                                                    }
-                                                }
-                                                Err(quinn::ReadToEndError::TooLong) => {
-                                                    tracing::error!(
-                                                        "Stream from {} exceeded {} byte cap; dropping. Likely a clipboard image larger than the supported wire size.",
-                                                        remote_addr,
-                                                        MESSAGE_BYTE_CAP
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!(
-                                                        "Failed to read from stream from {}: {}",
-                                                        remote_addr,
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(_e) => {
-                                            // connection closed is normal
-                                            // tracing::debug!("Message connection closed/error from {}: {}", remote_addr, e);
-                                            on_conn_event("drop", remote_addr, None);
-                                            break;
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Connection handshake failed from {}: {}",
-                            remote_for_log,
-                            e
-                        );
-                        on_conn_event("handshake_failed", remote_for_log, Some(e.to_string()));
-                    }
-                }
+            while let Some(incoming) = endpoint.accept().await {
+                // Finish each handshake in its own task. Awaiting it here
+                // would serialise them: one slow or lossy handshake (a lost
+                // packet costs ~1 s of QUIC retransmit timer before the first
+                // RTT sample) would hold up every other peer's connection
+                // behind it (issue #20).
+                tauri::async_runtime::spawn(serve_connection(
+                    incoming,
+                    on_receive_message.clone(),
+                    on_receive_file.clone(),
+                    on_conn_event.clone(),
+                ));
             }
         });
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, Box<dyn Error>> {
         Ok(self.endpoint.local_addr()?)
+    }
+}
+
+/// Complete one inbound handshake and route the connection by ALPN: file
+/// connections hand each uni stream to `on_receive_file`, message connections
+/// read each bi stream to the end and hand the bytes to `on_receive_message`.
+async fn serve_connection<F, G, H>(
+    incoming: quinn::Incoming,
+    on_receive_message: F,
+    on_receive_file: G,
+    on_conn_event: H,
+) where
+    F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static + Clone,
+    G: Fn(quinn::RecvStream, SocketAddr) + Send + Sync + 'static + Clone,
+    H: Fn(&str, SocketAddr, Option<String>) + Send + Sync + 'static + Clone,
+{
+    // Capture the peer's address before the handshake-future consumes
+    // `incoming`. Without this, a failed handshake logs an anonymous
+    // "rejected" line and you have no way to tell which host on the LAN
+    // tried to reach you.
+    let remote_for_log = incoming.remote_address();
+    let conn = match incoming.await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!(
+                "Connection handshake failed from {}: {}",
+                remote_for_log,
+                e
+            );
+            on_conn_event("handshake_failed", remote_for_log, Some(e.to_string()));
+            return;
+        }
+    };
+
+    let remote_addr = conn.remote_address();
+    on_conn_event("connect", remote_addr, None);
+    // tracing::info!("Transport established connection with {}", remote_addr);
+
+    // Check Protocol (ALPN)
+    let protocol = conn
+        .handshake_data()
+        .unwrap()
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .unwrap()
+        .protocol
+        .map(|p| String::from_utf8_lossy(&p).to_string());
+
+    // Default to transport if unknown
+    let proto = protocol.unwrap_or_else(|| "clustercut-transport".to_string());
+
+    tracing::debug!("Connection from {} using ALPN: {}", remote_addr, proto);
+
+    if proto == "clustercut-file" {
+        // File Stream Handler
+        tracing::debug!("Handling FILE connection from {}", remote_addr);
+        loop {
+            // Accept Uni streams for files
+            match conn.accept_uni().await {
+                Ok(recv) => {
+                    tracing::info!("Accepted FILE stream from {}", remote_addr);
+                    on_receive_file(recv, remote_addr);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "File connection closed/error from {}: {}",
+                        remote_addr,
+                        e
+                    );
+                    break;
+                }
+            }
+        }
+    } else {
+        // Standard Message Handler (clustercut-transport)
+        // tracing::debug!("Handling MESSAGE connection from {}", remote_addr);
+        loop {
+            match conn.accept_bi().await {
+                Ok((_, mut recv)) => {
+                    // Cap each message at 64 MB. Sized to fit a 10 MB raw
+                    // clipboard image after the wire-format expansion:
+                    // base64 (1.33×) inside ClipboardPayload JSON, then the
+                    // encrypted ciphertext re-wrapped in
+                    // Message::Clipboard(Vec<u8>) which serde_json emits
+                    // as an integer array (~3.5×). Net ~50 MB worst case.
+                    const MESSAGE_BYTE_CAP: usize = 1024 * 1024 * 64;
+                    match recv.read_to_end(MESSAGE_BYTE_CAP).await {
+                        Ok(buf) => {
+                            if !buf.is_empty() {
+                                on_receive_message(buf, remote_addr);
+                            }
+                        }
+                        Err(quinn::ReadToEndError::TooLong) => {
+                            tracing::error!(
+                                "Stream from {} exceeded {} byte cap; dropping. Likely a clipboard image larger than the supported wire size.",
+                                remote_addr,
+                                MESSAGE_BYTE_CAP
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to read from stream from {}: {}",
+                                remote_addr,
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(_e) => {
+                    // connection closed is normal
+                    // tracing::debug!("Message connection closed/error from {}: {}", remote_addr, e);
+                    on_conn_event("drop", remote_addr, None);
+                    break;
+                }
+            }
+        }
     }
 }
 

@@ -7,6 +7,7 @@
 /// The two crates run side-by-side on the same monitor thread; reads on all
 /// three platforms (X11, Windows, macOS) are non-destructive, so the
 /// existing text/file paths are unaffected if arboard is disabled or fails.
+use super::change_events;
 use super::common::{self, ClipboardContent};
 use super::rich;
 use crate::protocol::{ClipboardBlob, ClipboardFormat};
@@ -79,6 +80,17 @@ enum WorkerCommand {
 /// looks this up to dispatch onto the worker thread instead of opening its
 /// own arboard handle on whichever thread it happens to be running on.
 static WORKER_CMD_TX: OnceLock<mpsc::Sender<WorkerCommand>> = OnceLock::new();
+
+/// Longest the monitor waits between clipboard checks. On X11 and Windows a
+/// change event wakes it sooner (see `change_events`), so this is only the
+/// fallback if that listener misses something or can't start. macOS has no
+/// change notification, but its loop is gated on the cheap NSPasteboard
+/// changeCount and only reads when that moves, so it can poll fast enough to
+/// pick up a copy in well under 100 ms.
+#[cfg(target_os = "macos")]
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(not(target_os = "macos"))]
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Cap on RGBA bytes returned by arboard. A 4K image is ~33 MB; 200 MB
 /// covers up to ~7K screenshots without risking absurd allocations.
@@ -697,6 +709,17 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
         // the current clipboard owner left a stale file-reference URL behind.
         let mut last_change_count: Option<i64> = None;
 
+        // Change events cut the wait between checks short (issue #20). There
+        // is no listener on macOS, so each wait there is a plain POLL_INTERVAL
+        // sleep.
+        let (wake_tx, wake_rx) = mpsc::channel::<()>();
+        #[cfg(target_os = "linux")]
+        change_events::spawn_x11_listener(wake_tx);
+        #[cfg(target_os = "windows")]
+        change_events::spawn_windows_listener(wake_tx);
+        #[cfg(target_os = "macos")]
+        drop(wake_tx);
+
         loop {
             if state.is_shutdown() {
                 tracing::info!("Clipboard monitor received shutdown signal, exiting.");
@@ -705,7 +728,7 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
 
             if let Some(current) = rich::clipboard_change_count() {
                 if Some(current) == last_change_count {
-                    thread::sleep(Duration::from_millis(500));
+                    change_events::wait_for_change(&wake_rx, POLL_INTERVAL);
                     continue;
                 }
                 last_change_count = Some(current);
@@ -756,7 +779,7 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 common::EchoVerdict::NoChange => {}
             }
 
-            thread::sleep(Duration::from_millis(500));
+            change_events::wait_for_change(&wake_rx, POLL_INTERVAL);
         }
     });
 }

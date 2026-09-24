@@ -1,3 +1,4 @@
+mod change_events;
 pub mod common;
 pub mod history_store;
 pub mod preview;
