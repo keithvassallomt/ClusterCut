@@ -1,0 +1,17 @@
+{{!--
+  Handlebars template for the ClusterCut.desktop that the Tauri bundler always
+  generates (it names the file after productName, with no way to change that).
+  The real launcher is app.clustercut.clustercut.desktop, shared with the
+  Flatpak (src-tauri/flatpak/). This one is kept hidden so launchers pinned
+  before the rename still work, and has no StartupWMClass so the running window
+  matches the real launcher instead. Icon is hard-coded because {{icon}} is the
+  bundler's 1024 px PNG, a size the hicolor theme never looks in.
+--}}
+# Hidden alias kept for launchers pinned before the move to app.clustercut.clustercut.desktop.
+[Desktop Entry]
+Type=Application
+Name={{name}}
+Exec={{exec}}
+Icon=app.clustercut.clustercut
+Terminal=false
+NoDisplay=true

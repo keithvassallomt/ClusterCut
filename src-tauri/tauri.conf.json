@@ -67,12 +67,18 @@
     },
     "linux": {
       "deb": {
+        "desktopTemplate": "../packaging/linux/ClusterCut-legacy.desktop",
         "files": {
+          "/usr/share/applications/app.clustercut.clustercut.desktop": "flatpak/app.clustercut.clustercut.desktop",
+          "/usr/share/icons/hicolor/scalable/apps/app.clustercut.clustercut.svg": "flatpak/app.clustercut.clustercut.svg",
           "/usr/share/icons/hicolor/scalable/status/app.clustercut.clustercut-tray-symbolic.svg": "../assets/Tray Icons/svg/clustercut-tray-symbolic.svg"
         }
       },
       "rpm": {
+        "desktopTemplate": "../packaging/linux/ClusterCut-legacy.desktop",
         "files": {
+          "/usr/share/applications/app.clustercut.clustercut.desktop": "flatpak/app.clustercut.clustercut.desktop",
+          "/usr/share/icons/hicolor/scalable/apps/app.clustercut.clustercut.svg": "flatpak/app.clustercut.clustercut.svg",
           "/usr/share/icons/hicolor/scalable/status/app.clustercut.clustercut-tray-symbolic.svg": "../assets/Tray Icons/svg/clustercut-tray-symbolic.svg"
         }
       }
