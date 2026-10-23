@@ -1,9 +1,12 @@
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { version } from "../../../package.json";
 import clsx from "clsx";
 import { Settings, Monitor, Wifi } from "lucide-react";
 import { SectionHeader, Card } from "../ui";
-import { ShortcutRecorder } from "../ShortcutRecorder";
-import type { AppSettings } from "../../types";
+import { GlobalShortcutField } from "./GlobalShortcutField";
+import type { AppSettings, ShortcutStatus } from "../../types";
 
 // The firewall toggle only has an effect on Windows, where
 // configure_windows_firewall() exists. Match ShortcutRecorder's userAgent check.
@@ -20,6 +23,19 @@ export function GeneralSettings({
   autostart: boolean;
   toggleAutostart: () => void;
 }) {
+  // How global shortcuts are bound here (plugin, Wayland portal, Hyprland binds).
+  const [shortcutStatus, setShortcutStatus] = useState<ShortcutStatus | null>(null);
+  useEffect(() => {
+    const refresh = () => invoke<ShortcutStatus>("get_shortcut_status").then(setShortcutStatus);
+    refresh();
+    const unlisten = listen("shortcut-status-changed", refresh);
+    return () => { unlisten.then(f => f()); };
+  }, []);
+  const showHyprlandToggle =
+    !!shortcutStatus?.hyprland &&
+    shortcutStatus.portal?.state === "bound" &&
+    (!settings.auto_send || !settings.auto_receive);
+
   return (
     <div className="flex flex-col gap-4">
       {/* General Settings */}
@@ -112,10 +128,13 @@ export function GeneralSettings({
             <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-white/10 dark:bg-white/5">
               <div className="flex flex-col gap-2">
                 <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">Global Shortcut (Send)</div>
-                <ShortcutRecorder
+                <GlobalShortcutField
+                  shortcutId="manual-send"
+                  dbusMethod="ManualSend"
                   value={settings.shortcut_send}
                   onChange={(val) => setSettings({ ...settings, shortcut_send: val })}
-                  placeholder="No shortcut set"
+                  status={shortcutStatus}
+                  hyprlandBindKeys={settings.hyprland_bind_keys}
                 />
                 <div className="text-[10px] text-zinc-500">
                   Keyboard shortcut to manually broadcast clipboard.
@@ -143,16 +162,39 @@ export function GeneralSettings({
             <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-white/10 dark:bg-white/5">
               <div className="flex flex-col gap-2">
                 <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">Global Shortcut (Receive)</div>
-                <ShortcutRecorder
+                <GlobalShortcutField
+                  shortcutId="manual-receive"
+                  dbusMethod="ManualReceive"
                   value={settings.shortcut_receive}
                   onChange={(val) => setSettings({ ...settings, shortcut_receive: val })}
-                  placeholder="No shortcut set"
+                  status={shortcutStatus}
+                  hyprlandBindKeys={settings.hyprland_bind_keys}
                 />
                 <div className="text-[10px] text-zinc-500">
                   Keyboard shortcut to apply pending clipboard data.
                 </div>
               </div>
             </div>
+          )}
+
+          {showHyprlandToggle && (
+            <>
+              <div className="h-px bg-zinc-900/5 dark:bg-white/5" />
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">Bind Keys in Hyprland</div>
+                  <div className="text-xs text-zinc-500">
+                    Hyprland doesn't assign keys to app shortcuts. Let ClusterCut add its binds while it runs, without editing your config.
+                  </div>
+                </div>
+                <button
+                  onClick={() => setSettings({ ...settings, hyprland_bind_keys: !settings.hyprland_bind_keys })}
+                  className={clsx("relative h-6 w-11 shrink-0 rounded-full transition-colors", settings.hyprland_bind_keys ? "bg-emerald-500" : "bg-zinc-200 dark:bg-zinc-700")}
+                >
+                  <span className={clsx("block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform", settings.hyprland_bind_keys ? "translate-x-6" : "translate-x-1")} />
+                </button>
+              </div>
+            </>
           )}
         </div>
       </Card>

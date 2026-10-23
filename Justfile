@@ -63,7 +63,18 @@ dev-setup:
         "${TRAY_DEST}/app.clustercut.clustercut-tray-symbolic.svg"
     echo "Installed tray icon to ${TRAY_DEST}/app.clustercut.clustercut-tray-symbolic.svg"
 
-    # 2. GNOME extension — copy (not symlink) so gnome-shell treats it as a normal install.
+    # 2. Launcher + icon under the app ID. Desktop portals only accept
+    #    Registry.Register("app.clustercut.clustercut") when a matching .desktop
+    #    exists; otherwise they guess the app ID from the launching process and
+    #    global shortcuts register under the wrong app.
+    APPS_DEST="${HOME}/.local/share/applications"
+    ICON_DEST="${HOME}/.local/share/icons/hicolor/scalable/apps"
+    mkdir -p "${APPS_DEST}" "${ICON_DEST}"
+    install -m 0644 src-tauri/flatpak/app.clustercut.clustercut.desktop "${APPS_DEST}/"
+    install -m 0644 src-tauri/flatpak/app.clustercut.clustercut.svg "${ICON_DEST}/"
+    echo "Installed launcher to ${APPS_DEST}/app.clustercut.clustercut.desktop"
+
+    # 3. GNOME extension — copy (not symlink) so gnome-shell treats it as a normal install.
     EXT_UUID="clustercut@keithvassallo.com"
     EXT_DEST="${HOME}/.local/share/gnome-shell/extensions/${EXT_UUID}"
     mkdir -p "${EXT_DEST}"

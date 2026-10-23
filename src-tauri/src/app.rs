@@ -1307,6 +1307,9 @@ pub(crate) fn run() {
             crate::commands::peers::expects_remote_manual_peers,
             crate::commands::system::log_frontend,
             crate::commands::settings::save_settings,
+            crate::commands::shortcuts::get_shortcut_status,
+            crate::commands::shortcuts::configure_portal_shortcuts,
+            crate::commands::shortcuts::retry_portal_shortcuts,
             crate::commands::identity::set_network_identity,
             crate::commands::identity::regenerate_network_identity,
             crate::commands::clipboard::send_clipboard,
@@ -1405,6 +1408,10 @@ pub(crate) fn run() {
 
                 // Clear Cache on Exit
                 clear_cache(app_handle);
+
+                // Runtime Hyprland binds would otherwise keep swallowing the keys.
+                #[cfg(target_os = "linux")]
+                crate::hyprland::unbind_on_exit();
 
                 let state = app_handle.state::<AppState>();
 

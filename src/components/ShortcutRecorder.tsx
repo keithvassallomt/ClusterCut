@@ -171,7 +171,7 @@ export function ShortcutRecorder({ value, onChange, placeholder = "Record Shortc
   );
 }
 
-function Kbd({ label }: { label: string }) {
+export function Kbd({ label }: { label: string }) {
     return (
         <div className="min-w-[20px] rounded bg-zinc-100 px-1.5 py-0.5 text-center text-xs font-semibold text-zinc-600 shadow-sm ring-1 ring-inset ring-zinc-300 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-zinc-700">
             {label}

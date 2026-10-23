@@ -180,6 +180,9 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
 
                     #[cfg(not(target_os = "linux"))]
                     let _ = toggle_send_handle.set_checked(settings.auto_send);
+
+                    drop(settings);
+                    crate::shortcuts::register_shortcuts(app);
                 }
                 "toggle_auto_receive" => {
                     let state = app.state::<AppState>();
@@ -198,6 +201,9 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<TrayIcon<Wry>> {
 
                     #[cfg(not(target_os = "linux"))]
                     let _ = toggle_receive_handle.set_checked(settings.auto_receive);
+
+                    drop(settings);
+                    crate::shortcuts::register_shortcuts(app);
                 }
                 _ => {}
             }

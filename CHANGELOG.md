@@ -7,10 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The manual Send/Receive shortcuts now work on Wayland. They previously relied on X11, so on Wayland they never fired, and never at all in the Flatpak. ClusterCut now registers them through the desktop's global shortcuts portal (GNOME 48+, KDE Plasma 5.27+, Hyprland): GNOME and KDE ask once, Settings shows the key the desktop assigned, and "Change" opens the desktop's own shortcut settings.
+- Hyprland's portal never assigns keys, so on Hyprland ClusterCut can bind them itself over Hyprland's IPC while it runs ("Bind Keys in Hyprland", off by default; your config files are never edited), or show the line to add to your config.
+- On Wayland desktops without the portal (Sway, GNOME 47 and older), bind a key to the new `ManualSend` / `ManualReceive` D-Bus methods; Settings shows the `gdbus` command.
+
 ### Changed
 - The deb, rpm, and AUR packages now install the same launcher and icon as the Flatpak: `app.clustercut.clustercut.desktop`, matching the app ID that desktop portals use to identify ClusterCut, listed under Utilities. The old `ClusterCut.desktop` remains as a hidden entry so launchers pinned before the change keep working.
 
 ### Fixed
+- Switching Auto-Send or Auto-Receive off from the tray or the GNOME Quick Settings tile now turns the manual shortcut on straight away, and switching back turns it off. It used to wait for a restart or a settings change in the window, on every platform.
+- A manual send (shortcut or D-Bus) now shows its text in History and is kept there. It appeared as an empty "Sent" entry since the 0.3.6 History rework.
 - On Linux, the window's close button works again without first minimising or maximising the window, a regression since 0.4.3. Making the window resizable had removed the workaround that kept GTK's titlebar buttons responsive; it is back, adapted to the resizable window (except on Hyprland), and restoring the window from the tray or the GNOME extension unminimizes it first.
 - Toggling Auto-Send or Auto-Receive from the GNOME Quick Settings tile no longer freezes ClusterCut. The D-Bus toggle refreshed the tray menu while still holding the settings lock, and the tray menu takes that lock too, so every later settings access hung.
 - The app icon now shows in Linux launchers for the deb, rpm, and AUR packages. They only shipped a 1024 px PNG, a size the icon theme never looks in.

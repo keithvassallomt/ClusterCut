@@ -556,6 +556,10 @@ pub struct AppSettings {
     /// count. Default 200 MB; oldest entries evict first when exceeded.
     #[serde(default = "default_history_store_max_bytes")]
     pub history_store_max_bytes: u64,
+    /// Hyprland only: bind the manual shortcuts live over Hyprland's IPC, since
+    /// its shortcut portal never assigns keys. Opt-in; no config files touched.
+    #[serde(default)]
+    pub hyprland_bind_keys: bool,
 }
 
 fn default_pairing_accept_enabled() -> bool {
@@ -591,6 +595,7 @@ impl Default for AppSettings {
             configure_firewall: true,
             mdns_advertising: true,
             history_store_max_bytes: 200 * 1024 * 1024,
+            hyprland_bind_keys: false,
         }
     }
 }

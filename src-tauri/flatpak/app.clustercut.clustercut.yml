@@ -18,6 +18,7 @@ finish-args:
   - --system-talk-name=org.freedesktop.login1
   - --filesystem=home
   - --filesystem=xdg-run/tray-icon:create
+  - --filesystem=xdg-run/hypr
 modules:
   - shared-modules/libappindicator/libappindicator-gtk3-12.10.json
   - name: clustercut

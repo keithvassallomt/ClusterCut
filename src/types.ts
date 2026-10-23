@@ -99,4 +99,27 @@ export interface AppSettings {
   configure_firewall: boolean;
   mdns_advertising: boolean;
   history_store_max_bytes: number; // bytes; History content store budget
+  hyprland_bind_keys: boolean; // Hyprland: bind manual shortcuts live over IPC
+}
+
+// Wayland GlobalShortcuts portal binding (get_shortcut_status).
+export type PortalShortcutStatus =
+  | { state: "inactive" }
+  | { state: "unavailable" }
+  | { state: "declined" }
+  // triggers: shortcut ID -> the desktop's own description of the key
+  | { state: "bound"; version: number; triggers: Record<string, string> }
+  | { state: "error"; message: string };
+
+export interface HyprlandShortcutStatus {
+  syntax: "lua" | "legacy" | null;
+  bound: Record<string, string>; // shortcut ID -> keys ClusterCut bound
+  conflicts: Record<string, string>; // shortcut ID -> keys already in use
+  config_lines: Record<string, string>; // shortcut ID -> line for the user's config
+}
+
+export interface ShortcutStatus {
+  backend: "native" | "portal";
+  portal?: PortalShortcutStatus | null;
+  hyprland?: HyprlandShortcutStatus | null;
 }

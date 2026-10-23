@@ -75,6 +75,7 @@ impl ClusterCutDBus {
         #[cfg(desktop)]
         crate::tray::update_tray_menu(&self.app_handle);
 
+        crate::shortcuts::register_shortcuts(&self.app_handle);
         enabled
     }
 
@@ -91,6 +92,7 @@ impl ClusterCutDBus {
         #[cfg(desktop)]
         crate::tray::update_tray_menu(&self.app_handle);
 
+        crate::shortcuts::register_shortcuts(&self.app_handle);
         enabled
     }
 
@@ -112,6 +114,22 @@ impl ClusterCutDBus {
 
     async fn quit(&self) {
         self.app_handle.exit(0);
+    }
+
+    /// Manual-mode Send, for desktops without a global-shortcuts portal: users
+    /// bind a key to `gdbus call ... app.clustercut.clustercut.ManualSend`.
+    async fn manual_send(&self) {
+        tracing::info!("ManualSend requested over D-Bus");
+        let app = self.app_handle.clone();
+        // The GNOME clipboard bridge is a blocking D-Bus call; keep it off the executor.
+        let _ = tauri::async_runtime::spawn_blocking(move || crate::shortcuts::manual_send(&app)).await;
+    }
+
+    /// Manual-mode Receive; see `manual_send`.
+    async fn manual_receive(&self) {
+        tracing::info!("ManualReceive requested over D-Bus");
+        let app = self.app_handle.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || crate::shortcuts::manual_receive(&app)).await;
     }
 
     #[zbus(signal)]
