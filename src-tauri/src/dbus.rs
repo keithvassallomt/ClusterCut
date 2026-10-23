@@ -62,30 +62,36 @@ impl ClusterCutDBus {
 #[interface(name = "app.clustercut.clustercut")]
 impl ClusterCutDBus {
     async fn toggle_auto_send(&mut self) -> bool {
-        let state = self.app_handle.state::<AppState>();
-        let mut settings = state.settings.lock().unwrap();
-        settings.auto_send = !settings.auto_send;
-        crate::storage::save_settings(&self.app_handle, &settings);
-        let _ = self.app_handle.emit("settings-changed", settings.clone());
+        let enabled = {
+            let state = self.app_handle.state::<AppState>();
+            let mut settings = state.settings.lock().unwrap();
+            settings.auto_send = !settings.auto_send;
+            crate::storage::save_settings(&self.app_handle, &settings);
+            let _ = self.app_handle.emit("settings-changed", settings.clone());
+            settings.auto_send
+        };
 
-        // Notify Tray if applicable
+        // Notify Tray if applicable. After releasing settings: it locks them itself.
         #[cfg(desktop)]
         crate::tray::update_tray_menu(&self.app_handle);
 
-        settings.auto_send
+        enabled
     }
 
     async fn toggle_auto_receive(&mut self) -> bool {
-        let state = self.app_handle.state::<AppState>();
-        let mut settings = state.settings.lock().unwrap();
-        settings.auto_receive = !settings.auto_receive;
-        crate::storage::save_settings(&self.app_handle, &settings);
-        let _ = self.app_handle.emit("settings-changed", settings.clone());
+        let enabled = {
+            let state = self.app_handle.state::<AppState>();
+            let mut settings = state.settings.lock().unwrap();
+            settings.auto_receive = !settings.auto_receive;
+            crate::storage::save_settings(&self.app_handle, &settings);
+            let _ = self.app_handle.emit("settings-changed", settings.clone());
+            settings.auto_receive
+        };
 
         #[cfg(desktop)]
         crate::tray::update_tray_menu(&self.app_handle);
 
-        settings.auto_receive
+        enabled
     }
 
     async fn get_state(&self) -> (bool, bool) {
