@@ -13,10 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On Wayland desktops without the portal (Sway, GNOME 47 and older), bind a key to the new `ManualSend` / `ManualReceive` D-Bus methods; Settings shows the `gdbus` command.
 
 ### Changed
+- With Auto-Send off, a manual send now sends everything Auto-Send would: rich text, images (large ones included) and copied files, not just plain text. This covers the shortcut, the D-Bus `ManualSend` method and the in-app Send button, whose panel now previews the image or files about to go. With nothing on the clipboard, it now says so in a notification instead of appearing to do nothing.
 - The deb, rpm, and AUR packages now install the same launcher and icon as the Flatpak: `app.clustercut.clustercut.desktop`, matching the app ID that desktop portals use to identify ClusterCut, listed under Utilities. The old `ClusterCut.desktop` remains as a hidden entry so launchers pinned before the change keep working.
 
 ### Fixed
 - Switching Auto-Send or Auto-Receive off from the tray or the GNOME Quick Settings tile now turns the manual shortcut on straight away, and switching back turns it off. It used to wait for a restart or a settings change in the window, on every platform.
+- Sending a History item to the cluster now works with Auto-Send off. It was only recorded locally, never sent.
 - A manual send (shortcut or D-Bus) now shows its text in History and is kept there. It appeared as an empty "Sent" entry since the 0.3.6 History rework.
 - On Linux, the window's close button works again without first minimising or maximising the window, a regression since 0.4.3. Making the window resizable had removed the workaround that kept GTK's titlebar buttons responsive; it is back, adapted to the resizable window (except on Hyprland), and restoring the window from the tray or the GNOME extension unminimizes it first.
 - Toggling Auto-Send or Auto-Receive from the GNOME Quick Settings tile no longer freezes ClusterCut. The D-Bus toggle refreshed the tray menu while still holding the settings lock, and the tray menu takes that lock too, so every later settings access hung.

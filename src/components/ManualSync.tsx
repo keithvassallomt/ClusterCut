@@ -42,7 +42,9 @@ export function ManualSyncModal({
 }: {
   open: boolean;
   onClose: () => void;
-  localContent: string;
+  // What a manual send will send: the last captured copy (any kind), or the
+  // clipboard text when nothing was captured.
+  localContent: { text: string, blob?: ClipboardBlobPreview, files?: { name: string, size: number }[], formats?: ClipboardFormatPreview[] } | null;
   remoteContent: { text: string, sender: string, timestamp: number, blob?: ClipboardBlobPreview, formats?: ClipboardFormatPreview[] } | null;
   onSend: () => void;
   onReceive: () => void;
@@ -67,7 +69,50 @@ export function ManualSyncModal({
               <span className="font-medium">Send Local</span>
             </div>
             <div className="flex-1 rounded-xl bg-white/5 p-4 text-sm font-mono text-zinc-300 h-32 overflow-y-auto whitespace-pre-wrap border border-white/5">
-              {localContent || <span className="text-zinc-600 italic">Clipboard empty</span>}
+              {!localContent ? (
+                <span className="text-zinc-600 italic">Clipboard empty</span>
+              ) : localContent.blob ? (
+                <div className="flex items-start gap-3 font-sans">
+                  {localContent.blob.thumbnail ? (
+                    <img
+                      src={localContent.blob.thumbnail}
+                      alt="Image to send"
+                      className="max-h-24 max-w-[40%] rounded object-contain"
+                    />
+                  ) : (
+                    <div className="flex h-24 w-24 items-center justify-center rounded bg-white/5 text-2xl text-zinc-500">
+                      🖼️
+                    </div>
+                  )}
+                  <div className="text-xs text-zinc-300">
+                    Image
+                    {localContent.blob.width && localContent.blob.height
+                      ? ` (${localContent.blob.width}×${localContent.blob.height})`
+                      : ""}
+                    <div className="text-zinc-500">{formatBytes(localContent.blob.size)}</div>
+                  </div>
+                </div>
+              ) : localContent.files && localContent.files.length > 0 ? (
+                <div className="font-sans text-xs">
+                  <div className="mb-1 text-zinc-400">
+                    {localContent.files.length === 1 ? "1 file" : `${localContent.files.length} files`}
+                  </div>
+                  {localContent.files.map((f, i) => (
+                    <div key={i} className="truncate">
+                      {f.name} <span className="text-zinc-500">({formatBytes(f.size)})</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <>
+                  {localContent.formats && localContent.formats.length > 0 && (
+                    <div className="mb-2 inline-flex items-center rounded-md bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-200 font-sans">
+                      Rich · {localContent.formats.map(f => shortRichLabel(f.mime_type)).join(", ")}
+                    </div>
+                  )}
+                  {localContent.text}
+                </>
+              )}
             </div>
             <Button variant="primary" onClick={onSend} disabled={!localContent} iconLeft={<Send className="h-4 w-4" />}>
               Broadcast to Cluster

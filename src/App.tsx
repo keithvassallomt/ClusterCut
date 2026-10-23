@@ -131,16 +131,27 @@ export default function App() {
   const [lastSentClipboard, setLastSentClipboard] = useState(""); // Last successfully sent
   const [lastReceivedClipboard, setLastReceivedClipboard] = useState(""); // Last received from cluster
 
+  // Last local copy captured with Auto-Send off, of any kind (text, rich text,
+  // image, files). A manual send sends exactly this (the backend keeps the same
+  // payload); null when nothing is captured.
+  const [pendingLocalItem, setPendingLocalItem] = useState<HistoryItem | null>(null);
+  const [lastSentId, setLastSentId] = useState<string | null>(null);
+
   // We need to know if Auto-Send is ON/OFF to decide if we show "Pending Send"
   const [isAutoSend, setIsAutoSend] = useState(true); // Default assumption, updated bySettings
   const isAutoSendRef = useRef(isAutoSend);
   useEffect(() => { isAutoSendRef.current = isAutoSend; }, [isAutoSend]);
+  // Received content only replaces the local clipboard when Auto-Receive is on.
+  const isAutoReceiveRef = useRef(true);
 
-  // Rule 2: If local matches last received, not a candidate for sending.
-  const hasPendingSend = !isAutoSend
-    && localClipboard !== lastSentClipboard
-    && localClipboard !== lastReceivedClipboard
-    && localClipboard.length > 0;
+  // A captured local copy is pending until it's been sent. Without one, fall
+  // back to the clipboard text. Rule 2: if local matches last received, not a
+  // candidate for sending.
+  const hasPendingSend = !isAutoSend && (pendingLocalItem
+    ? pendingLocalItem.id !== lastSentId
+    : localClipboard !== lastSentClipboard
+      && localClipboard !== lastReceivedClipboard
+      && localClipboard.length > 0);
 
   // Rule 3: If pending receive matches local (already have it or I sent it), not a candidate.
   // Image-only payloads have empty text; treat them as pending if a blob is present.
@@ -339,6 +350,7 @@ export default function App() {
     invoke<AppSettings>("get_settings").then(s => {
       setSettings(s);
       setIsAutoSend(s.auto_send);
+      isAutoReceiveRef.current = s.auto_receive;
     });
   };
 
@@ -550,6 +562,7 @@ export default function App() {
         // Do NOT set lastSentClipboard here, because we haven't sent it yet!
         // This discrepancy (local > lastSent) will trigger the FAB.
       }
+      setPendingLocalItem(newItem);
     });
 
     // Listen for Clipboard Changes
@@ -585,11 +598,17 @@ export default function App() {
           setLocalClipboard(newItem.text);
           setLastSentClipboard(newItem.text);
         }
+        setLastSentId(newItem.id);
+        // Sending a different copy (Auto-Send, or the plain-text fallback)
+        // supersedes the captured one, as it does in the backend.
+        setPendingLocalItem((prev) => (prev && prev.id === newItem.id ? prev : null));
       } else {
         if (newItem.text && fullTextAvailable) {
           setLocalClipboard(newItem.text);
           setLastReceivedClipboard(newItem.text);
         }
+        // Applied to the clipboard, so the backend dropped its captured copy.
+        if (isAutoReceiveRef.current) setPendingLocalItem(null);
       }
 
       // Update History
@@ -662,6 +681,7 @@ export default function App() {
 
     const unlistenSettingsChanged = listen<AppSettings>("settings-changed", (event) => {
       setIsAutoSend(event.payload.auto_send);
+      isAutoReceiveRef.current = event.payload.auto_receive;
     });
 
     return () => {
@@ -1305,13 +1325,15 @@ export default function App() {
         <ManualSyncModal
           open={manualSyncOpen}
           onClose={() => setManualSyncOpen(false)}
-          localContent={localClipboard}
+          localContent={pendingLocalItem ?? (localClipboard ? { text: localClipboard } : null)}
           remoteContent={pendingReceive}
           onSend={async () => {
             try {
-              await invoke("send_clipboard", { text: localClipboard });
+              // Sends the captured copy in full, or the clipboard text if none.
+              await invoke("manual_send");
               // Store strict equality check for "Last Sent" to avoid re-triggering pending send
-              setLastSentClipboard(localClipboard);
+              if (pendingLocalItem) setLastSentId(pendingLocalItem.id);
+              else setLastSentClipboard(localClipboard);
               setManualSyncOpen(false);
             } catch (e) {
               alert("Failed to send: " + e);

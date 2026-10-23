@@ -2,86 +2,19 @@
 
 use crate::state::AppState;
 use crate::transport::Transport;
-use crate::{NotificationPayload, send_notification, get_hostname_internal, report_send_failure};
+use crate::{NotificationPayload, send_notification};
 use crate::protocol::Message;
 use crate::{request_clipboard_blob_internal, request_file_internal};
 use tauri::{Emitter, State};
 
+/// Manual send from the UI's "Broadcast to Cluster" button: the same full-content
+/// send as the shortcut (text, rich text, images, files).
 #[tauri::command]
-pub(crate) async fn send_clipboard(
-    text: String,
-    state: State<'_, AppState>,
-    transport: State<'_, Transport>,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
-
-    // Manual Send Command
-    crate::clipboard::set_clipboard(&app_handle, text.clone()); // Update local clipboard too? Yes, usually.
-
-    // Construct Payload
-    let local_id = state.local_device_id.lock().unwrap().clone();
-    let hostname = get_hostname_internal();
-    let msg_id = uuid::Uuid::new_v4().to_string();
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-
-    let payload_obj = crate::protocol::ClipboardPayload {
-        id: msg_id.clone(),
-        text: text.clone(),
-        timestamp: ts,
-        sender: hostname,
-        sender_id: local_id,
-        files: None,
-        blob: None,
-        formats: None,
-    };
-
-    // Emit local event so history updates
-    crate::clipboard::common::record_and_emit(&app_handle, &state, "clipboard-change", &payload_obj);
-
-    // Send (mTLS provides confidentiality + sender auth; no app-layer
-    // encryption needed since v0.3 dropped cluster_key).
-    let msg = Message::Clipboard(payload_obj);
-    let data = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
-
-    let peers = state.get_peers();
-    for p in peers.values() {
-        let addr = std::net::SocketAddr::new(p.ip, p.port);
-        let transport_clone = (*transport).clone();
-        let data_vec = data.clone();
-        let app_clone = app_handle.clone();
-        let peer_id = p.id.clone();
-        let peer_hostname = p.hostname.clone();
-        let peer_version = p.protocol_version.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
-                report_send_failure(
-                    &app_clone,
-                    &peer_id,
-                    &peer_hostname,
-                    peer_version.as_deref(),
-                    addr,
-                    &e.to_string(),
-                );
-            } else {
-                tracing::debug!("[Clipboard] Sent to {}", addr);
-            }
-        });
-    }
-
-    let notifications = state.settings.lock().unwrap().notifications.clone();
-    if notifications.data_sent {
-        send_notification(
-            &app_handle,
-            "Clipboard Sent",
-            "Manual broadcast successful.",
-            false,
-            Some(2),
-            "history",
-            NotificationPayload::None,
-        );
-    }
-
-    Ok(())
+pub(crate) async fn manual_send(app_handle: tauri::AppHandle) -> Result<(), String> {
+    // Off the executor: the GNOME clipboard bridge is a blocking D-Bus call.
+    tauri::async_runtime::spawn_blocking(move || crate::shortcuts::manual_send(&app_handle))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -165,7 +98,13 @@ pub(crate) async fn recall_send_history_item(
     // Explicit user re-send: clear the echo/dedup guard so process_clipboard_change
     // does not suppress an image/rich item that still matches the last broadcast.
     *state.last_clipboard_content.lock().unwrap() = String::new();
-    crate::clipboard::common::process_clipboard_change(content, &app_handle, &state, &transport);
+    crate::clipboard::common::process_clipboard_change_with(
+        content,
+        &app_handle,
+        &state,
+        &transport,
+        crate::clipboard::common::Broadcast::Always,
+    );
     Ok(())
 }
 

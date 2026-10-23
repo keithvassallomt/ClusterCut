@@ -5,10 +5,11 @@ use std::str::FromStr;
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
-use crate::protocol::Message;
+use crate::clipboard::common::{Broadcast, ClipboardContent};
+use crate::protocol::ClipboardPayload;
 use crate::state::AppState;
 use crate::transport::Transport;
-use crate::{clipboard, report_send_failure, request_clipboard_blob_internal, send_notification, NotificationPayload};
+use crate::{clipboard, request_clipboard_blob_internal, send_notification, NotificationPayload};
 
 pub(crate) fn register_shortcuts(app_handle: &tauri::AppHandle) {
     let state = app_handle.state::<AppState>();
@@ -80,73 +81,48 @@ pub(crate) fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut
     }
 }
 
-/// Manual-mode Send: broadcast the local clipboard text to every peer.
-/// Shared by the global shortcut, the D-Bus `ManualSend` method and the
-/// Wayland shortcut portal.
+/// Manual-mode Send: broadcast the clipboard to every peer in full (text, rich
+/// text, images, files), as Auto-Send would. Shared by the global shortcut, the
+/// D-Bus `ManualSend` method, the Wayland shortcut portal and the in-app button.
 pub(crate) fn manual_send(app_handle: &tauri::AppHandle) {
     let state = app_handle.state::<AppState>();
-    let settings = state.settings.lock().unwrap().clone();
-
-    // Get local content
-    let text = match clipboard::read_text(app_handle) {
-        Ok(text) => text,
-        Err(e) => {
-            tracing::error!("Failed to read clipboard for global send: {}", e);
-            return;
-        }
-    };
-    let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
-    let msg_id = uuid::Uuid::new_v4().to_string();
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-
-    let local_id = state.local_device_id.lock().unwrap().clone();
-    let payload_obj = crate::protocol::ClipboardPayload {
-        id: msg_id,
-        text,
-        timestamp: ts,
-        sender: hostname,
-        sender_id: local_id,
-        files: None,
-        blob: None,
-        formats: None,
-    };
-
-    // Record in History and tell the UI, as the "Broadcast to Cluster" button
-    // does. A raw ClipboardPayload has no `text_preview`, so History showed an
-    // empty "Sent" entry.
-    clipboard::common::record_and_emit(app_handle, &state, "clipboard-change", &payload_obj);
-
-    // Send (mTLS handles confidentiality + sender auth).
-    let msg = Message::Clipboard(payload_obj);
-    let Ok(data) = serde_json::to_vec(&msg) else {
-        return;
-    };
     let transport = app_handle.state::<Transport>();
-    let peers = state.get_peers();
-    for p in peers.values() {
-        let addr = std::net::SocketAddr::new(p.ip, p.port);
-        let transport_clone = (*transport).clone();
-        let data_vec = data.clone();
-        let app_clone = app_handle.clone();
-        let peer_id = p.id.clone();
-        let peer_hostname = p.hostname.clone();
-        let peer_version = p.protocol_version.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = transport_clone.send_message(addr, &data_vec).await {
-                report_send_failure(
-                    &app_clone,
-                    &peer_id,
-                    &peer_hostname,
-                    peer_version.as_deref(),
-                    addr,
-                    &e.to_string(),
-                );
-            }
-        });
+
+    // With Auto-Send off, the monitor keeps the payload it built on the last
+    // copy, with large content already staged for peers to fetch.
+    if let Some(payload) = clipboard::common::pending_manual_send() {
+        tracing::info!("Manual send of the last copy (id={}, {})", payload.id, payload_kind(&payload));
+        clipboard::common::broadcast_clipboard(app_handle, &state, &transport, payload, Broadcast::Always);
+        return;
     }
 
-    if settings.notifications.data_sent {
-        send_notification(app_handle, "Clipboard Sent", "Manual broadcast successful.", false, Some(2), "history", NotificationPayload::None);
+    // Nothing kept (copied before ClusterCut started, Auto-Send was on, or the
+    // clipboard holds something ClusterCut wrote): send its plain text.
+    match clipboard::read_text(app_handle) {
+        Ok(text) if !text.trim().is_empty() => {
+            tracing::info!("Manual send of the clipboard's plain text (no captured copy)");
+            clipboard::common::process_clipboard_change_with(ClipboardContent::Text(text), app_handle, &state, &transport, Broadcast::Always);
+        }
+        result => {
+            match result {
+                Err(e) => tracing::info!("Nothing to send: {}", e),
+                Ok(_) => tracing::info!("Nothing to send: clipboard text is only whitespace"),
+            }
+            // Otherwise the shortcut just appears to do nothing.
+            send_notification(app_handle, "Manual Send", "Nothing to send. Copy something first.", false, Some(3), "history", NotificationPayload::None);
+        }
+    }
+}
+
+fn payload_kind(payload: &ClipboardPayload) -> &'static str {
+    if payload.files.is_some() {
+        "files"
+    } else if let Some(blob) = &payload.blob {
+        if blob.mime_type.starts_with("image/") { "image" } else { "large text" }
+    } else if payload.formats.as_ref().is_some_and(|f| !f.is_empty()) {
+        "rich text"
+    } else {
+        "text"
     }
 }
 

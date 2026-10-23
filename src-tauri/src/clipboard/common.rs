@@ -363,6 +363,9 @@ fn guard_key_matches(key: &GuardKey, current: &ClipboardContent) -> bool {
 /// Arm the guard for a self-write. All `set_clipboard_*_with_ignore` helpers
 /// funnel through this. Prunes expired entries and bounds the list length.
 fn set_ignored(content: ClipboardContent) {
+    // The clipboard is about to hold something ClusterCut wrote, not the last
+    // local copy, so that copy is no longer what a manual send should send.
+    *PENDING_MANUAL_SEND.lock().unwrap() = None;
     let Some(key) = guard_key_of(&content) else {
         return;
     };
@@ -495,6 +498,9 @@ pub fn should_process_content(
     last_content: &ClipboardContent,
 ) -> EchoVerdict {
     if *current_content == ClipboardContent::None {
+        // Nothing (sendable) on the clipboard any more, e.g. cleared or its
+        // owner exited: so nothing for a manual send either.
+        *PENDING_MANUAL_SEND.lock().unwrap() = None;
         return EchoVerdict::NoChange;
     }
 
@@ -610,12 +616,25 @@ fn stage_clipboard_blob_temp_file(
     Ok(())
 }
 
-/// Process a changed clipboard content: build payload and broadcast.
+/// Process a changed clipboard content: build payload and broadcast if
+/// Auto-Send is on (otherwise it's kept for a manual send).
 pub fn process_clipboard_change(
     content: ClipboardContent,
     app_handle: &AppHandle,
     state: &AppState,
     transport: &Transport,
+) {
+    process_clipboard_change_with(content, app_handle, state, transport, Broadcast::IfAutoSend);
+}
+
+/// `process_clipboard_change` with an explicit send policy; `Always` for sends
+/// the user asked for (manual send, History re-send).
+pub fn process_clipboard_change_with(
+    content: ClipboardContent,
+    app_handle: &AppHandle,
+    state: &AppState,
+    transport: &Transport,
+    broadcast: Broadcast,
 ) {
     // Any non-echo clipboard change invalidates a pending GNOME "promote to
     // rich" stash — the user copied something else on this machine, so the
@@ -677,7 +696,7 @@ pub fn process_clipboard_change(
                         sender: hostname,
                         sender_id: local_id,
                     };
-                    broadcast_clipboard(app_handle, state, transport, payload_obj);
+                    broadcast_clipboard(app_handle, state, transport, payload_obj, broadcast);
                 }
                 TextWireDecision::Descriptor => {
                     let len = text.len() as u64;
@@ -712,7 +731,7 @@ pub fn process_clipboard_change(
                                     state.last_clipboard_content.lock().unwrap();
                                 *last_global = payload_signature(&payload_obj);
                             }
-                            broadcast_clipboard(app_handle, state, transport, payload_obj);
+                            broadcast_clipboard(app_handle, state, transport, payload_obj, broadcast);
                         }
                         Err(e) => {
                             tracing::error!("Failed to stage large clipboard text for descriptor path: {}", e);
@@ -832,7 +851,7 @@ pub fn process_clipboard_change(
                     sender: hostname,
                     sender_id: local_id,
                 };
-                broadcast_clipboard(app_handle, state, transport, payload_obj);
+                broadcast_clipboard(app_handle, state, transport, payload_obj, broadcast);
             } else {
                 tracing::warn!("No valid files found in clipboard content.");
             }
@@ -945,7 +964,7 @@ pub fn process_clipboard_change(
                 *last_global = sig;
             }
 
-            broadcast_clipboard(app_handle, state, transport, payload_obj);
+            broadcast_clipboard(app_handle, state, transport, payload_obj, broadcast);
         }
         ClipboardContent::Rich { text, formats } => {
             tracing::debug!(
@@ -984,7 +1003,7 @@ pub fn process_clipboard_change(
                 *last_global = sig;
             }
 
-            broadcast_clipboard(app_handle, state, transport, payload_obj);
+            broadcast_clipboard(app_handle, state, transport, payload_obj, broadcast);
         }
         ClipboardContent::None => {}
     }
@@ -1134,17 +1153,43 @@ pub fn record_and_emit(
     let _ = app.emit(event, &preview);
 }
 
+/// Whether `broadcast_clipboard` honours the Auto-Send setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Broadcast {
+    /// A clipboard change seen by the monitor: send only when Auto-Send is on.
+    IfAutoSend,
+    /// The user asked to send (manual send, History re-send): send regardless.
+    Always,
+}
+
+/// The last local copy captured while Auto-Send was off: the full payload (text,
+/// rich text, image or files, with large content already staged for peers),
+/// ready for a manual send. Cleared when an Auto-Send broadcast goes out and by
+/// `set_ignored` (every ClusterCut self-write, such as applying received
+/// content), so a manual send never resends an older local copy.
+static PENDING_MANUAL_SEND: Lazy<Mutex<Option<ClipboardPayload>>> = Lazy::new(|| Mutex::new(None));
+
+/// What a manual send should send, if the monitor captured anything.
+pub fn pending_manual_send() -> Option<ClipboardPayload> {
+    PENDING_MANUAL_SEND.lock().unwrap().clone()
+}
+
 pub fn broadcast_clipboard(
     app_handle: &AppHandle,
     state: &AppState,
     transport: &Transport,
     payload_obj: ClipboardPayload,
+    broadcast: Broadcast,
 ) {
-    let auto_send = { state.settings.lock().unwrap().auto_send };
-    if !auto_send {
-        tracing::debug!("Auto-send disabled. Emitting monitor update only.");
-        record_and_emit(app_handle, state, "clipboard-monitor-update", &payload_obj);
-        return;
+    if broadcast == Broadcast::IfAutoSend {
+        let auto_send = { state.settings.lock().unwrap().auto_send };
+        if !auto_send {
+            tracing::debug!("Auto-send disabled. Emitting monitor update only; kept for a manual send.");
+            record_and_emit(app_handle, state, "clipboard-monitor-update", &payload_obj);
+            *PENDING_MANUAL_SEND.lock().unwrap() = Some(payload_obj);
+            return;
+        }
+        *PENDING_MANUAL_SEND.lock().unwrap() = None;
     }
 
     record_and_emit(app_handle, state, "clipboard-change", &payload_obj);
@@ -1322,6 +1367,24 @@ mod tests {
             sender: "host".to_string(),
             sender_id: "device".to_string(),
         }
+    }
+
+    #[test]
+    fn self_write_drops_the_copy_kept_for_manual_send() {
+        *PENDING_MANUAL_SEND.lock().unwrap() = Some(payload_with("local copy", None));
+        assert!(pending_manual_send().is_some());
+        // ClusterCut writing received content must not leave the older local
+        // copy as what a manual send would send.
+        set_ignored(ClipboardContent::Text("from the cluster".to_string()));
+        assert!(pending_manual_send().is_none());
+    }
+
+    #[test]
+    fn empty_clipboard_drops_the_copy_kept_for_manual_send() {
+        *PENDING_MANUAL_SEND.lock().unwrap() = Some(payload_with("local copy", None));
+        let verdict = should_process_content(&ClipboardContent::None, &ClipboardContent::None);
+        assert!(matches!(verdict, EchoVerdict::NoChange));
+        assert!(pending_manual_send().is_none());
     }
 
     #[test]

@@ -1312,7 +1312,7 @@ pub(crate) fn run() {
             crate::commands::shortcuts::retry_portal_shortcuts,
             crate::commands::identity::set_network_identity,
             crate::commands::identity::regenerate_network_identity,
-            crate::commands::clipboard::send_clipboard,
+            crate::commands::clipboard::manual_send,
             crate::commands::clipboard::set_local_clipboard,
             crate::commands::clipboard::set_local_clipboard_files,
             crate::commands::clipboard::confirm_pending_clipboard,
