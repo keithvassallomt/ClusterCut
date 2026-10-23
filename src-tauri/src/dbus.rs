@@ -102,6 +102,8 @@ impl ClusterCutDBus {
 
     async fn show_window(&self) {
         if let Some(window) = self.app_handle.get_webview_window("main") {
+            // Unminimize first, or GTK can leave the titlebar unresponsive (6dc895f).
+            let _ = window.unminimize();
             let _ = window.show();
             let _ = window.set_focus();
             crate::tray::set_badge(&self.app_handle, false);

@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The deb, rpm, and AUR packages now install the same launcher and icon as the Flatpak: `app.clustercut.clustercut.desktop`, matching the app ID that desktop portals use to identify ClusterCut, listed under Utilities. The old `ClusterCut.desktop` remains as a hidden entry so launchers pinned before the change keep working.
 
 ### Fixed
+- On Linux, the window's close button works again without first minimising or maximising the window, a regression since 0.4.3. Making the window resizable had removed the workaround that kept GTK's titlebar buttons responsive; it is back, adapted to the resizable window (except on Hyprland), and restoring the window from the tray or the GNOME extension unminimizes it first.
 - Toggling Auto-Send or Auto-Receive from the GNOME Quick Settings tile no longer freezes ClusterCut. The D-Bus toggle refreshed the tray menu while still holding the settings lock, and the tray menu takes that lock too, so every later settings access hung.
 - The app icon now shows in Linux launchers for the deb, rpm, and AUR packages. They only shipped a 1024 px PNG, a size the icon theme never looks in.
 

@@ -590,20 +590,24 @@ pub(crate) fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // NOTE: there used to be a Linux-only `tauri://focus` listener here that
-            // force-unmaximized the window and toggled `set_resizable(true/false)` to
-            // work around unresponsive Flatpak/GTK titlebar buttons. Both halves were
-            // tied to the window being fixed-size, which is no longer the case:
-            //   - the resizable toggle cleared the GTK min/max size hints on every
-            //     focus, and a fixed-size window is what made tiling compositors
-            //     (Hyprland) auto-float the window and then strand it in a
-            //     compositor-driven maximized state on drag, at 800x600 content
-            //     inside a monitor-sized frame;
-            //   - the unmaximize call never fired anyway, since GTK does not report
-            //     a compositor-imposed fullscreen/maximized state via `is_maximized`,
-            //     and now that the window is genuinely maximizable it would be wrong
-            //     to undo a maximize the user asked for.
-            // The window is resizable with a min size instead (see tauri.conf.json).
+            // Linux: GTK titlebar buttons (close, notably) can stop responding until
+            // the window's state changes; minimising or maximising brings them back.
+            // Toggling the resizable flag on focus refreshes them the same way. This
+            // was the 7c52c89 workaround, dropped in 5455873 along with the
+            // fixed-size window; it now ends resizable (false -> true) instead.
+            // Skipped on Hyprland: a momentarily fixed-size window is what got it
+            // auto-floated and stranded there.
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+                if let Some(window) = app.get_webview_window("main") {
+                    use tauri::Listener;
+                    let win = window.clone();
+                    window.listen("tauri://focus", move |_event| {
+                        let _ = win.set_resizable(false);
+                        let _ = win.set_resizable(true);
+                    });
+                }
+            }
 
             let app_handle = app.handle();
 
