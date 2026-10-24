@@ -4,7 +4,7 @@
 
 **Goal:** cut the manual-mode round trip from four key presses to two (issue #21, mtudor). The sender's shortcut copies the selection and sends it; the receiver's shortcut applies the pending content and pastes it. Plus a cut variant, the old "send what's on the clipboard" behaviour on its own combo, and an optional mode that leaves the local clipboard as it was.
 
-**Status:** stage 1 (core + Hyprland) done and tested by Keith 2026-10-23. Stage 2 (KDE) done 2026-10-24, Keith tested on the VM. Stage 3 (GNOME) done 2026-10-24, Keith tested on the VM. Stages 4-6 (X11, Windows, macOS) written 2026-10-24: X11 untested by design; Windows tested by Keith 2026-10-24; macOS awaiting Keith. X11 is best effort: written, not tested (Keith, 2026-10-23).
+**Status:** stage 1 (core + Hyprland) done and tested by Keith 2026-10-23. Stage 2 (KDE) done 2026-10-24, Keith tested on the VM. Stage 3 (GNOME) done 2026-10-24, Keith tested on the VM. Stages 4-6 (X11, Windows, macOS) written 2026-10-24: X11 untested by design; Windows and macOS tested by Keith 2026-10-24. X11 is best effort: written, not tested (Keith, 2026-10-23).
 
 ## Decisions (Keith, 2026-10-23)
 
@@ -147,10 +147,13 @@ Each stage ends with Keith testing on the named desktop.
 - Found: Windows toasts with `&` or `<` in the title or text were rejected outright ("Copy & Send"). Existing bug; fixed with `xml_escape` in `send_notification` (0e4e139).
 - Testing through RustDesk muddles it: RustDesk syncs clipboards itself and forwards keys, and both machines had the same shortcuts. Clean setup: RustDesk clipboard sync off, the controlling machine in automatic mode (so it has no manual shortcuts).
 
-### 6. macOS (Keith) (written 2026-10-24)
+### 6. macOS (Keith) (DONE 2026-10-24, Keith tested)
 - [x] `keys/macos.rs`: raw CoreGraphics FFI, Cmd(+Shift)+key with explicit event flags, waits on `CGEventSourceFlagsState`, keycode for c/x/v from the current layout via `UCKeyTranslate` (on the main thread; the input source APIs assert it on recent macOS), ANSI fallback. `AXIsProcessTrustedWithOptions` with the prompt before pressing; `KeysError::NeedsAccessibility` and the Settings Allow row (`permission: false`) until granted. No terminal check (Cmd is safe there).
 - [x] Compile-checked for `aarch64-apple-darwin` in an isolated crate.
-- [ ] Keith: first use shows the Accessibility alert; after granting, TextEdit, Safari, Finder (files), Terminal. Note: unsigned or ad-hoc-signed builds may lose the Accessibility grant on each update.
+- [x] Keith (2026-10-24, `tauri dev` through RustDesk): first use showed the Accessibility alert (for Terminal, which `tauri dev` ran from; the installed app asks for itself); then TextEdit copy, holding Cmd+Option, nothing selected, Cut, Finder (files), Terminal, Receive & Paste into TextEdit.
+- Found: the release wait polled the HID modifier state, which is the physical keyboard only. Keys injected by RustDesk looked released at once, so Cmd+C went out with Option held (TextEdit's Copy Style). Now polls the combined session state (34a2fd2), and logs which modifiers are still down if it gives up (47f3805).
+- RustDesk quirk: Keith had to unfocus and refocus RustDesk between runs; RustDesk loses its own modifier state after macOS swallows the hotkey. Not ClusterCut's.
+- Note: unsigned or ad-hoc-signed builds may lose the Accessibility grant on each update.
 
 ### 7. Keep My Clipboard
 - [ ] Shared last-seen content, snapshot/restore around both flows, kept-payload restore, clipboard-manager hints.
