@@ -4,7 +4,7 @@
 
 **Goal:** cut the manual-mode round trip from four key presses to two (issue #21, mtudor). The sender's shortcut copies the selection and sends it; the receiver's shortcut applies the pending content and pastes it. Plus a cut variant, the old "send what's on the clipboard" behaviour on its own combo, and an optional mode that leaves the local clipboard as it was.
 
-**Status:** stage 1 (core + Hyprland) done and tested by Keith 2026-10-23. Stage 2 (KDE) done 2026-10-24, Keith tested on the VM. Stage 3 (GNOME) done 2026-10-24, Keith tested on the VM. Stages 4-6 (X11, Windows, macOS) written 2026-10-24: X11 untested by design; Windows and macOS tested by Keith 2026-10-24. X11 is best effort: written, not tested (Keith, 2026-10-23).
+**Status:** stage 1 (core + Hyprland) done and tested by Keith 2026-10-23. Stage 2 (KDE) done 2026-10-24, Keith tested on the VM. Stage 3 (GNOME) done 2026-10-24, Keith tested on the VM. Stages 4-6 (X11, Windows, macOS) written 2026-10-24: X11 untested by design; Windows and macOS tested by Keith 2026-10-24. Stage 7 (Keep My Clipboard) done 2026-10-24. X11 is best effort: written, not tested (Keith, 2026-10-23).
 
 ## Decisions (Keith, 2026-10-23)
 
@@ -155,9 +155,14 @@ Each stage ends with Keith testing on the named desktop.
 - RustDesk quirk: Keith had to unfocus and refocus RustDesk between runs; RustDesk loses its own modifier state after macOS swallows the hotkey. Not ClusterCut's.
 - Note: unsigned or ad-hoc-signed builds may lose the Accessibility grant on each update.
 
-### 7. Keep My Clipboard
-- [ ] Shared last-seen content, snapshot/restore around both flows, kept-payload restore, clipboard-manager hints.
-- [ ] Test the restore delay against slow readers (browser, LibreOffice, a large image).
+### 7. Keep My Clipboard (DONE 2026-10-24)
+- [x] `common::last_seen_content`, set in `should_process_content` on Process and Echo (the clipboard holds ClusterCut's writes too), cleared when the clipboard empties. `restore_content` writes it back through the echo-guarded writers; files go back as paths (Wayland and GNOME read `file://` URIs); on GNOME rich text goes back as plain text (the extension offers one format at a time).
+- [x] `shortcuts.rs`: `keep_clipboard` before pressing, `restore_clipboard` after: Copy/Cut & Send restore once sent; Receive & Paste restores 500 ms after the Paste (`RESTORE_DELAY`), but not when the content is still being fetched (it lands later, for the user to paste). The kept manual-send payload goes back once the restore has landed (the echo guard drops it on its own thread).
+- [x] Setting `keep_local_clipboard` (default off), Settings switch shown when either direction is manual.
+- [x] Tests: last-seen tracking (Process, NoChange, Echo, empty), URI to path. 169 pass.
+- [x] Tested locally (Hyprland, real keys): text, HTML (formats intact) and an image all came back after Copy & Send, and Send Clipboard afterwards sent the restored image.
+- Decided against the clipboard-manager hints: only KDE runs a manager by default (Klipper), what it would record is content the user just pasted, and it needs a "temporary write" flag through every write in four backends.
+- [ ] Keith: Receive & Paste with Keep My Clipboard (needs a peer); slow readers (LibreOffice, a large image) to judge the 500 ms.
 
 ### 8. UI, docs, CHANGELOG
 - [ ] Settings: five shortcut fields grouped under Send and Receive, the "Keep My Clipboard" switch, permission states (KDE approval, macOS Accessibility, GNOME extension too old, unsupported desktop).

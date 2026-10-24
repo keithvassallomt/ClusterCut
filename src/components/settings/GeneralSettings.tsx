@@ -194,6 +194,26 @@ export function GeneralSettings({
 
           {!settings.auto_receive && shortcutGroup("Global Shortcuts (Receive)", RECEIVE_SHORTCUTS)}
 
+          {(!settings.auto_send || !settings.auto_receive) && (
+            <>
+              <div className="h-px bg-zinc-900/5 dark:bg-white/5" />
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">Keep My Clipboard</div>
+                  <div className="text-xs text-zinc-500">
+                    Copy & Send, Cut & Send and Receive & Paste put back what was on your clipboard before.
+                  </div>
+                </div>
+                <button
+                  onClick={() => setSettings({ ...settings, keep_local_clipboard: !settings.keep_local_clipboard })}
+                  className={clsx("relative h-6 w-11 shrink-0 rounded-full transition-colors", settings.keep_local_clipboard ? "bg-emerald-500" : "bg-zinc-200 dark:bg-zinc-700")}
+                >
+                  <span className={clsx("block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform", settings.keep_local_clipboard ? "translate-x-6" : "translate-x-1")} />
+                </button>
+              </div>
+            </>
+          )}
+
           {showKeyPermission && (
             <>
               <div className="h-px bg-zinc-900/5 dark:bg-white/5" />

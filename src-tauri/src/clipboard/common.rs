@@ -501,8 +501,26 @@ pub fn should_process_content(
         // Nothing (sendable) on the clipboard any more, e.g. cleared or its
         // owner exited: so nothing for a manual send either.
         *PENDING_MANUAL_SEND.lock().unwrap() = None;
+        *LAST_SEEN.lock().unwrap() = None;
         return EchoVerdict::NoChange;
     }
+    let verdict = echo_verdict(current_content, last_content);
+    if !matches!(verdict, EchoVerdict::NoChange) {
+        *LAST_SEEN.lock().unwrap() = Some(current_content.clone());
+    }
+    verdict
+}
+
+/// What the clipboard monitor last saw on the clipboard, whoever put it there.
+/// Keep My Clipboard (issue #21) writes it back after Copy & Send and Receive
+/// & Paste. `None` while the clipboard is empty or holds nothing we can read.
+static LAST_SEEN: Lazy<Mutex<Option<ClipboardContent>>> = Lazy::new(|| Mutex::new(None));
+
+pub fn last_seen_content() -> Option<ClipboardContent> {
+    LAST_SEEN.lock().unwrap().clone()
+}
+
+fn echo_verdict(current_content: &ClipboardContent, last_content: &ClipboardContent) -> EchoVerdict {
 
     let mut guard = IGNORED_GUARD.lock().unwrap();
 
@@ -1177,6 +1195,43 @@ pub fn pending_manual_send() -> Option<ClipboardPayload> {
     PENDING_MANUAL_SEND.lock().unwrap().clone()
 }
 
+/// Put back the kept copy that matched content Keep My Clipboard restored.
+pub fn set_pending_manual_send(payload: Option<ClipboardPayload>) {
+    *PENDING_MANUAL_SEND.lock().unwrap() = payload;
+}
+
+/// The Wayland and GNOME monitors read files as `file://` URIs, the others as
+/// paths; the writers take paths.
+fn file_path(file: String) -> String {
+    url::Url::parse(&file)
+        .ok()
+        .filter(|url| url.scheme() == "file")
+        .and_then(|url| url.to_file_path().ok())
+        .map_or(file, |path| path.to_string_lossy().into_owned())
+}
+
+/// Write `content` (from `last_seen_content`) back to the OS clipboard, with
+/// the echo guard, for Keep My Clipboard. Only what ClusterCut can read comes
+/// back: an app's private formats (a spreadsheet's cell data, say) don't.
+pub fn restore_content(app: &AppHandle, content: ClipboardContent) {
+    match content {
+        ClipboardContent::Text(text) => crate::clipboard::set_clipboard(app, text),
+        ClipboardContent::Files(files) => crate::clipboard::set_clipboard_paths(app, files.into_iter().map(file_path).collect()),
+        ClipboardContent::Image(blob) => crate::clipboard::set_clipboard_image(app, blob),
+        // GNOME's extension offers one format at a time, so rich text would come
+        // back as HTML only; plain text pastes everywhere (the receive path
+        // makes the same call).
+        #[cfg(target_os = "linux")]
+        ClipboardContent::Rich { text, .. }
+            if crate::clipboard::get_backend() == crate::clipboard::ClipboardBackend::GnomeExtension && !text.trim().is_empty() =>
+        {
+            crate::clipboard::set_clipboard(app, text)
+        }
+        ClipboardContent::Rich { text, formats } => crate::clipboard::set_clipboard_rich(app, text, formats),
+        ClipboardContent::None => {}
+    }
+}
+
 pub fn broadcast_clipboard(
     app_handle: &AppHandle,
     state: &AppState,
@@ -1397,7 +1452,34 @@ mod tests {
     }
 
     #[test]
+    fn remembers_what_the_clipboard_holds_for_keep_my_clipboard() {
+        let _guard = echo_guard_test_lock();
+        IGNORED_GUARD.lock().unwrap().clear();
+        let copied = ClipboardContent::Text("copied".to_string());
+        assert!(matches!(should_process_content(&copied, &ClipboardContent::None), EchoVerdict::Process));
+        assert_eq!(last_seen_content(), Some(copied.clone()));
+        // Re-reading the same content changes nothing.
+        assert!(matches!(should_process_content(&copied, &copied), EchoVerdict::NoChange));
+        assert_eq!(last_seen_content(), Some(copied.clone()));
+        // ClusterCut's own writes are on the clipboard too.
+        let written = ClipboardContent::Text("written".to_string());
+        set_ignored(written.clone());
+        assert!(matches!(should_process_content(&written, &copied), EchoVerdict::Echo));
+        assert_eq!(last_seen_content(), Some(written.clone()));
+        should_process_content(&ClipboardContent::None, &written);
+        assert_eq!(last_seen_content(), None);
+    }
+
+    #[test]
+    fn restores_files_as_paths() {
+        assert_eq!(file_path("file:///home/keith/a%20b.txt".to_string()), "/home/keith/a b.txt");
+        assert_eq!(file_path("/home/keith/c.txt".to_string()), "/home/keith/c.txt");
+        assert_eq!(file_path("https://example.com/x".to_string()), "https://example.com/x");
+    }
+
+    #[test]
     fn empty_clipboard_drops_the_copy_kept_for_manual_send() {
+        let _guard = echo_guard_test_lock();
         *PENDING_MANUAL_SEND.lock().unwrap() = Some(payload_with("local copy", None));
         let verdict = should_process_content(&ClipboardContent::None, &ClipboardContent::None);
         assert!(matches!(verdict, EchoVerdict::NoChange));

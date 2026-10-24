@@ -93,6 +93,7 @@ export interface AppSettings {
   shortcut_copy_send: string | null;
   shortcut_cut_send: string | null;
   shortcut_receive_paste: string | null;
+  keep_local_clipboard: boolean; // Copy & Send / Receive & Paste put the old clipboard back
   enable_file_transfer: boolean;
   max_auto_download_size: number;
   notify_large_files: boolean;

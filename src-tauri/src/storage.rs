@@ -533,6 +533,10 @@ pub struct AppSettings {
     /// Receive & Paste: applies the pending content, then presses Paste.
     #[serde(default)]
     pub shortcut_receive_paste: Option<String>,
+    /// Keep My Clipboard: Copy & Send, Cut & Send and Receive & Paste put back
+    /// what was on the clipboard before.
+    #[serde(default)]
+    pub keep_local_clipboard: bool,
     /// Bumped by `migrate_shortcuts`; 0 for settings written before issue #21.
     #[serde(default)]
     pub shortcuts_version: u32,
@@ -653,6 +657,7 @@ impl Default for AppSettings {
             shortcut_copy_send: Some(DEFAULT_COPY_SEND.to_string()),
             shortcut_cut_send: Some(DEFAULT_CUT_SEND.to_string()),
             shortcut_receive_paste: Some(DEFAULT_RECEIVE_PASTE.to_string()),
+            keep_local_clipboard: false,
             shortcuts_version: SHORTCUTS_VERSION,
             remote_desktop_token: None,
             enable_file_transfer: true,

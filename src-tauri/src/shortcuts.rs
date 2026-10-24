@@ -159,6 +159,10 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 const APPLY_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Large content is fetched from the sender first; past this, the user pastes it themselves.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Keep My Clipboard: how long the app gets to read the pasted content before
+/// the old clipboard goes back. Pastes read asynchronously; too soon and the
+/// app pastes the old content.
+const RESTORE_DELAY: Duration = Duration::from_millis(500);
 
 /// One key-pressing action at a time: a second press while the first still
 /// waits on the clipboard would press keys into the middle of it.
@@ -178,6 +182,34 @@ impl Drop for Pressing {
     }
 }
 
+/// The clipboard as it was, for Keep My Clipboard to put back.
+struct KeptClipboard {
+    content: ClipboardContent,
+    /// The kept manual-send copy that goes with it.
+    pending: Option<ClipboardPayload>,
+}
+
+/// `None` unless Keep My Clipboard is on and there's something to put back.
+fn keep_clipboard(app_handle: &tauri::AppHandle) -> Option<KeptClipboard> {
+    if !app_handle.state::<AppState>().settings.lock().unwrap().keep_local_clipboard {
+        return None;
+    }
+    let content = clipboard::common::last_seen_content()?;
+    Some(KeptClipboard { content, pending: clipboard::common::pending_manual_send() })
+}
+
+fn restore_clipboard(app_handle: &tauri::AppHandle, kept: KeptClipboard) {
+    tracing::info!("Keep My Clipboard: putting back {}", clipboard::common::describe_content(&kept.content));
+    let before = change_events::change_count();
+    clipboard::common::restore_content(app_handle, kept.content);
+    // The write's echo guard drops the kept copy (on its own thread), so put it
+    // back once the write has landed.
+    if let Some(changed) = change_events::wait_for_change_after(before, APPLY_TIMEOUT) {
+        change_events::wait_until_processed(changed, PROCESS_TIMEOUT);
+    }
+    clipboard::common::set_pending_manual_send(kept.pending);
+}
+
 /// Copy & Send and Cut & Send: press Copy (or Cut) in the focused app, then
 /// send what it put on the clipboard. Sends nothing if the clipboard doesn't
 /// change, rather than an older copy.
@@ -190,6 +222,7 @@ fn copy_send(app_handle: &tauri::AppHandle, action: Action, title: &str) {
         report_keys_error(app_handle, title, e);
         return;
     }
+    let kept = keep_clipboard(app_handle);
     let before = change_events::change_count();
     if let Err(e) = keys::perform(app_handle, action) {
         report_keys_error(app_handle, title, e);
@@ -208,6 +241,9 @@ fn copy_send(app_handle: &tauri::AppHandle, action: Action, title: &str) {
     if !auto_send {
         manual_send(app_handle);
     }
+    if let Some(kept) = kept {
+        restore_clipboard(app_handle, kept);
+    }
 }
 
 /// Receive & Paste: apply the pending content from a peer, then press Paste in
@@ -221,11 +257,13 @@ fn receive_paste(app_handle: &tauri::AppHandle, title: &str) {
         report_keys_error(app_handle, title, e);
         return;
     }
+    let kept = keep_clipboard(app_handle);
     let before = change_events::change_count();
     let Some(fetching) = receive_pending(app_handle, title) else {
         return;
     };
     if change_events::wait_for_change_after(before, if fetching { FETCH_TIMEOUT } else { APPLY_TIMEOUT }).is_none() {
+        // Nothing to put back yet: the content lands later and the user pastes it.
         if fetching {
             tracing::info!("{}: still fetching; not pasting", title);
             send_notification(app_handle, title, "Still receiving. Paste it once it arrives.", false, Some(3), "history", NotificationPayload::None);
@@ -236,6 +274,10 @@ fn receive_paste(app_handle: &tauri::AppHandle, title: &str) {
     }
     if let Err(e) = keys::perform(app_handle, Action::Paste) {
         report_keys_error(app_handle, title, e);
+    }
+    if let Some(kept) = kept {
+        std::thread::sleep(RESTORE_DELAY);
+        restore_clipboard(app_handle, kept);
     }
 }
 
