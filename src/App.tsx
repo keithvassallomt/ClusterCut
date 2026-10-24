@@ -19,9 +19,31 @@ import { IncompatibleModal, ConnectionFailedModal, JoinModal, LeaveModal, AddRem
 import { LegacyPeerBanner, PairingLockoutBanner } from "./components/Banners";
 import type {
   Peer, View, NearbyNetwork, ClipboardBlobPreview, ClipboardFormatPreview,
-  HistoryItem, AppSettings,
+  HistoryItem, AppSettings, HistoryRetention,
 } from "./types";
 import { blobPreviewFromPreview, formatsFromPayload } from "./lib/protocol";
+
+// History's retention settings (issue #22), applied to the list. The backend
+// applies them to the stored content and drops those entries via history-delete;
+// this also covers entries with nothing stored (files, unfetched large items).
+const RETENTION_MS: Record<HistoryRetention, number | null> = {
+  off: 0,
+  "15m": 15 * 60_000,
+  "1h": 60 * 60_000,
+  "1d": 24 * 60 * 60_000,
+  "1w": 7 * 24 * 60 * 60_000,
+  until_quit: null,
+};
+
+type HistoryLimits = { retention: HistoryRetention; maxItems: number };
+
+function trimHistory(items: HistoryItem[], { retention, maxItems }: HistoryLimits): HistoryItem[] {
+  const maxAge = RETENTION_MS[retention];
+  if (maxAge === 0) return items.length ? [] : items;
+  const now = Date.now();
+  const trimmed = (maxAge === null ? items : items.filter((i) => now - i.added_at <= maxAge)).slice(0, maxItems);
+  return trimmed.length === items.length ? items : trimmed;
+}
 
 // Helper for backend logging
 // Helper for backend logging
@@ -143,6 +165,15 @@ export default function App() {
   useEffect(() => { isAutoSendRef.current = isAutoSend; }, [isAutoSend]);
   // Received content only replaces the local clipboard when Auto-Receive is on.
   const isAutoReceiveRef = useRef(true);
+  const historyLimitsRef = useRef<HistoryLimits>({ retention: "until_quit", maxItems: 50 });
+  const applyHistoryLimits = (s: AppSettings) => {
+    historyLimitsRef.current = { retention: s.history_retention, maxItems: s.history_max_items };
+    setClipboardHistory((prev) => trimHistory(prev, historyLimitsRef.current));
+  };
+  useEffect(() => {
+    const sweep = setInterval(() => setClipboardHistory((prev) => trimHistory(prev, historyLimitsRef.current)), 30_000);
+    return () => clearInterval(sweep);
+  }, []);
 
   // A captured local copy is pending until it's been sent. Without one, fall
   // back to the clipboard text. Rule 2: if local matches last received, not a
@@ -351,6 +382,7 @@ export default function App() {
       setSettings(s);
       setIsAutoSend(s.auto_send);
       isAutoReceiveRef.current = s.auto_receive;
+      applyHistoryLimits(s);
     });
   };
 
@@ -549,6 +581,7 @@ export default function App() {
         blob: blobPreviewFromPreview(p.blob),
         formats: formatsFromPayload(p.formats),
         has_backing: !!p.has_backing,
+        added_at: Date.now(),
       };
 
       // Update Local State but NOT 'lastSentClipboard'
@@ -585,6 +618,7 @@ export default function App() {
         blob: blobPreviewFromPreview(p.blob),
         formats: formatsFromPayload(p.formats),
         has_backing: !!p.has_backing,
+        added_at: Date.now(),
       };
 
       // Update Local Clipboard State
@@ -614,7 +648,7 @@ export default function App() {
       // Update History
       setClipboardHistory((prev) => {
         if (prev.find(i => i.id === newItem.id)) return prev;
-        return [newItem, ...prev].slice(0, 50);
+        return trimHistory([newItem, ...prev], historyLimitsRef.current);
       });
     });
 
@@ -682,6 +716,7 @@ export default function App() {
     const unlistenSettingsChanged = listen<AppSettings>("settings-changed", (event) => {
       setIsAutoSend(event.payload.auto_send);
       isAutoReceiveRef.current = event.payload.auto_receive;
+      applyHistoryLimits(event.payload);
     });
 
     return () => {
@@ -1295,6 +1330,7 @@ export default function App() {
             ) : activeView === "history" ? (
               <HistoryView
                 items={clipboardHistory}
+                historyOff={settings?.history_retention === "off"}
                 onClearHistory={() => {
                   setDialog({
                     open: true,
@@ -1303,6 +1339,8 @@ export default function App() {
                     type: "danger",
                     confirmLabel: "Clear History",
                     onConfirm: () => {
+                      // The stored content too, not just the list.
+                      invoke("clear_history");
                       setClipboardHistory([]);
                       setDialog(d => ({ ...d, open: false }));
                     },

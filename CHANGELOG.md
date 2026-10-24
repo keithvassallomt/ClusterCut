@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- History settings (#22): keep History for 15 minutes, an hour, a day, a week, or until ClusterCut quits (the default, as before), or turn it off; and keep at most 10 to 500 entries (50, as before). History is only held in memory, so it never outlives ClusterCut. Thanks to @mtudor for the suggestions.
 - The manual Send/Receive shortcuts now work on Wayland. They previously relied on X11, so on Wayland they never fired, and never at all in the Flatpak. ClusterCut now registers them through the desktop's global shortcuts portal (GNOME 48+, KDE Plasma 5.27+, Hyprland): GNOME and KDE ask once, Settings shows the key the desktop assigned, and "Change" opens the desktop's own shortcut settings.
 - Hyprland's portal never assigns keys, so on Hyprland ClusterCut can bind them itself over Hyprland's IPC while it runs ("Bind Keys in Hyprland", off by default; your config files are never edited), or show the line to add to your config.
 - On Wayland desktops without the portal (Sway, GNOME 47 and older), bind a key to the new `ManualSend` / `ManualReceive` / `CopySend` / `CutSend` / `ReceivePaste` D-Bus methods; Settings shows the `gdbus` command.
@@ -15,11 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep My Clipboard (Settings, with either direction in manual mode): Copy & Send, Cut & Send and Receive & Paste put back what was on your clipboard before, so sending or receiving doesn't replace it. Text, rich text, images and files come back; an app's private formats (a spreadsheet's cell data, say) don't. Receive & Paste gives the app half a second to read the paste first.
 
 ### Changed
+- ClusterCut no longer keeps copies of items that never appear in History, such as a manual-mode copy waiting to be sent or a received item waiting to be applied.
 - The old shortcuts move to Shift: Send Clipboard (Ctrl+Alt+Shift+C) sends what's already on the clipboard, as Ctrl+Alt+C used to, and Receive Only (Ctrl+Alt+Shift+V) applies received content without pasting. Settings still on the old defaults move automatically; customised keys keep their meaning.
 - With Auto-Send off, a manual send now sends everything Auto-Send would: rich text, images (large ones included) and copied files, not just plain text. This covers the shortcut, the D-Bus `ManualSend` method and the in-app Send button, whose panel now previews the image or files about to go. With nothing on the clipboard, it now says so in a notification instead of appearing to do nothing.
 - The deb, rpm, and AUR packages now install the same launcher and icon as the Flatpak: `app.clustercut.clustercut.desktop`, matching the app ID that desktop portals use to identify ClusterCut, listed under Utilities. The old `ClusterCut.desktop` remains as a hidden entry so launchers pinned before the change keep working.
 
 ### Fixed
+- Clear History now also deletes the stored content (in memory, and on disk for large items). It used to empty only the list, keeping the content until ClusterCut quit or needed the space.
+- Deleting a History entry now deletes its stored content on the other devices too, not just their list entry.
 - On Windows, notifications whose title or text contains `&` or `<` now show. Windows refused the whole notification, so for example a received file named with an ampersand went unannounced.
 - With Auto-Receive off, accepting a large received image or text (Receive shortcut or the app's Apply button) now puts it on the clipboard. It was downloaded, then parked as pending again.
 - The Receive shortcut now applies rich text and records the item in History, as the app's Apply button does. With Auto-Send on, text received this way is no longer sent straight back to the cluster.

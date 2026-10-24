@@ -10,7 +10,7 @@ import { shortRichLabel } from "../lib/protocol";
 // Stateless; one instance reused for all rows rather than allocating per render.
 const utf8 = new TextEncoder();
 
-export function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; onClearHistory: () => void }) {
+export function HistoryView({ items, historyOff, onClearHistory }: { items: HistoryItem[]; historyOff: boolean; onClearHistory: () => void }) {
   const [myHostname, setMyHostname] = useState<string>("");
   const [progress, setProgress] = useState<Record<string, { transferred: number, total: number }>>({});
   const [downloadedFiles, setDownloadedFiles] = useState<Record<string, string[]>>({});
@@ -119,6 +119,10 @@ export function HistoryView({ items, onClearHistory }: { items: HistoryItem[]; o
             ) : undefined
           }
         />
+
+        {historyOff && (
+          <div className="mt-4 text-sm text-zinc-500">History is off, so nothing is kept. You can turn it back on in Settings.</div>
+        )}
 
         <div className="mt-4 space-y-2">
           {items.map((it) => {

@@ -6,11 +6,25 @@ import clsx from "clsx";
 import { Settings, Monitor, Wifi } from "lucide-react";
 import { SectionHeader, Card, Button } from "../ui";
 import { GlobalShortcutField } from "./GlobalShortcutField";
-import type { AppSettings, ShortcutStatus } from "../../types";
+import type { AppSettings, HistoryRetention, ShortcutStatus } from "../../types";
 
 // The firewall toggle only has an effect on Windows, where
 // configure_windows_firewall() exists. Match ShortcutRecorder's userAgent check.
 const isWindows = navigator.userAgent.toLowerCase().includes("win");
+
+const HISTORY_RETENTION: { value: HistoryRetention; label: string }[] = [
+  { value: "off", label: "Off" },
+  { value: "15m", label: "15 minutes" },
+  { value: "1h", label: "1 hour" },
+  { value: "1d", label: "1 day" },
+  { value: "1w", label: "1 week" },
+  { value: "until_quit", label: "Until ClusterCut quits" },
+];
+
+const HISTORY_MAX_ITEMS = [10, 25, 50, 100, 250, 500];
+
+const selectClass =
+  "h-10 w-56 rounded-xl border border-zinc-900/10 bg-white px-3 text-sm text-zinc-900 outline-none focus:ring-2 focus:ring-emerald-500/40 dark:border-white/10 dark:bg-zinc-900 dark:text-zinc-50";
 
 // The manual shortcuts per direction. `id` is the backend's ManualAction ID.
 type ShortcutDef = {
@@ -125,6 +139,37 @@ export function GeneralSettings({
               <span className={clsx("block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform", autostart ? "translate-x-6" : "translate-x-1")} />
             </button>
           </div>
+          <div className="mt-4 flex flex-col gap-1">
+            <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Keep History</label>
+            <select
+              className={selectClass}
+              value={settings.history_retention}
+              onChange={(e) => setSettings({ ...settings, history_retention: e.target.value as HistoryRetention })}
+            >
+              {HISTORY_RETENTION.map((r) => (
+                <option key={r.value} value={r.value}>{r.label}</option>
+              ))}
+            </select>
+            <div className="text-[10px] text-zinc-500">
+              How long copied and received items stay in History. History is never saved to disk, so it never outlives ClusterCut.
+            </div>
+          </div>
+          {settings.history_retention !== "off" && (
+            <div className="mt-4 flex flex-col gap-1">
+              <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Keep At Most</label>
+              <select
+                className={selectClass}
+                value={settings.history_max_items}
+                onChange={(e) => setSettings({ ...settings, history_max_items: parseInt(e.target.value, 10) })}
+              >
+                {/* A value set by hand in settings.json still shows. */}
+                {[...new Set([...HISTORY_MAX_ITEMS, settings.history_max_items])].sort((a, b) => a - b).map((n) => (
+                  <option key={n} value={n}>{n} items</option>
+                ))}
+              </select>
+              <div className="text-[10px] text-zinc-500">The oldest go first.</div>
+            </div>
+          )}
           <div className="mt-4 flex flex-col gap-1">
             <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
               History storage limit (MB)

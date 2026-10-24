@@ -73,7 +73,11 @@ export type HistoryItem = {
   formats?: ClipboardFormatPreview[];
   sender_id?: string;
   has_backing: boolean; // re-call possible (content still retained)
+  added_at: number; // local Date.now() when listed, for History expiry (ts is the sender's clock)
 };
+
+// How long History keeps entries (issue #22).
+export type HistoryRetention = "off" | "15m" | "1h" | "1d" | "1w" | "until_quit";
 
 export interface NotificationSettings {
   device_join: boolean;
@@ -103,6 +107,8 @@ export interface AppSettings {
   configure_firewall: boolean;
   mdns_advertising: boolean;
   history_store_max_bytes: number; // bytes; History content store budget
+  history_retention: HistoryRetention;
+  history_max_items: number;
   hyprland_bind_keys: boolean; // Hyprland: bind manual shortcuts live over IPC
 }
 

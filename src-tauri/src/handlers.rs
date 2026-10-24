@@ -1018,7 +1018,8 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
         }
         Message::HistoryDelete(id) => {
             tracing::info!("Received HistoryDelete for ID: {}", id);
-            let _ = listener_handle.emit("history-delete", &id);
+            // The stored content too, not just the list entry.
+            crate::clipboard::common::delete_history_entry(&listener_handle, &listener_state, &id);
         }
         Message::PeerDiscovery(mut peer) => {
             tracing::debug!("Received PeerDiscovery for {}", peer.hostname);

@@ -37,6 +37,8 @@ pub(crate) fn save_settings(
         .unwrap()
         .set_max_bytes(settings.history_store_max_bytes);
     crate::clipboard::common::handle_evictions(&app_handle, &state, evicted);
+    // Shorter retention, a lower limit, or history off: apply it now.
+    crate::clipboard::common::apply_history_retention(&app_handle, &state);
     tracing::info!(
         "Saving Settings: auto_send={}, auto_receive={}, configure_firewall={}, mdns_advertising={}",
         settings.auto_send, settings.auto_receive, settings.configure_firewall, settings.mdns_advertising

@@ -8,6 +8,7 @@
 use crate::protocol::ClipboardFormat;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// Re-callable content for one history item.
 #[derive(Debug, Clone)]
@@ -73,6 +74,11 @@ pub struct StoredEntry {
     /// Because the API is append-only (insert replaces, never mutates in
     /// place), this never diverges from the live content.
     pub size: u64,
+    /// Shown in History, so subject to the retention settings (issue #22).
+    /// Unlisted entries are large items' staged files, kept for peers to
+    /// fetch, which only the byte budget evicts.
+    pub listed: bool,
+    pub stored_at: Instant,
 }
 
 /// An entry removed by eviction/delete. The caller deletes `disk_path` (if
@@ -119,12 +125,12 @@ impl HistoryStore {
     /// AND there is nothing older to evict, in which case it is kept — see
     /// the spec's "cap smaller than a single item" rule). The freshly
     /// inserted id is exempt from this round's eviction.
-    pub fn insert(&mut self, id: String, content: StoredContent) -> Vec<Evicted> {
+    pub fn insert(&mut self, id: String, content: StoredContent, listed: bool) -> Vec<Evicted> {
         // Replace semantics: a repeated id (e.g. pending → confirmed) updates.
         self.remove_internal(&id);
         let size = content.size();
         self.entries
-            .insert(id.clone(), StoredEntry { content, size });
+            .insert(id.clone(), StoredEntry { content, size, listed, stored_at: Instant::now() });
         self.order.push_back(id.clone());
         self.total_bytes += size;
         self.evict_to_budget(Some(&id))
@@ -139,6 +145,34 @@ impl HistoryStore {
     pub fn set_max_bytes(&mut self, max_bytes: u64) -> Vec<Evicted> {
         self.max_bytes = max_bytes;
         self.evict_to_budget(None)
+    }
+
+    /// The retention settings (issue #22): evict listed entries beyond
+    /// `max_items` (oldest first) and listed entries older than `max_age`.
+    pub fn apply_limits(&mut self, max_items: usize, max_age: Option<Duration>) -> Vec<Evicted> {
+        self.apply_limits_at(Instant::now(), max_items, max_age)
+    }
+
+    fn apply_limits_at(&mut self, now: Instant, max_items: usize, max_age: Option<Duration>) -> Vec<Evicted> {
+        let listed = self.listed_ids();
+        let excess = listed.len().saturating_sub(max_items);
+        let mut victims = listed[..excess].to_vec();
+        if let Some(max_age) = max_age {
+            victims.extend(listed[excess..].iter().filter(|id| {
+                self.entries.get(*id).is_some_and(|e| now.saturating_duration_since(e.stored_at) > max_age)
+            }).cloned());
+        }
+        victims.iter().filter_map(|id| self.remove_internal(id)).collect()
+    }
+
+    /// Clear History: every listed entry.
+    pub fn clear_listed(&mut self) -> Vec<Evicted> {
+        self.listed_ids().iter().filter_map(|id| self.remove_internal(id)).collect()
+    }
+
+    /// Listed ids, oldest first.
+    fn listed_ids(&self) -> Vec<String> {
+        self.order.iter().filter(|id| self.entries.get(*id).is_some_and(|e| e.listed)).cloned().collect()
     }
 
     fn remove_internal(&mut self, id: &str) -> Option<Evicted> {
@@ -257,7 +291,7 @@ mod tests {
     #[test]
     fn insert_accounts_bytes() {
         let mut s = HistoryStore::new(1000);
-        assert!(s.insert("a".into(), text(100)).is_empty());
+        assert!(s.insert("a".into(), text(100), true).is_empty());
         assert_eq!(s.total_bytes(), 100);
         assert!(s.get("a").is_some());
     }
@@ -265,9 +299,9 @@ mod tests {
     #[test]
     fn evicts_oldest_first_over_budget() {
         let mut s = HistoryStore::new(250);
-        s.insert("a".into(), text(100));
-        s.insert("b".into(), text(100));
-        let evicted = s.insert("c".into(), text(100)); // 300 > 250
+        s.insert("a".into(), text(100), true);
+        s.insert("b".into(), text(100), true);
+        let evicted = s.insert("c".into(), text(100), true); // 300 > 250
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].id, "a");
         assert!(s.get("a").is_none());
@@ -279,8 +313,8 @@ mod tests {
     #[test]
     fn replace_same_id_updates_size_and_order() {
         let mut s = HistoryStore::new(1000);
-        s.insert("a".into(), text(100));
-        s.insert("a".into(), text(300));
+        s.insert("a".into(), text(100), true);
+        s.insert("a".into(), text(300), true);
         assert_eq!(s.total_bytes(), 300);
         assert_eq!(s.order.len(), 1);
     }
@@ -288,8 +322,8 @@ mod tests {
     #[test]
     fn lowering_cap_evicts_down() {
         let mut s = HistoryStore::new(1000);
-        s.insert("a".into(), text(100));
-        s.insert("b".into(), text(100));
+        s.insert("a".into(), text(100), true);
+        s.insert("b".into(), text(100), true);
         let evicted = s.set_max_bytes(150);
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].id, "a");
@@ -299,7 +333,7 @@ mod tests {
     #[test]
     fn oversized_single_item_is_kept() {
         let mut s = HistoryStore::new(50);
-        let evicted = s.insert("big".into(), text(500));
+        let evicted = s.insert("big".into(), text(500), true);
         assert!(evicted.is_empty());
         assert!(s.get("big").is_some());
     }
@@ -316,9 +350,53 @@ mod tests {
                 height: None,
                 size: 100,
             },
+            true,
         );
         let e = s.remove("d").unwrap();
         assert_eq!(e.disk_path, Some(PathBuf::from("/tmp/d.png")));
+    }
+
+    #[test]
+    fn item_limit_evicts_the_oldest_listed() {
+        let mut s = HistoryStore::new(10_000);
+        for id in ["a", "b", "c"] {
+            s.insert(id.into(), text(10), true);
+        }
+        let evicted: Vec<String> = s.apply_limits(2, None).into_iter().map(|e| e.id).collect();
+        assert_eq!(evicted, ["a"]);
+        assert!(s.get("b").is_some() && s.get("c").is_some());
+    }
+
+    #[test]
+    fn expiry_evicts_listed_entries_past_the_age() {
+        let mut s = HistoryStore::new(10_000);
+        s.insert("old".into(), text(10), true);
+        let later = Instant::now() + Duration::from_secs(120);
+        let evicted: Vec<String> = s.apply_limits_at(later, 50, Some(Duration::from_secs(60))).into_iter().map(|e| e.id).collect();
+        assert_eq!(evicted, ["old"]);
+        assert!(s.apply_limits(50, Some(Duration::from_secs(60))).is_empty());
+    }
+
+    #[test]
+    fn retention_leaves_unlisted_entries_to_the_budget() {
+        let mut s = HistoryStore::new(10_000);
+        s.insert("staged".into(), text(10), false);
+        s.insert("shown".into(), text(10), true);
+        let later = Instant::now() + Duration::from_secs(3600);
+        let evicted: Vec<String> = s.apply_limits_at(later, 0, Some(Duration::from_secs(1))).into_iter().map(|e| e.id).collect();
+        assert_eq!(evicted, ["shown"]);
+        assert!(s.get("staged").is_some());
+        assert!(s.clear_listed().is_empty());
+        assert_eq!(s.total_bytes(), 10);
+    }
+
+    #[test]
+    fn clear_removes_every_listed_entry() {
+        let mut s = HistoryStore::new(10_000);
+        s.insert("a".into(), text(10), true);
+        s.insert("b".into(), text(10), true);
+        assert_eq!(s.clear_listed().len(), 2);
+        assert_eq!(s.total_bytes(), 0);
     }
 
     #[test]

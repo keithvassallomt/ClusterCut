@@ -5,7 +5,7 @@ use crate::transport::Transport;
 use crate::{NotificationPayload, send_notification};
 use crate::protocol::Message;
 use crate::{request_clipboard_blob_internal, request_file_internal};
-use tauri::{Emitter, State};
+use tauri::State;
 
 /// Manual send from the UI's "Broadcast to Cluster" button: the same full-content
 /// send as the shortcut (text, rich text, images, files).
@@ -108,6 +108,15 @@ pub(crate) async fn recall_send_history_item(
     Ok(())
 }
 
+/// Clear History: every entry's stored content and files too, not just the
+/// list. This device only; peers keep their own History.
+#[tauri::command]
+pub(crate) fn clear_history(app_handle: tauri::AppHandle, state: State<'_, AppState>) {
+    let evicted = state.history_store.lock().unwrap().clear_listed();
+    tracing::info!("Clearing History ({} stored entr{})", evicted.len(), if evicted.len() == 1 { "y" } else { "ies" });
+    crate::clipboard::common::drop_history_entries(&app_handle, &state, evicted);
+}
+
 #[tauri::command]
 pub(crate) async fn delete_history_item(
     app_handle: tauri::AppHandle,
@@ -115,20 +124,9 @@ pub(crate) async fn delete_history_item(
     state: State<'_, AppState>,
     transport: State<'_, Transport>,
 ) -> Result<(), String> {
-    // 1. Emit Local Event (to update UI immediately)
+    // 1. Drop it here: list entry, retained content and its disk file.
     tracing::info!("Deleting history item locally: {}", id);
-    let _ = app_handle.emit("history-delete", &id);
-
-    // Drop retained content + its disk file. Take the evicted entry out of the
-    // history_store lock scope first, so we never hold history_store while
-    // acquiring local_clipboard_blobs.
-    let evicted = state.history_store.lock().unwrap().remove(&id);
-    if let Some(evicted) = evicted {
-        if let Some(path) = evicted.disk_path {
-            let _ = std::fs::remove_file(&path);
-        }
-        state.local_clipboard_blobs.lock().unwrap().remove(&id);
-    }
+    crate::clipboard::common::delete_history_entry(&app_handle, &state, &id);
 
     // 2. Broadcast to Peers
     let msg = Message::HistoryDelete(id);

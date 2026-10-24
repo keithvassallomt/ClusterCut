@@ -579,6 +579,12 @@ pub struct AppSettings {
     /// count. Default 200 MB; oldest entries evict first when exceeded.
     #[serde(default = "default_history_store_max_bytes")]
     pub history_store_max_bytes: u64,
+    /// How long History keeps entries (issue #22).
+    #[serde(default)]
+    pub history_retention: HistoryRetention,
+    /// How many entries History keeps (issue #22); the oldest go first.
+    #[serde(default = "default_history_max_items")]
+    pub history_max_items: u32,
     /// Hyprland only: bind the manual shortcuts live over Hyprland's IPC, since
     /// its shortcut portal never assigns keys. Opt-in; no config files touched.
     #[serde(default)]
@@ -595,6 +601,49 @@ fn default_true() -> bool {
 
 fn default_history_store_max_bytes() -> u64 {
     200 * 1024 * 1024
+}
+
+fn default_history_max_items() -> u32 {
+    50
+}
+
+/// How long History keeps an entry. History never outlives ClusterCut: it's
+/// held in memory, plus staged files cleared on exit.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HistoryRetention {
+    #[serde(rename = "off")]
+    Off,
+    #[serde(rename = "15m")]
+    Minutes15,
+    #[serde(rename = "1h")]
+    Hour,
+    #[serde(rename = "1d")]
+    Day,
+    #[serde(rename = "1w")]
+    Week,
+    #[default]
+    #[serde(rename = "until_quit")]
+    UntilQuit,
+}
+
+impl AppSettings {
+    /// History's limits: how many entries (0 while it's off) and how old.
+    pub fn history_limits(&self) -> (usize, Option<std::time::Duration>) {
+        let minutes = |m: u64| Some(std::time::Duration::from_secs(m * 60));
+        let max_age = match self.history_retention {
+            HistoryRetention::Off => return (0, None),
+            HistoryRetention::Minutes15 => minutes(15),
+            HistoryRetention::Hour => minutes(60),
+            HistoryRetention::Day => minutes(24 * 60),
+            HistoryRetention::Week => minutes(7 * 24 * 60),
+            HistoryRetention::UntilQuit => None,
+        };
+        (self.history_max_items.clamp(1, 1000) as usize, max_age)
+    }
+
+    pub fn history_off(&self) -> bool {
+        self.history_retention == HistoryRetention::Off
+    }
 }
 
 const DEFAULT_COPY_SEND: &str = "CommandOrControl+Alt+C";
@@ -671,6 +720,8 @@ impl Default for AppSettings {
             configure_firewall: true,
             mdns_advertising: true,
             history_store_max_bytes: 200 * 1024 * 1024,
+            history_retention: HistoryRetention::UntilQuit,
+            history_max_items: 50,
             hyprland_bind_keys: false,
         }
     }
@@ -838,6 +889,30 @@ mod settings_tests {
         assert_eq!(s.shortcut_cut_send, None);
         assert_eq!(s.shortcut_copy_send.as_deref(), Some("CommandOrControl+Alt+C"));
         assert_eq!(s.shortcut_receive, None, "a cleared key stays cleared");
+    }
+
+    #[test]
+    fn history_settings_default_to_todays_behaviour() {
+        let json = serde_json::to_value(AppSettings::default()).unwrap();
+        let mut obj = json.as_object().unwrap().clone();
+        obj.remove("history_retention");
+        obj.remove("history_max_items");
+        let s: AppSettings = serde_json::from_value(obj.into()).unwrap();
+        assert_eq!(s.history_retention, super::HistoryRetention::UntilQuit);
+        assert_eq!(s.history_limits(), (50, None));
+    }
+
+    #[test]
+    fn history_limits_follow_the_settings() {
+        let mut s = AppSettings::default();
+        s.history_retention = super::HistoryRetention::Minutes15;
+        s.history_max_items = 10;
+        assert_eq!(s.history_limits(), (10, Some(std::time::Duration::from_secs(900))));
+        s.history_retention = super::HistoryRetention::Off;
+        assert_eq!(s.history_limits(), (0, None));
+        assert!(s.history_off());
+        let back: super::HistoryRetention = serde_json::from_str("\"1w\"").unwrap();
+        assert_eq!(back, super::HistoryRetention::Week);
     }
 
     #[test]

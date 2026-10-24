@@ -1106,7 +1106,57 @@ fn disk_text_prefix(path: &std::path::Path) -> Option<String> {
 /// Apply the side effects of an eviction: delete the disk file (unless an
 /// in-flight fetch still needs it), drop the local_clipboard_blobs entry, and
 /// tell the UI the item's backing is gone.
+/// Byte-budget evictions: the entry stays in History but can't be re-copied.
 pub(crate) fn handle_evictions(app: &AppHandle, state: &AppState, evicted: Vec<Evicted>) {
+    release_evicted(app, state, evicted, "history-backing-evicted");
+}
+
+/// Retention, Clear and Delete: the entry leaves History altogether.
+pub(crate) fn drop_history_entries(app: &AppHandle, state: &AppState, evicted: Vec<Evicted>) {
+    release_evicted(app, state, evicted, "history-delete");
+}
+
+/// Delete one History entry here: its stored content and file as well as the
+/// list entry (the History delete button, and a peer's delete).
+pub(crate) fn delete_history_entry(app: &AppHandle, state: &AppState, id: &str) {
+    // Out of the history_store lock before release_evicted takes others.
+    let evicted = state.history_store.lock().unwrap().remove(id);
+    match evicted {
+        Some(e) => drop_history_entries(app, state, vec![e]),
+        None => {
+            let _ = app.emit("history-delete", id);
+        }
+    }
+}
+
+/// Apply the retention settings to the store (issue #22). The frontend trims
+/// its list by the same settings; entries with stored content also go from it
+/// through `history-delete`.
+pub(crate) fn apply_history_retention(app: &AppHandle, state: &AppState) {
+    let (max_items, max_age) = state.settings.lock().unwrap().history_limits();
+    let evicted = state.history_store.lock().unwrap().apply_limits(max_items, max_age);
+    if !evicted.is_empty() {
+        tracing::info!("History retention removed {} stored entr{}", evicted.len(), if evicted.len() == 1 { "y" } else { "ies" });
+    }
+    drop_history_entries(app, state, evicted);
+}
+
+/// Expire History entries as they age (issue #22).
+pub(crate) fn spawn_history_sweep(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            let state = app.state::<AppState>();
+            if state.is_shutdown() {
+                break;
+            }
+            apply_history_retention(&app, &state);
+        }
+    });
+}
+
+fn release_evicted(app: &AppHandle, state: &AppState, evicted: Vec<Evicted>, event: &str) {
     for e in evicted {
         {
             let mut map = state.local_clipboard_blobs.lock().unwrap();
@@ -1125,7 +1175,7 @@ pub(crate) fn handle_evictions(app: &AppHandle, state: &AppState, evicted: Vec<E
                 let _ = std::fs::remove_file(&path);
             }
         }
-        let _ = app.emit("history-backing-evicted", &e.id);
+        let _ = app.emit(event, &e.id);
     }
 }
 
@@ -1138,6 +1188,9 @@ pub fn record_and_emit(
     payload: &ClipboardPayload,
 ) {
     let mut evicted = Vec::new();
+    let mut expired = Vec::new();
+    // Only `clipboard-change` items appear in History, and only while it's on.
+    let listed = event == "clipboard-change" && !state.settings.lock().unwrap().history_off();
     let (text_preview, text_len, blob, has_backing) =
         match stored_content_for_payload(state, payload) {
             Some((content, thumb)) => {
@@ -1148,8 +1201,16 @@ pub fn record_and_emit(
                         tp = disk_text_prefix(path);
                     }
                 }
-                evicted = state.history_store.lock().unwrap().insert(payload.id.clone(), content);
-                (tp, tl, bp, true)
+                // Keep what History can re-copy, plus large items' staged files,
+                // which peers fetch the content from. Nothing else is ever
+                // recalled, so no other copy is kept.
+                if listed || matches!(content, StoredContent::Disk { .. }) {
+                    let (max_items, max_age) = state.settings.lock().unwrap().history_limits();
+                    let mut store = state.history_store.lock().unwrap();
+                    evicted = store.insert(payload.id.clone(), content, listed);
+                    expired = store.apply_limits(max_items, max_age);
+                }
+                (tp, tl, bp, listed)
             }
             None => {
                 let (tp, tl, bp) = descriptor_preview(payload);
@@ -1158,6 +1219,7 @@ pub fn record_and_emit(
         };
 
     handle_evictions(app, state, evicted);
+    drop_history_entries(app, state, expired);
 
     let preview = ClipboardPreview {
         id: payload.id.clone(),
