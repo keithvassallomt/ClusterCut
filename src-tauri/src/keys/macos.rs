@@ -18,6 +18,7 @@ const RELEASE_TIMEOUT: Duration = Duration::from_millis(1500);
 const RELEASE_POLL: Duration = Duration::from_millis(10);
 
 // CGEventTypes.h / CGEventSource.h
+const COMBINED_SESSION_STATE: i32 = 0;
 const HID_SYSTEM_STATE: i32 = 1;
 const HID_EVENT_TAP: u32 = 0;
 const FLAG_SHIFT: u64 = 0x0002_0000;
@@ -133,8 +134,11 @@ pub(super) fn ansi_keycode(ch: char) -> u16 {
 pub(super) fn press(keycode: u16, shift: bool) -> Result<(), KeysError> {
     let held = FLAG_SHIFT | FLAG_CONTROL | FLAG_ALTERNATE | FLAG_COMMAND;
     let deadline = Instant::now() + RELEASE_TIMEOUT;
+    // Combined, not HID: the HID state is the physical keyboard only, so keys
+    // from RustDesk or other remote control looked released while still held
+    // and TextEdit got Cmd+Option+C (Copy Style).
     // SAFETY: reads the current modifier state.
-    while unsafe { CGEventSourceFlagsState(HID_SYSTEM_STATE) } & held != 0 && Instant::now() < deadline {
+    while unsafe { CGEventSourceFlagsState(COMBINED_SESSION_STATE) } & held != 0 && Instant::now() < deadline {
         std::thread::sleep(RELEASE_POLL);
     }
     let flags = FLAG_COMMAND | if shift { FLAG_SHIFT } else { 0 };

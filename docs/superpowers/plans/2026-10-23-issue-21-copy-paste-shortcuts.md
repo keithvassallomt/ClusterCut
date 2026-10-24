@@ -4,7 +4,7 @@
 
 **Goal:** cut the manual-mode round trip from four key presses to two (issue #21, mtudor). The sender's shortcut copies the selection and sends it; the receiver's shortcut applies the pending content and pastes it. Plus a cut variant, the old "send what's on the clipboard" behaviour on its own combo, and an optional mode that leaves the local clipboard as it was.
 
-**Status:** stage 1 (core + Hyprland) done and tested by Keith 2026-10-23. Stage 2 (KDE) done 2026-10-24, Keith tested on the VM. Stage 3 (GNOME) done 2026-10-24, Keith tested on the VM. Stages 4-6 (X11, Windows, macOS) written 2026-10-24: X11 untested by design, Windows and macOS awaiting Keith. X11 is best effort: written, not tested (Keith, 2026-10-23).
+**Status:** stage 1 (core + Hyprland) done and tested by Keith 2026-10-23. Stage 2 (KDE) done 2026-10-24, Keith tested on the VM. Stage 3 (GNOME) done 2026-10-24, Keith tested on the VM. Stages 4-6 (X11, Windows, macOS) written 2026-10-24: X11 untested by design; Windows tested by Keith 2026-10-24; macOS awaiting Keith. X11 is best effort: written, not tested (Keith, 2026-10-23).
 
 ## Decisions (Keith, 2026-10-23)
 
@@ -140,10 +140,12 @@ Each stage ends with Keith testing on the named desktop.
 ### 4. X11 (best effort, not tested) (written 2026-10-24)
 - [x] `keys/x11.rs`: XTEST (`x11rb` `xtest` feature), keycodes from the current keyboard mapping, waits on `QueryKeymap` for modifier keycodes (1.5 s cap), `_NET_ACTIVE_WINDOW` then `WM_CLASS` (instance and class) for terminals. Picked when not Wayland and `DISPLAY` is set. Builds; not run (Keith, 2026-10-23).
 
-### 5. Windows (Keith) (written 2026-10-24)
+### 5. Windows (Keith) (DONE 2026-10-24, Keith tested)
 - [x] `keys/windows.rs`: `SendInput` (Insert gets `KEYEVENTF_EXTENDEDKEY`), waits on `GetAsyncKeyState` for Ctrl/Alt/Shift/Win, foreground window's exe (`QueryFullProcessImageNameW`) for terminals, which get Ctrl+Insert / Shift+Insert. Fewer events sent than asked means UIPI blocked it (elevated app). New `windows` features: `Win32_UI_Input_KeyboardAndMouse`, `Win32_System_Threading`.
 - [x] Compile-checked for `x86_64-pc-windows-msvc` in an isolated crate (the full app can't be cross-built here: `aws-lc-sys`), including the calls `keys/mod.rs` makes.
-- [ ] Keith: Notepad, a browser, Explorer (files), Windows Terminal with a selection, holding Ctrl+Alt.
+- [x] Keith (2026-10-24, `tauri dev` on the branch): Copy & Send in Notepad; holding Ctrl+Alt; nothing selected (notice, nothing sent); browser (rich text); Explorer (files); Cut & Send; Windows Terminal with a selection (Ctrl+Insert, the running ping kept going); Receive & Paste into Notepad and into Windows Terminal (Shift+Insert).
+- Found: Windows toasts with `&` or `<` in the title or text were rejected outright ("Copy & Send"). Existing bug; fixed with `xml_escape` in `send_notification` (0e4e139).
+- Testing through RustDesk muddles it: RustDesk syncs clipboards itself and forwards keys, and both machines had the same shortcuts. Clean setup: RustDesk clipboard sync off, the controlling machine in automatic mode (so it has no manual shortcuts).
 
 ### 6. macOS (Keith) (written 2026-10-24)
 - [x] `keys/macos.rs`: raw CoreGraphics FFI, Cmd(+Shift)+key with explicit event flags, waits on `CGEventSourceFlagsState`, keycode for c/x/v from the current layout via `UCKeyTranslate` (on the main thread; the input source APIs assert it on recent macOS), ANSI fallback. `AXIsProcessTrustedWithOptions` with the prompt before pressing; `KeysError::NeedsAccessibility` and the Settings Allow row (`permission: false`) until granted. No terminal check (Cmd is safe there).
