@@ -1,0 +1,245 @@
+name: Release
+
+# A v* tag, pushed by `just release`, builds every installer and publishes the
+# GitHub release. Nothing else is published from here: the AUR package, the
+# FriendlyHub files and the EGO zip are `just release`'s, on Keith's machine,
+# once this run succeeds. See BUILD.md, "Release Workflow".
+
+on:
+  push:
+    tags: ['v*']
+  # Dry run (`just release-dry-run`): builds everything, publishes nothing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: check
+        name: Version strings agree (and match the tag)
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tauri=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          if [ "$tauri" != "$version" ] || [ "$cargo" != "$version" ]; then
+            echo "::error::package.json is $version, tauri.conf.json $tauri, Cargo.toml $cargo. Run npm run sync-version."
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME doesn't match the version $version."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: CHANGELOG.md has a section for it
+        if: github.ref_type == 'tag'
+        run: scripts/release-notes.sh "${{ steps.check.outputs.version }}" > /dev/null
+
+  # Built on the oldest supported Ubuntu, so the deb and rpm run on any distro
+  # with glibc 2.35 or newer. Built on Arch they needed 2.39.
+  linux:
+    name: deb and rpm
+    needs: version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential file libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npm run tauri build -- --bundles deb,rpm
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installer-linux
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+          if-no-files-found: error
+
+  windows:
+    name: Windows installer
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 60
+    # PowerShell's npm shim can drop the `--` before Tauri's arguments.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npm run tauri build -- --bundles nsis
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installer-windows
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  # Signed and notarized, as the DMGs built on the Mac were. Tauri imports
+  # APPLE_CERTIFICATE into a temporary keychain and notarizes with the Apple ID.
+  macos:
+    name: macOS DMG
+    needs: version
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      # Under CI=true Tauri skips the Finder step that lays out the DMG window
+      # (background, icon positions); this keeps it.
+      TAURI_BUNDLER_DMG_IGNORE_CI: 'true'
+    steps:
+      - name: Signing secrets are set
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The $name secret is missing, so the DMG would ship unsigned. See BUILD.md."
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npm run tauri build -- --bundles dmg
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installer-macos
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  # What FriendlyHub gets: the manifest pinned to this tag and commit, the
+  # metainfo, and the generated cargo and node sources. The Flatpak below is
+  # built from exactly these files, so a release proves its submission builds.
+  friendlyhub:
+    name: FriendlyHub files
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Generate the submission
+        run: |
+          manifest=src-tauri/flatpak/app.clustercut.clustercut.yml
+          mkdir friendlyhub
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if ! grep -qE "^\s+tag: ${GITHUB_REF_NAME//./\\.}\$" "$manifest"; then
+              echo "::error::$manifest doesn't build $GITHUB_REF_NAME; just release sets its tag."
+              exit 1
+            fi
+            sed "s|^\(\s*\)tag: $GITHUB_REF_NAME\$|&\n\1commit: $GITHUB_SHA|" "$manifest" > friendlyhub/app.clustercut.clustercut.yml
+          else
+            # Dry run: build this commit, not the last release's tag.
+            sed "s|^\(\s*\)tag: v.*|\1commit: $GITHUB_SHA|" "$manifest" > friendlyhub/app.clustercut.clustercut.yml
+          fi
+          cp src-tauri/flatpak/app.clustercut.clustercut.metainfo.xml friendlyhub/
+          python3 -m venv .venv-flatpak
+          .venv-flatpak/bin/pip install -q aiohttp PyYAML tomlkit
+          .venv-flatpak/bin/python3 src-tauri/flatpak/builder-tools/cargo/flatpak-cargo-generator.py src-tauri/Cargo.lock -o friendlyhub/cargo-sources.json
+          PYTHONPATH=src-tauri/flatpak/builder-tools/node .venv-flatpak/bin/python3 -m flatpak_node_generator npm package-lock.json -o friendlyhub/node-sources.json
+          grep -A3 'type: git' friendlyhub/app.clustercut.clustercut.yml
+      - uses: actions/upload-artifact@v7
+        with:
+          name: friendlyhub
+          path: friendlyhub/*
+          if-no-files-found: error
+
+  flatpak:
+    name: Flatpak bundle
+    needs: [version, friendlyhub]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: friendlyhub
+          path: flatpak-build
+      # FriendlyHub clones these itself, so they aren't part of the submission.
+      - name: Fetch shared-modules
+        run: git clone --depth 1 https://github.com/flathub/shared-modules.git flatpak-build/shared-modules
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: flatpak-build/app.clustercut.clustercut.yml
+          bundle: ClusterCut_${{ needs.version.outputs.version }}_x86_64.flatpak
+          upload-artifact: false
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installer-flatpak
+          path: ClusterCut_${{ needs.version.outputs.version }}_x86_64.flatpak
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: [version, linux, windows, macos, flatpak]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: installer-*
+          path: release-assets
+          merge-multiple: true
+      - name: Every installer is there
+        run: |
+          ls -l release-assets
+          for f in "ClusterCut_${VERSION}_amd64.deb" "ClusterCut-${VERSION}-1.x86_64.rpm" "ClusterCut_${VERSION}_x64-setup.exe" \
+                   "ClusterCut_${VERSION}_aarch64.dmg" "ClusterCut_${VERSION}_x86_64.flatpak"; do
+            if [ ! -f "release-assets/$f" ]; then
+              echo "::error::$f is missing."
+              exit 1
+            fi
+          done
+      # gh uploads the assets to a draft and publishes it once they're all there.
+      - name: Publish
+        run: |
+          scripts/release-notes.sh "$VERSION" > release-notes.md
+          gh release create "v$VERSION" --verify-tag --title "v$VERSION" --notes-file release-notes.md release-assets/*

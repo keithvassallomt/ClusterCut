@@ -7,13 +7,16 @@ default:
 # Use .env file for all commands
 set dotenv-load := true
 
-# Bump the version: prompts for new version, updates package.json, syncs everywhere
-bump-version:
+# Bump the version: updates package.json (prompting when no version is given), syncs everywhere
+bump-version version="":
     #!/usr/bin/env bash
     set -euo pipefail
     CURRENT=$(node -p "require('./package.json').version")
-    echo "Current version: ${CURRENT}"
-    read -rp "New version: " NEW_VERSION
+    NEW_VERSION="{{version}}"
+    if [ -z "${NEW_VERSION}" ]; then
+        echo "Current version: ${CURRENT}"
+        read -rp "New version: " NEW_VERSION
+    fi
     if [ -z "${NEW_VERSION}" ]; then
         echo "ERROR: No version provided."
         exit 1
@@ -87,177 +90,211 @@ dev-setup:
     echo "  - Log out and log back in (GNOME Wayland can't live-reload extensions)."
     echo "    Then: gnome-extensions enable ${EXT_UUID}"
 
-# Build a release: sync version, commit, tag, build native packages (+flatpak on Linux), copy to output dir
+# From main on the Arch machine. Checks the changelog, the metainfo notes and (if it
+# changed) the GNOME extension, then tags and pushes; GitHub builds every installer
+# and publishes the release, then release-finish runs. See BUILD.md, "Release Workflow".
+# Cut a release: asks for the version, checks, tags; GitHub builds and publishes
 release output_dir="~/Downloads":
     #!/usr/bin/env bash
     set -euo pipefail
+    die() { echo "ERROR: $*" >&2; exit 1; }
+    REPO=keithvassallomt/ClusterCut
+    METAINFO=src-tauri/flatpak/app.clustercut.clustercut.metainfo.xml
+    MANIFEST=src-tauri/flatpak/app.clustercut.clustercut.yml
+
+    # Preflight: nothing changes until all of these pass.
+    command -v makepkg >/dev/null || die "release from an Arch machine: the AUR step needs makepkg"
+    for tool in gh node xmllint appstreamcli zip; do
+        command -v "${tool}" >/dev/null || die "${tool} is not installed"
+    done
+    [ "$(git branch --show-current)" = main ] || die "release from main"
+    [ -z "$(git status --porcelain)" ] || die "commit or stash your changes first"
+    git fetch -q --tags origin
+    git merge-base --is-ancestor origin/main HEAD || die "main is behind origin/main; pull first"
+    SECRETS=$(gh secret list -R "${REPO}" --json name --jq '.[].name')
+    for secret in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+        grep -qx "${secret}" <<< "${SECRETS}" || die "the ${secret} GitHub secret is missing (macOS signing, see BUILD.md)"
+    done
+
+    # 1. The version: newer than the last release, and not tagged yet.
+    LAST_TAG=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)
+    LAST="${LAST_TAG#v}"
+    CURRENT=$(node -p "require('./package.json').version")
+    newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
+    SUGGESTED=""
+    if newer "${CURRENT}" "${LAST}"; then
+        SUGGESTED="${CURRENT}"
+    fi
+    echo "Last release: ${LAST_TAG}. package.json: ${CURRENT}."
+    read -rp "Version to release${SUGGESTED:+ [${SUGGESTED}]}: " VERSION
+    VERSION="${VERSION:-${SUGGESTED}}"
+    [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "the version must look like 1.2.3"
+    newer "${VERSION}" "${LAST}" || die "${VERSION} isn't newer than the last release, ${LAST}"
+    TAG="v${VERSION}"
+    if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+        die "${TAG} is already tagged"
+    fi
+
+    # 2. CHANGELOG.md: notes under [X.Y.Z], or under [Unreleased], which becomes [X.Y.Z].
+    has_notes() { awk -v h="$1" 'index($0, h) == 1 {f = 1; next} f && /^## \[/ {exit} f && NF {n++} END {exit !n}' CHANGELOG.md; }
+    if has_notes "## [${VERSION}]"; then
+        DATE_UNRELEASED=false
+    elif has_notes "## [Unreleased]"; then
+        DATE_UNRELEASED=true
+    else
+        die "CHANGELOG.md has no notes under [${VERSION}] or [Unreleased]"
+    fi
+
+    # 3. Metainfo: a <release> for this version with notes, and the file validates.
+    NOTES=$(xmllint --xpath "count(//release[@version='${VERSION}']/description)" "${METAINFO}")
+    [ "${NOTES}" = 1 ] || die "${METAINFO} needs a <release version=\"${VERSION}\"> with a <description> of what's new"
+    if ! appstreamcli validate --no-net "${METAINFO}" >/dev/null; then
+        appstreamcli validate --no-net "${METAINFO}" || true
+        die "${METAINFO} doesn't validate"
+    fi
+
+    # 4. The GNOME extension, if it changed since the last release: a new
+    #    version-name, and a zip that passes EGO's checks.
+    EXTENSION="unchanged since ${LAST_TAG}"
+    if ! git diff --quiet "${LAST_TAG}" HEAD -- gnome-extension; then
+        version_name() { node -p "JSON.parse(require('fs').readFileSync(0, 'utf8'))['version-name']"; }
+        OLD_NAME=$(git show "${LAST_TAG}:gnome-extension/metadata.json" | version_name)
+        NEW_NAME=$(version_name < gnome-extension/metadata.json)
+        [ "${OLD_NAME}" != "${NEW_NAME}" ] || die "gnome-extension changed since ${LAST_TAG}, but its version-name is still ${NEW_NAME}"
+        {{just_executable()}} extension-zip
+        EXTENSION="${OLD_NAME} -> ${NEW_NAME}, zip validated"
+    fi
+
+    # 5. Tests, and the frontend builds.
+    echo "==> Running the tests..."
+    (cd src-tauri && cargo test --quiet)
+    npm run build >/dev/null
+
+    # From here on files change; a failure, or answering no, puts them back.
+    RESTORE=true
+    restore() {
+        if [ "${RESTORE}" = true ]; then
+            git checkout -q -- .
+            echo "Files restored."
+        fi
+    }
+    trap restore EXIT
+
+    # 6. Set the version everywhere, date the changelog and the metainfo
+    #    release, and point the Flatpak manifest at the new tag.
+    TODAY=$(date +%Y-%m-%d)
+    if [ "${CURRENT}" != "${VERSION}" ]; then
+        {{just_executable()}} bump-version "${VERSION}" >/dev/null
+    fi
+    if [ "${DATE_UNRELEASED}" = true ]; then
+        sed -i "s/^## \[Unreleased\]/## [${VERSION}] - ${TODAY}/" CHANGELOG.md
+    fi
+    sed -i -E "s|(<release version=\"${VERSION//./\\.}\" date=\")[^\"]*|\1${TODAY}|" "${METAINFO}"
+    sed -i "s/tag: v.*/tag: ${TAG}/" "${MANIFEST}"
+
+    # 7. Confirm.
+    echo
+    echo "=== GitHub release notes ==="
+    scripts/release-notes.sh "${VERSION}"
+    echo "=== Metainfo notes ==="
+    xmllint --xpath "//release[@version='${VERSION}']/description" "${METAINFO}"
+    echo
+    echo "=== GNOME extension: ${EXTENSION} ==="
+    echo
+    git --no-pager diff --stat
+    read -rp "Release ${TAG}? [y/N] " ANSWER
+    [ "${ANSWER}" = y ] || die "cancelled"
+
+    # 8. Commit, tag and push; the tag starts the release workflow.
+    # Nothing to commit when releasing a version again after deleting its tag.
+    git add -A
+    git diff --cached --quiet || git commit -q -m "${TAG}"
+    git tag "${TAG}"
+    RESTORE=false
+    git push -q --atomic origin main "${TAG}" \
+        || die "the push failed. Once fixed: git push --atomic origin main ${TAG} && just release-finish ${VERSION}"
+    echo "==> Pushed ${TAG}."
+    {{just_executable()}} release-finish "${VERSION}" "{{output_dir}}"
+
+# `just release` runs this; run it again after rerunning a failed workflow. The EGO
+# zip is only saved when the GNOME extension changed since the previous release.
+# Finish a pushed release: wait for GitHub, publish to the AUR, save the FriendlyHub files and EGO zip
+release-finish version output_dir="~/Downloads":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    die() { echo "ERROR: $*" >&2; exit 1; }
+    REPO=keithvassallomt/ClusterCut
+    VERSION="{{version}}"
+    TAG="v${VERSION}"
     OUTPUT_DIR="{{output_dir}}"
     OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
     mkdir -p "${OUTPUT_DIR}"
 
-    # Cross-platform in-place sed (BSD sed on macOS requires an extension arg after -i)
-    sedi() { if [[ "$(uname -s)" == "Darwin" ]]; then sed -i '' "$@"; else sed -i "$@"; fi; }
+    git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null || die "${TAG} isn't tagged"
+    # aur-publish packages the version in package.json.
+    [ "$(node -p "require('./package.json').version")" = "${VERSION}" ] || die "package.json isn't at ${VERSION}; check out ${TAG}"
 
-    # 1. Sync version
-    echo "==> Syncing version..."
-    npm run sync-version
-
-    # 2. Read version
-    VERSION=$(node -p "require('./package.json').version")
-    TAG="v${VERSION}"
-    AMEND=false
-    if git rev-parse "${TAG}" >/dev/null 2>&1; then
-        echo "==> Version: ${VERSION} (tag: ${TAG}) — tag exists, will amend"
-        AMEND=true
-    else
-        echo "==> Version: ${VERSION} (tag: ${TAG})"
-    fi
-
-    # 3. Check changelog has notes for this version
-    echo "==> Updating CHANGELOG.md..."
-    if grep -q '## \[Unreleased\]' CHANGELOG.md; then
-        TODAY=$(date +%Y-%m-%d)
-        sedi "s/## \[Unreleased\]/## [${VERSION}] - ${TODAY}/" CHANGELOG.md
-    elif ! grep -q "## \[${VERSION}\]" CHANGELOG.md; then
-        echo "ERROR: CHANGELOG.md has no [Unreleased] or [${VERSION}] section. Add release notes before releasing."
+    # 1. Wait for the release workflow.
+    RUN=""
+    for _ in $(seq 1 30); do
+        RUN=$(gh run list -R "${REPO}" --workflow release.yml --branch "${TAG}" --event push --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+        [ -n "${RUN}" ] && break
+        sleep 5
+    done
+    [ -n "${RUN}" ] || die "the release workflow didn't start; check: gh run list -R ${REPO} --workflow release.yml"
+    echo "==> Waiting for the release workflow (the Flatpak and macOS builds take a while):"
+    echo "    https://github.com/${REPO}/actions/runs/${RUN}"
+    if ! gh run watch "${RUN}" -R "${REPO}" --exit-status --interval 30 >/dev/null; then
+        FAILED=$(gh run view "${RUN}" -R "${REPO}" --json jobs --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")')
+        echo "ERROR: the release workflow failed in: ${FAILED}" >&2
+        echo "  Logs:  gh run view ${RUN} -R ${REPO} --log-failed" >&2
+        echo "  Retry: gh run rerun ${RUN} -R ${REPO} --failed, then: just release-finish ${VERSION}" >&2
         exit 1
     fi
+    URL=$(gh release view "${TAG}" -R "${REPO}" --json url --jq .url) || die "the workflow passed but there's no GitHub release for ${TAG}"
 
-    # 4. Update yml tag, commit all changes, tag
-    echo "==> Committing release..."
-    sedi "s/tag: v.*/tag: ${TAG}/" src-tauri/flatpak/app.clustercut.clustercut.yml
-    sedi "/^        commit:/d" src-tauri/flatpak/app.clustercut.clustercut.yml
-    git add -A
-    if [ "${AMEND}" = true ]; then
-        git commit --amend -m "v${VERSION}"
-        git tag -f "${TAG}"
-        echo "==> Amended commit and moved tag ${TAG}"
-    else
-        git commit -m "v${VERSION}"
-        git tag "${TAG}"
-        echo "==> Created tag ${TAG}"
+    # 2. The FriendlyHub submission, as the workflow generated and built it.
+    FRIENDLYHUB="${OUTPUT_DIR}/ClusterCut-${VERSION}-friendlyhub"
+    rm -rf "${FRIENDLYHUB}"
+    gh run download "${RUN}" -R "${REPO}" -n friendlyhub -D "${FRIENDLYHUB}"
+
+    # 3. The EGO zip, if the extension changed since the release before this one.
+    PREVIOUS=$(git tag --list 'v[0-9]*' --sort=-v:refname | awk -v t="${TAG}" 'found {print; exit} $0 == t {found = 1}')
+    EGO_ZIP=""
+    if ! git diff --quiet "${PREVIOUS}" "${TAG}" -- gnome-extension; then
+        git diff --quiet "${TAG}" -- gnome-extension || die "gnome-extension has changed since ${TAG}; check out ${TAG} to build its zip"
+        {{just_executable()}} extension-zip
+        EGO_ZIP="${OUTPUT_DIR}/clustercut@keithvassallo.com.shell-extension.zip"
+        cp clustercut@keithvassallo.com.shell-extension.zip "${EGO_ZIP}"
     fi
 
-    # 6. Push (must happen before Flatpak build, which clones the tag from GitHub)
-    echo "==> Pushing..."
-    git push --force-with-lease
-    git push origin "${TAG}" --force
+    # 4. The AUR. A failure here leaves the rest of the release standing.
+    echo "==> Publishing to the AUR..."
+    AUR_OK=true
+    {{just_executable()}} aur-publish || AUR_OK=false
 
-    # 7. Build native packages
-    echo "==> Building native packages..."
-    rm -rf src-tauri/target/release/bundle
-    npm run tauri build
-
-    # 8. Copy artifacts to output dir
-    OS="$(uname -s)"
-    echo "==> Copying artifacts to ${OUTPUT_DIR}..."
-    case "${OS}" in
-        Linux)
-            cp src-tauri/target/release/bundle/deb/*.deb "${OUTPUT_DIR}/" 2>/dev/null || true
-            cp src-tauri/target/release/bundle/rpm/*.rpm "${OUTPUT_DIR}/" 2>/dev/null || true
-            ;;
-        Darwin)
-            cp src-tauri/target/release/bundle/dmg/*.dmg "${OUTPUT_DIR}/" 2>/dev/null || true
-            ;;
-        MINGW*|MSYS*|CYGWIN*)
-            cp src-tauri/target/release/bundle/nsis/*.exe "${OUTPUT_DIR}/" 2>/dev/null || true
-            ;;
-    esac
-
-    # 9. Flatpak (Linux only)
-    if [ "${OS}" = "Linux" ]; then
-        echo "==> Building Flatpak bundle..."
-        just flatpak "{{output_dir}}"
-    fi
-
-    # 10. Create (or update) the GitHub release and upload THIS platform's artifacts.
-    # The release is published immediately rather than kept as a draft: assets on a
-    # draft release are not publicly downloadable, and the AUR package's source URL
-    # has to resolve the moment it is pushed. So the release goes live with whatever
-    # has been built so far, and the macOS/Windows runs add their installers when
-    # they happen.
-    # Notes = packaging/release-notes-template.md with @VERSION@ substituted and
-    # @CHANGELOG@ replaced by this version's CHANGELOG.md section, so every release
-    # keeps the same shape (install instructions, tips, Full Changelog footer).
-    echo "==> Publishing GitHub release ${TAG}..."
-    CHANGELOG_SECTION=$(mktemp)
-    awk -v ver="${VERSION}" '
-        $0 ~ "^## \\[" ver "\\]" { inside = 1; next }
-        inside && /^## \[/ { exit }
-        inside {
-            # Drop the blank line that follows the version heading; the template
-            # already spaces the changelog away from the title.
-            if (!started && $0 ~ /^[[:space:]]*$/) next
-            started = 1
-            print
-        }
-    ' CHANGELOG.md > "${CHANGELOG_SECTION}"
-    if [ ! -s "${CHANGELOG_SECTION}" ]; then
-        echo "ERROR: no CHANGELOG.md section for ${VERSION} to use as release notes."
-        exit 1
-    fi
-    NOTES_FILE=$(mktemp)
-    awk -v ver="${VERSION}" -v sect="${CHANGELOG_SECTION}" '
-        /@CHANGELOG@/ { while ((getline line < sect) > 0) print line; next }
-        { gsub(/@VERSION@/, ver); print }
-    ' packaging/release-notes-template.md > "${NOTES_FILE}"
-    rm -f "${CHANGELOG_SECTION}"
-    if gh release view "${TAG}" >/dev/null 2>&1; then
-        gh release edit "${TAG}" --notes-file "${NOTES_FILE}" >/dev/null
-        echo "    updated existing release"
-    else
-        gh release create "${TAG}" --title "${TAG}" --notes-file "${NOTES_FILE}" >/dev/null
-        echo "    created release"
-    fi
-    rm -f "${NOTES_FILE}"
-
-    # No bash arrays here on purpose: macOS ships bash 3.2, where expanding an
-    # empty array under `set -u` is an error. Unmatched globs fall through as
-    # literals, which the -f test filters out.
-    UPLOADED=0
-    upload_if_present() {
-        for f in "$@"; do
-            if [ -f "${f}" ]; then
-                echo "    uploading $(basename "${f}")..."
-                gh release upload "${TAG}" "${f}" --clobber
-                UPLOADED=$((UPLOADED + 1))
-            fi
-        done
-    }
-    case "${OS}" in
-        Linux)
-            upload_if_present src-tauri/target/release/bundle/deb/*.deb \
-                              src-tauri/target/release/bundle/rpm/*.rpm \
-                              "${OUTPUT_DIR}/ClusterCut_${VERSION}_x86_64.flatpak"
-            ;;
-        Darwin)
-            upload_if_present src-tauri/target/release/bundle/dmg/*.dmg
-            ;;
-        MINGW*|MSYS*|CYGWIN*)
-            upload_if_present src-tauri/target/release/bundle/nsis/*.exe
-            ;;
-    esac
-    if [ "${UPLOADED}" -eq 0 ]; then
-        echo "WARNING: no ${OS} artifacts found to upload."
-    fi
-
-    # 11. AUR (Linux only — needs the .deb to be on the release, which step 10 just
-    # did). Non-fatal: a missing AUR setup must not fail an otherwise good release.
-    if [ "${OS}" = "Linux" ]; then
-        echo "==> Publishing to the AUR..."
-        just aur-publish || echo "WARNING: AUR publish failed (see above). Fix it and run 'just aur-publish'."
-    fi
-
-    # 12. Summary
-    echo ""
+    echo
     echo "============================================"
-    echo " Release ${TAG} built successfully!"
+    echo " ClusterCut ${VERSION} is released"
     echo "============================================"
-    echo ""
-    echo "Artifacts in ${OUTPUT_DIR}:"
-    ls -1 "${OUTPUT_DIR}"/ClusterCut*${VERSION}* 2>/dev/null || echo "  (none found)"
-    echo ""
-    echo "Done!"
+    echo "GitHub:      ${URL}"
+    if [ "${AUR_OK}" = true ]; then
+        echo "AUR:         https://aur.archlinux.org/packages/clustercut-bin"
+    else
+        echo "AUR:         FAILED (see above). Once fixed: just aur-publish"
+    fi
+    echo "FriendlyHub: ${FRIENDLYHUB}/ (the four files for the update PR)"
+    if [ -n "${EGO_ZIP}" ]; then
+        echo "EGO:         ${EGO_ZIP} (upload at https://extensions.gnome.org/upload/)"
+    else
+        echo "EGO:         nothing to upload, the extension is unchanged since ${PREVIOUS}"
+    fi
+    [ "${AUR_OK}" = true ]
+
+# Run the release workflow on GitHub without publishing anything (it must be on main first)
+release-dry-run ref="main":
+    gh workflow run release.yml -R keithvassallomt/ClusterCut --ref {{ref}}
+    @echo "Started: https://github.com/keithvassallomt/ClusterCut/actions/workflows/release.yml"
 
 # Clean all build artifacts
 clean:
@@ -278,18 +315,35 @@ extension-zip:
     (cd gnome-extension && zip -r ../clustercut@keithvassallo.com.shell-extension.zip . -x "*.png" >/dev/null)
 
     # EGO now requires extensions pass shexli before publish. Cache the venv so
-    # we don't reinstall shexli on every zip build.
-    if [ ! -d .venv-shexli ]; then
+    # we don't reinstall shexli on every zip build, and rebuild it when it stops
+    # working (a Python upgrade breaks it). tree-sitter 0.26 crashes shexli 0.2.1.
+    install_shexli() { .venv-shexli/bin/pip install -q -U shexli 'tree-sitter<0.26'; }
+    if [ ! -d .venv-shexli ] || ! install_shexli 2>/dev/null; then
         echo "==> Creating shexli virtualenv..."
+        rm -rf .venv-shexli
         python3 -m venv .venv-shexli
+        install_shexli
     fi
-    . .venv-shexli/bin/activate
-    pip install -q -U shexli
 
     echo "==> Validating with shexli..."
-    if ! shexli clustercut@keithvassallo.com.shell-extension.zip; then
-        rm -f clustercut@keithvassallo.com.shell-extension.zip
-        echo "ERROR: shexli validation failed; zip removed."
+    ZIP=clustercut@keithvassallo.com.shell-extension.zip
+    REPORT=$(mktemp)
+    trap 'rm -f "${REPORT}"' EXIT
+    if ! .venv-shexli/bin/shexli --format json "${ZIP}" > "${REPORT}"; then
+        rm -f "${ZIP}"
+        echo "ERROR: shexli didn't run; zip removed."
+        exit 1
+    fi
+    .venv-shexli/bin/shexli "${ZIP}"
+    # shexli exits 0 whatever it finds, so the verdict comes from its report: any
+    # error fails the zip, except the false positives allowed here. Warnings and
+    # manual-review findings are for EGO's reviewers and don't.
+    #   EGO-M-004: shexli 0.2.1 takes any shell-version above 50 for a future
+    #   release, but GNOME 51 is out, and EGO accepted it for extension 4.1.
+    ERRORS=$(python3 -c 'import json, sys; findings = json.load(open(sys.argv[1]))["findings"]; print(" ".join(sorted({f["rule_id"] for f in findings if f["severity"] == "error"} - set(sys.argv[2:]))))' "${REPORT}" EGO-M-004)
+    if [ -n "${ERRORS}" ]; then
+        rm -f "${ZIP}"
+        echo "ERROR: shexli found errors (${ERRORS}); zip removed."
         exit 1
     fi
 
@@ -353,68 +407,6 @@ flatpak output_dir="~/Downloads":
 # Run the local Flatpak
 run-flatpak:
     flatpak run app.clustercut.clustercut
-
-# Prepare FriendlyHub submission: update manifest, regenerate sources, copy to submission dir
-friendlyhub-update submission_dir="/home/keith/LocalCode/keithvassallomt/app.clustercut.ClusterCut":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    VERSION=$(node -p "require('./package.json').version")
-    TAG="v${VERSION}"
-    echo "Preparing FriendlyHub submission for ${TAG}..."
-    # Verify the upstream tag exists
-    if ! git rev-parse "${TAG}" >/dev/null 2>&1; then
-        echo "ERROR: Tag ${TAG} does not exist. Tag and push the upstream release first."
-        exit 1
-    fi
-    echo "Tag ${TAG} found."
-    # Verify the release has a description in metainfo. The previous
-    # grep -A2 check was scoped to "any <description> within 2 lines", which
-    # silently inherited the next-older release's notes when the current
-    # entry was a self-closing <release ... /> — so missing notes slipped
-    # through unnoticed. xmllint scopes the check to the actual release node.
-    METAINFO="src-tauri/flatpak/app.clustercut.clustercut.metainfo.xml"
-    if ! command -v xmllint >/dev/null 2>&1; then
-        echo "ERROR: xmllint (libxml2) is required to verify release notes. Install libxml2 and re-run."
-        exit 1
-    fi
-    DESC_COUNT=$(xmllint --xpath "count(//release[@version=\"${VERSION}\"]/description)" "${METAINFO}" 2>/dev/null || echo 0)
-    if [ "${DESC_COUNT}" != "1" ]; then
-        echo "ERROR: Release ${VERSION} in ${METAINFO} has no <description>. Add release notes before updating."
-        exit 1
-    fi
-    # Create submission directory if needed
-    mkdir -p "{{submission_dir}}"
-    # Copy and update the yml with current tag and commit
-    YML="{{submission_dir}}/app.clustercut.clustercut.yml"
-    cp src-tauri/flatpak/app.clustercut.clustercut.yml "${YML}"
-    echo "Updating yml tag..."
-    sed -i "s/tag: v.*/tag: ${TAG}/" "${YML}"
-    # Update the template in-repo as well
-    sed -i "s/tag: v.*/tag: ${TAG}/" src-tauri/flatpak/app.clustercut.clustercut.yml
-    # Copy the metainfo manifest
-    echo "Copying metainfo manifest..."
-    cp "${METAINFO}" "{{submission_dir}}/"
-    # Generator scripts need aiohttp / PyYAML / tomlkit — install into a cached venv.
-    if [ ! -d .venv-flatpak ]; then
-        echo "Creating flatpak tooling virtualenv..."
-        python3 -m venv .venv-flatpak
-        .venv-flatpak/bin/pip install -q -U pip aiohttp PyYAML tomlkit
-    fi
-    PY=.venv-flatpak/bin/python3
-    # Generate sources into submission dir
-    echo "Generating Cargo sources..."
-    "${PY}" src-tauri/flatpak/builder-tools/cargo/flatpak-cargo-generator.py src-tauri/Cargo.lock -o "{{submission_dir}}/cargo-sources.json"
-    echo "Generating Node sources..."
-    export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/src-tauri/flatpak/builder-tools/node"
-    "${PY}" -m flatpak_node_generator npm package-lock.json -o "{{submission_dir}}/node-sources.json"
-    echo ""
-    echo "============================================"
-    echo " FriendlyHub submission prepared!"
-    echo "============================================"
-    echo ""
-    echo "Submission directory: {{submission_dir}}"
-    echo "Contents:"
-    ls -1 "{{submission_dir}}/"
 
 # ── AUR (clustercut-bin) ──────────────────────────────────────────────────────
 # Repackages the published amd64 .deb, so the release must already be tagged and
@@ -541,8 +533,7 @@ _aur-stage staging_dir:
     echo "==> Checking ${TAG} for ${DEB}..."
     if ! gh release view "${TAG}" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx "${DEB}"; then
         echo "ERROR: ${DEB} is not attached to release ${TAG}."
-        echo "       Run 'just release' and upload the artifacts first:"
-        echo "       gh release upload ${TAG} ~/Downloads/${DEB}"
+        echo "       The release workflow attaches it; check that ${TAG}'s run finished."
         exit 1
     fi
 

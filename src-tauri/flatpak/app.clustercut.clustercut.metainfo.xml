@@ -7,7 +7,7 @@
   <summary>Cross-platform Clipboard Sync</summary>
   <description>
     <p>
-      <strong>Please only use the Flatpak version if you're using GNOME. For all other desktops, please install a native release.</strong>
+      <em>Please only use the Flatpak version if you're using GNOME. For all other desktops, please install a native release.</em>
     </p>
     <p>
       ClusterCut is a seamless clipboard synchronization tool that works across Linux, macOS and Windows.

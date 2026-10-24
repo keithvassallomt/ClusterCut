@@ -119,7 +119,7 @@ just build          # Build native package (.exe/.dmg/.deb/.rpm)
 just flatpak        # Build and install a local Flatpak from working tree
 just run-flatpak    # Run the locally-installed Flatpak
 just extension-zip  # Build the GNOME extension ZIP
-just release        # Full release: version sync, tag, push, build everything
+just release        # Release: checks and tag; GitHub builds and publishes (see BUILD.md)
 just clean          # Clean all build artifacts
 ```
 
