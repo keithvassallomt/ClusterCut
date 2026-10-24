@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The deb, rpm, and AUR packages now install the same launcher and icon as the Flatpak: `app.clustercut.clustercut.desktop`, matching the app ID that desktop portals use to identify ClusterCut, listed under Utilities. The old `ClusterCut.desktop` remains as a hidden entry so launchers pinned before the change keep working.
 
 ### Fixed
+- On Windows, notifications whose title or text contains `&` or `<` now show. Windows refused the whole notification, so for example a received file named with an ampersand went unannounced.
 - With Auto-Receive off, accepting a large received image or text (Receive shortcut or the app's Apply button) now puts it on the clipboard. It was downloaded, then parked as pending again.
 - The Receive shortcut now applies rich text and records the item in History, as the app's Apply button does. With Auto-Send on, text received this way is no longer sent straight back to the cluster.
 - Switching Auto-Send or Auto-Receive off from the tray or the GNOME Quick Settings tile now turns the manual shortcut on straight away, and switching back turns it off. It used to wait for a restart or a settings change in the window, on every platform.

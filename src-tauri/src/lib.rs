@@ -54,6 +54,13 @@ pub(crate) fn get_hostname_internal() -> String {
 }
 
 // Helper to broadcast a new peer to all known peers (Gossip)
+/// Text for the Windows toast XML. A bare `&` or `<` makes Windows refuse the
+/// whole toast ("Copy & Send" did), so escape it.
+#[cfg(any(target_os = "windows", test))]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
 pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body: &str, increment_badge: bool, _id: Option<i32>, target_view: &str, _payload: NotificationPayload) {
     // 1. Windows (Native windows-rs with XML Actions)
     #[cfg(target_os = "windows")]
@@ -99,7 +106,7 @@ pub(crate) fn send_notification(app_handle: &tauri::AppHandle, title: &str, body
         {}
     </actions>
 </toast>
-"#, target_view, title, body, actions_xml);
+"#, target_view, xml_escape(title), xml_escape(body), actions_xml);
 
         if let Ok(doc) = XmlDocument::new() {
              match doc.LoadXml(&HSTRING::from(&xml)) {
@@ -920,4 +927,14 @@ pub enum NotificationPayload {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     app::run();
+}
+
+#[cfg(test)]
+mod xml_escape_tests {
+    #[test]
+    fn escapes_toast_text() {
+        assert_eq!(super::xml_escape("Copy & Send"), "Copy &amp; Send");
+        assert_eq!(super::xml_escape("a <b> \"c\""), "a &lt;b&gt; &quot;c&quot;");
+        assert_eq!(super::xml_escape("&amp;"), "&amp;amp;");
+    }
 }
