@@ -109,7 +109,7 @@ release output_dir="~/Downloads":
     done
     [ "$(git branch --show-current)" = main ] || die "release from main"
     [ -z "$(git status --porcelain)" ] || die "commit or stash your changes first"
-    git fetch -q --tags origin
+    git fetch -q --tags origin || die "fetching from origin failed; run 'git fetch --tags origin' to see why"
     git merge-base --is-ancestor origin/main HEAD || die "main is behind origin/main; pull first"
     SECRETS=$(gh secret list -R "${REPO}" --json name --jq '.[].name')
     for secret in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
