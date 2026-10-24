@@ -141,6 +141,13 @@ pub(super) fn press(keycode: u16, shift: bool) -> Result<(), KeysError> {
     while unsafe { CGEventSourceFlagsState(COMBINED_SESSION_STATE) } & held != 0 && Instant::now() < deadline {
         std::thread::sleep(RELEASE_POLL);
     }
+    // SAFETY: as above.
+    let still_held = unsafe { CGEventSourceFlagsState(COMBINED_SESSION_STATE) } & held;
+    if still_held != 0 {
+        let names = [(FLAG_COMMAND, "Cmd"), (FLAG_ALTERNATE, "Option"), (FLAG_CONTROL, "Ctrl"), (FLAG_SHIFT, "Shift")];
+        let held_names: Vec<&str> = names.iter().filter(|(flag, _)| still_held & flag != 0).map(|(_, name)| *name).collect();
+        tracing::warn!("Still held after {:?}: {}; pressing anyway", RELEASE_TIMEOUT, held_names.join("+"));
+    }
     let flags = FLAG_COMMAND | if shift { FLAG_SHIFT } else { 0 };
     // SAFETY: each created object is checked and released after posting.
     unsafe {
