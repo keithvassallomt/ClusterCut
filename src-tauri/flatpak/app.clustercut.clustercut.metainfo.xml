@@ -67,6 +67,20 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.5.0" date="2026-10-24">
+      <description>
+        <p>One-step shortcuts, shortcuts that work on Wayland, and control over your History.</p>
+        <ul>
+          <li>Copy &amp; Send (Ctrl+Alt+C) copies your selection and sends it to your other devices in one go. Cut &amp; Send (Ctrl+Alt+X) cuts it instead, and Receive &amp; Paste (Ctrl+Alt+V) pastes what you were sent. In a terminal, ClusterCut uses the terminal's own copy and paste keys. On GNOME, this needs version 4.2 of the ClusterCut extension.</li>
+          <li>The manual Send and Receive shortcuts now work on Wayland, through your desktop's shortcut settings on GNOME 48 and newer, KDE Plasma 5.27 and newer, and Hyprland. They move to Shift: Send Clipboard is now Ctrl+Alt+Shift+C and Receive Only is Ctrl+Alt+Shift+V.</li>
+          <li>Keep My Clipboard puts back what was on your clipboard before a one-step shortcut, so sending or receiving doesn't replace it.</li>
+          <li>Choose how long History is kept (from 15 minutes to a week, until ClusterCut quits, or not at all) and how many items it holds.</li>
+          <li>Sending manually now sends images, files and formatted text, not just plain text.</li>
+          <li>Clearing History, or deleting an item, now deletes the stored content too, not just the list entry.</li>
+          <li>The window's close button works again on Linux, and toggling sync from GNOME's Quick Settings no longer freezes ClusterCut.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.4" date="2026-09-24">
       <description>
         <p>Faster clipboard sync.</p>
