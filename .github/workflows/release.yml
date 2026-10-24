@@ -68,12 +68,16 @@ jobs:
           workspaces: src-tauri
       - run: npm ci
       - run: npm run tauri build -- --bundles deb,rpm
+      # One folder, or the artifact keeps deb/ and rpm/ and the release job
+      # finds neither at the top.
+      - name: Collect the packages
+        run: |
+          mkdir dist-linux
+          cp src-tauri/target/release/bundle/deb/*.deb src-tauri/target/release/bundle/rpm/*.rpm dist-linux/
       - uses: actions/upload-artifact@v7
         with:
           name: installer-linux
-          path: |
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
+          path: dist-linux/*
           if-no-files-found: error
 
   windows:
@@ -210,10 +214,10 @@ jobs:
           path: ClusterCut_${{ needs.version.outputs.version }}_x86_64.flatpak
           if-no-files-found: error
 
+  # Dry runs check the installers are all there, then stop short of publishing.
   release:
     name: GitHub release
     needs: [version, linux, windows, macos, flatpak]
-    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -240,6 +244,7 @@ jobs:
           done
       # gh uploads the assets to a draft and publishes it once they're all there.
       - name: Publish
+        if: github.ref_type == 'tag'
         run: |
           scripts/release-notes.sh "$VERSION" > release-notes.md
           gh release create "v$VERSION" --verify-tag --title "v$VERSION" --notes-file release-notes.md release-assets/*
