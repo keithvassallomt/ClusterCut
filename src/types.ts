@@ -88,8 +88,11 @@ export interface AppSettings {
   auto_send: boolean;
   auto_receive: boolean;
   notifications: NotificationSettings;
-  shortcut_send: string | null;
-  shortcut_receive: string | null;
+  shortcut_send: string | null; // Send Clipboard
+  shortcut_receive: string | null; // Receive Only
+  shortcut_copy_send: string | null;
+  shortcut_cut_send: string | null;
+  shortcut_receive_paste: string | null;
   enable_file_transfer: boolean;
   max_auto_download_size: number;
   notify_large_files: boolean;
@@ -118,8 +121,17 @@ export interface HyprlandShortcutStatus {
   config_lines: Record<string, string>; // shortcut ID -> line for the user's config
 }
 
+// How the one-step shortcuts press Copy/Cut/Paste. permission: false while the
+// desktop's permission is still to be given (KDE), null where none is needed.
+export interface KeyStatus {
+  backend: "hyprland" | "gnome" | "remote_desktop" | "none";
+  permission: boolean | null;
+  needs_extension_update: boolean; // GNOME: the extension is missing or older than 4.2
+}
+
 export interface ShortcutStatus {
   backend: "native" | "portal";
   portal?: PortalShortcutStatus | null;
   hyprland?: HyprlandShortcutStatus | null;
+  keys: KeyStatus;
 }

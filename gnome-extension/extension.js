@@ -1,10 +1,12 @@
 // ClusterCut GNOME Shell extension.
 // Bridges the Wayland clipboard to the ClusterCut app over D-Bus (St.Clipboard
 // read/write is required for Wayland — see EGO-A-005 manual review note).
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
@@ -88,8 +90,53 @@ const CLIPBOARD_DBUS_IFACE = `
       <arg type="s" name="text"/>
       <arg type="a(say)" name="formats"/>
     </signal>
+    <!-- v4.2: every CLIPBOARD owner change, including re-copies of the same
+         content and ClusterCut's own writes, which the signals above skip.
+         Sent after any of those for the same change. -->
+    <signal name="SelectionChanged"/>
   </interface>
 </node>`;
+
+// v4.2: presses Copy, Cut or Paste in the focused app for ClusterCut's
+// one-step shortcuts (Copy & Send, Cut & Send, Receive & Paste). Wayland gives
+// apps no way to press keys in other apps; the shell can, through a Clutter
+// virtual keyboard, like its on-screen keyboard. Deliberately narrow: only the
+// chords in PRESSABLE_CHORDS, only into the focused window, and only for the
+// process that owns ClusterCut's bus name.
+const KEYS_DBUS_IFACE = `
+<node>
+  <interface name="app.clustercut.clustercut.Keys">
+    <method name="FocusedApp">
+      <arg type="s" direction="out" name="app_id"/>
+    </method>
+    <method name="Press">
+      <arg type="s" direction="in" name="chord"/>
+      <arg type="b" direction="out" name="pressed"/>
+    </method>
+  </interface>
+</node>`;
+
+const CLUSTERCUT_BUS_NAME = 'app.clustercut.clustercut';
+
+// Chord name to keyvals, pressed in order and released in reverse. Shifted
+// chords use the uppercase letter: Mutter types the exact keyval it's given.
+const PRESSABLE_CHORDS = {
+    'ctrl+c': [Clutter.KEY_Control_L, Clutter.KEY_c],
+    'ctrl+x': [Clutter.KEY_Control_L, Clutter.KEY_x],
+    'ctrl+v': [Clutter.KEY_Control_L, Clutter.KEY_v],
+    'ctrl+shift+c': [Clutter.KEY_Control_L, Clutter.KEY_Shift_L, Clutter.KEY_C],
+    'ctrl+shift+v': [Clutter.KEY_Control_L, Clutter.KEY_Shift_L, Clutter.KEY_V],
+};
+
+// The shortcut that triggered a press is usually still held (Ctrl+Alt): wait
+// for the modifiers to go up, or a held Alt turns Ctrl+C into Ctrl+Alt+C.
+const HELD_MODIFIERS = Clutter.ModifierType.CONTROL_MASK
+    | Clutter.ModifierType.SHIFT_MASK
+    | Clutter.ModifierType.MOD1_MASK
+    | Clutter.ModifierType.SUPER_MASK
+    | Clutter.ModifierType.MOD4_MASK;
+const RELEASE_POLL_MS = 10;
+const RELEASE_TIMEOUT_MS = 1500;
 
 // Rich-text MIME types we relay alongside plain text. Same priority as the
 // wlroots backend — text/html before text/rtf. Apps usually offer both when
@@ -138,6 +185,7 @@ const IMAGE_MIME_PRIORITY = [
 ];
 
 let ClipboardBridgeIface = null;
+let KeysIface = null;
 
 const ClusterCutIndicator = GObject.registerClass(
 class ClusterCutIndicator extends QuickSettings.SystemIndicator {
@@ -321,6 +369,7 @@ class ClusterCutIndicator extends QuickSettings.SystemIndicator {
 export default class ClusterCutExtension extends Extension {
     enable() {
         ClipboardBridgeIface = Gio.DBusNodeInfo.new_for_xml(CLIPBOARD_DBUS_IFACE);
+        KeysIface = Gio.DBusNodeInfo.new_for_xml(KEYS_DBUS_IFACE);
 
         this._indicator = new ClusterCutIndicator(this);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
@@ -338,6 +387,7 @@ export default class ClusterCutExtension extends Extension {
         }
 
         ClipboardBridgeIface = null;
+        KeysIface = null;
     }
 
     _startClipboardBridge() {
@@ -356,6 +406,17 @@ export default class ClusterCutExtension extends Extension {
             ClipboardBridgeIface.interfaces[0],
             (connection, sender, objectPath, interfaceName, methodName, parameters, invocation) => {
                 this._handleClipboardMethod(methodName, parameters, invocation);
+            },
+            null,
+            null
+        );
+
+        this._releaseWaits = new Set();
+        this._keysDbusId = Gio.DBus.session.register_object(
+            '/org/gnome/Shell/Extensions/ClusterCut',
+            KeysIface.interfaces[0],
+            (connection, sender, objectPath, interfaceName, methodName, parameters, invocation) => {
+                this._handleKeysMethod(methodName, parameters, invocation);
             },
             null,
             null
@@ -381,6 +442,15 @@ export default class ClusterCutExtension extends Extension {
             Gio.DBus.session.unregister_object(this._clipboardDbusId);
             this._clipboardDbusId = null;
         }
+        if (this._keysDbusId) {
+            Gio.DBus.session.unregister_object(this._keysDbusId);
+            this._keysDbusId = null;
+        }
+        for (const id of this._releaseWaits ?? []) {
+            GLib.source_remove(id);
+        }
+        this._releaseWaits = null;
+        this._virtualKeyboard = null;
 
         this._lastClipboardText = null;
         this._lastFilesKey = null;
@@ -397,8 +467,21 @@ export default class ClusterCutExtension extends Extension {
         return GLib.get_monotonic_time() < this._ignoreUntil;
     }
 
+    _emitSelectionChanged() {
+        Gio.DBus.session.emit_signal(
+            null,
+            '/org/gnome/Shell/Extensions/ClusterCut',
+            'app.clustercut.clustercut.Clipboard2',
+            'SelectionChanged',
+            null
+        );
+    }
+
     _onClipboardOwnerChanged() {
+        // SelectionChanged follows whatever this change emits (or doesn't).
+        const done = () => this._emitSelectionChanged();
         if (this._shouldIgnore()) {
+            done();
             return;
         }
 
@@ -407,6 +490,7 @@ export default class ClusterCutExtension extends Extension {
         const clipboard = St.Clipboard.get_default();
         const mimetypes = clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD);
         if (!mimetypes || mimetypes.length === 0) {
+            done();
             return;
         }
 
@@ -414,7 +498,7 @@ export default class ClusterCutExtension extends Extension {
             || mimetypes.includes('x-special/gnome-copied-files');
 
         if (hasUris) {
-            this._readAndEmitFiles();
+            this._readAndEmitFiles(done);
             return;
         }
 
@@ -423,7 +507,7 @@ export default class ClusterCutExtension extends Extension {
         // existing "Copy a file" flow that does emit uri-list still wins above.
         const imageMime = IMAGE_MIME_PRIORITY.find(m => mimetypes.includes(m));
         if (imageMime) {
-            this._readAndEmitBlob(imageMime);
+            this._readAndEmitBlob(imageMime, done);
             return;
         }
 
@@ -439,7 +523,7 @@ export default class ClusterCutExtension extends Extension {
             if (offered) richMimes.push({ canonical: prefix, offered });
         }
         if (richMimes.length > 0) {
-            this._readAndEmitFormats(richMimes);
+            this._readAndEmitFormats(richMimes, done);
             return;
         }
 
@@ -449,51 +533,65 @@ export default class ClusterCutExtension extends Extension {
             || m === 'STRING');
 
         if (hasText) {
-            this._readAndEmitText();
+            this._readAndEmitText(done);
+        } else {
+            done();
         }
     }
 
-    _readAndEmitText() {
+    _readAndEmitText(done) {
         const clipboard = St.Clipboard.get_default();
         clipboard.get_text(St.ClipboardType.CLIPBOARD, (cb, text) => {
-            if (text && text !== this._lastClipboardText) {
-                this._lastClipboardText = text;
-                this._lastFilesKey = '';
+            try {
+                if (text && text !== this._lastClipboardText) {
+                    this._lastClipboardText = text;
+                    this._lastFilesKey = '';
 
-                Gio.DBus.session.emit_signal(
-                    null,
-                    '/org/gnome/Shell/Extensions/ClusterCut',
-                    'app.clustercut.clustercut.Clipboard2',
-                    'ClipboardChanged',
-                    new GLib.Variant('(s)', [text])
-                );
+                    Gio.DBus.session.emit_signal(
+                        null,
+                        '/org/gnome/Shell/Extensions/ClusterCut',
+                        'app.clustercut.clustercut.Clipboard2',
+                        'ClipboardChanged',
+                        new GLib.Variant('(s)', [text])
+                    );
+                }
+            } finally {
+                done();
             }
         });
     }
 
-    _readAndEmitFiles() {
+    _readAndEmitFiles(done) {
         const clipboard = St.Clipboard.get_default();
         clipboard.get_content(St.ClipboardType.CLIPBOARD, 'text/uri-list', (cb, bytes) => {
-            const uris = this._parseUriList(bytes);
-            if (uris.length === 0) {
-                return;
+            try {
+                this._emitFiles(bytes);
+            } finally {
+                done();
             }
-
-            const key = uris.join('\n');
-            if (key === this._lastFilesKey) {
-                return;
-            }
-            this._lastFilesKey = key;
-            this._lastClipboardText = '';
-
-            Gio.DBus.session.emit_signal(
-                null,
-                '/org/gnome/Shell/Extensions/ClusterCut',
-                'app.clustercut.clustercut.Clipboard2',
-                'FilesChanged',
-                new GLib.Variant('(as)', [uris])
-            );
         });
+    }
+
+    _emitFiles(bytes) {
+        const uris = this._parseUriList(bytes);
+        if (uris.length === 0) {
+            return;
+        }
+
+        const key = uris.join('\n');
+        if (key === this._lastFilesKey) {
+            return;
+        }
+        this._lastFilesKey = key;
+        this._lastClipboardText = '';
+
+        Gio.DBus.session.emit_signal(
+            null,
+            '/org/gnome/Shell/Extensions/ClusterCut',
+            'app.clustercut.clustercut.Clipboard2',
+            'FilesChanged',
+            new GLib.Variant('(as)', [uris])
+        );
     }
 
     // Stable, cheap fingerprint for a blob so we can dedup natural re-copies of
@@ -516,33 +614,41 @@ export default class ClusterCutExtension extends Extension {
         return sig;
     }
 
-    _readAndEmitBlob(mime) {
+    _readAndEmitBlob(mime, done) {
         const clipboard = St.Clipboard.get_default();
         clipboard.get_content(St.ClipboardType.CLIPBOARD, mime, (cb, bytes) => {
-            if (!bytes) {
-                return;
+            try {
+                this._emitBlob(mime, bytes);
+            } finally {
+                done();
             }
-            const data = bytes.get_data ? bytes.get_data() : bytes;
-            if (!data || data.length === 0) {
-                return;
-            }
-
-            const key = this._blobKey(mime, data);
-            if (key === this._lastBlobKey) {
-                return;
-            }
-            this._lastBlobKey = key;
-            this._lastClipboardText = '';
-            this._lastFilesKey = '';
-
-            Gio.DBus.session.emit_signal(
-                null,
-                '/org/gnome/Shell/Extensions/ClusterCut',
-                'app.clustercut.clustercut.Clipboard2',
-                'BlobChanged',
-                new GLib.Variant('(say)', [mime, data])
-            );
         });
+    }
+
+    _emitBlob(mime, bytes) {
+        if (!bytes) {
+            return;
+        }
+        const data = bytes.get_data ? bytes.get_data() : bytes;
+        if (!data || data.length === 0) {
+            return;
+        }
+
+        const key = this._blobKey(mime, data);
+        if (key === this._lastBlobKey) {
+            return;
+        }
+        this._lastBlobKey = key;
+        this._lastClipboardText = '';
+        this._lastFilesKey = '';
+
+        Gio.DBus.session.emit_signal(
+            null,
+            '/org/gnome/Shell/Extensions/ClusterCut',
+            'app.clustercut.clustercut.Clipboard2',
+            'BlobChanged',
+            new GLib.Variant('(say)', [mime, data])
+        );
     }
 
     // Stable fingerprint for a rich-text snapshot so we don't re-emit when the
@@ -566,7 +672,7 @@ export default class ClusterCutExtension extends Extension {
     // them as a single FormatsChanged signal so the Rust side sees a coherent
     // snapshot of one copy event. St.Clipboard.get_content is async per MIME,
     // so we chain callbacks; missing formats are silently skipped.
-    _readAndEmitFormats(richMimes) {
+    _readAndEmitFormats(richMimes, done) {
         const clipboard = St.Clipboard.get_default();
         const collected = [];
         let pending = richMimes.length;
@@ -575,26 +681,11 @@ export default class ClusterCutExtension extends Extension {
             // Plain text last so we have it in the same emission. If the
             // source didn't offer text/plain we send an empty string.
             clipboard.get_text(St.ClipboardType.CLIPBOARD, (cb, text) => {
-                const t = text || '';
-                if (collected.length === 0) {
-                    return;
+                try {
+                    this._emitFormats(text, collected);
+                } finally {
+                    done();
                 }
-                const key = this._formatsKey(t, collected);
-                if (key === this._lastFormatsKey) {
-                    return;
-                }
-                this._lastFormatsKey = key;
-                this._lastClipboardText = '';
-                this._lastFilesKey = '';
-                this._lastBlobKey = '';
-
-                Gio.DBus.session.emit_signal(
-                    null,
-                    '/org/gnome/Shell/Extensions/ClusterCut',
-                    'app.clustercut.clustercut.Clipboard2',
-                    'FormatsChanged',
-                    new GLib.Variant('(sa(say))', [t, collected])
-                );
             });
         };
 
@@ -620,6 +711,29 @@ export default class ClusterCutExtension extends Extension {
                 }
             });
         }
+    }
+
+    _emitFormats(text, collected) {
+        const t = text || '';
+        if (collected.length === 0) {
+            return;
+        }
+        const key = this._formatsKey(t, collected);
+        if (key === this._lastFormatsKey) {
+            return;
+        }
+        this._lastFormatsKey = key;
+        this._lastClipboardText = '';
+        this._lastFilesKey = '';
+        this._lastBlobKey = '';
+
+        Gio.DBus.session.emit_signal(
+            null,
+            '/org/gnome/Shell/Extensions/ClusterCut',
+            'app.clustercut.clustercut.Clipboard2',
+            'FormatsChanged',
+            new GLib.Variant('(sa(say))', [t, collected])
+        );
     }
 
     _parseUriList(bytes) {
@@ -730,6 +844,138 @@ export default class ClusterCutExtension extends Extension {
             const glibBytes = GLib.Bytes.new(data);
             clipboard.set_content(St.ClipboardType.CLIPBOARD, mime, glibBytes);
         }
+    }
+
+    _handleKeysMethod(methodName, parameters, invocation) {
+        // Anything on the session bus can call this; only ClusterCut may.
+        this._callerIsClusterCut(invocation.get_sender(), allowed => {
+            if (!allowed) {
+                invocation.return_dbus_error(
+                    'org.freedesktop.DBus.Error.AccessDenied',
+                    'Only ClusterCut may press keys through this interface'
+                );
+            } else if (methodName === 'FocusedApp') {
+                invocation.return_value(new GLib.Variant('(s)', [this._focusedAppId()]));
+            } else if (methodName === 'Press') {
+                const [chord] = parameters.deep_unpack();
+                const keyvals = PRESSABLE_CHORDS[chord];
+                if (!keyvals) {
+                    invocation.return_dbus_error(
+                        'org.freedesktop.DBus.Error.InvalidArgs',
+                        `Not a pressable chord: ${chord}`
+                    );
+                    return;
+                }
+                this._pressWhenReleased(keyvals, error => {
+                    if (error) {
+                        invocation.return_dbus_error(
+                            'org.freedesktop.DBus.Error.Failed',
+                            `Couldn't press keys: ${error.message}`
+                        );
+                    } else {
+                        invocation.return_value(new GLib.Variant('(b)', [true]));
+                    }
+                });
+            } else {
+                invocation.return_dbus_error(
+                    'org.freedesktop.DBus.Error.UnknownMethod',
+                    `Unknown method: ${methodName}`
+                );
+            }
+        });
+    }
+
+    // The caller must be the process that owns ClusterCut's bus name. Compared
+    // by PID: ClusterCut talks to the shell over more than one connection.
+    _callerIsClusterCut(sender, callback) {
+        this._busPid(CLUSTERCUT_BUS_NAME, ownerPid => {
+            if (ownerPid === null) {
+                // ClusterCut isn't running, so nobody may.
+                callback(false);
+                return;
+            }
+            this._busPid(sender, senderPid => callback(senderPid === ownerPid));
+        });
+    }
+
+    _busPid(name, callback) {
+        Gio.DBus.session.call(
+            'org.freedesktop.DBus',
+            '/org/freedesktop/DBus',
+            'org.freedesktop.DBus',
+            'GetConnectionUnixProcessID',
+            new GLib.Variant('(s)', [name]),
+            new GLib.VariantType('(u)'),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            null,
+            (connection, result) => {
+                let pid = null;
+                try {
+                    pid = connection.call_finish(result).deep_unpack()[0];
+                } catch (_e) {
+                    // Not on the bus.
+                }
+                callback(pid);
+            }
+        );
+    }
+
+    // The app ID without ".desktop" (org.gnome.Ptyxis), else the WM class
+    // (kitty), so ClusterCut can tell a terminal from other apps.
+    _focusedAppId() {
+        const window = global.display.get_focus_window();
+        if (!window) {
+            return '';
+        }
+        const id = Shell.WindowTracker.get_default().get_window_app(window)?.get_id();
+        if (id && !id.startsWith('window:')) {
+            return id.replace(/\.desktop$/, '');
+        }
+        return window.get_wm_class() || '';
+    }
+
+    _pressWhenReleased(keyvals, done) {
+        const held = () => {
+            const [, , mods] = global.get_pointer();
+            return (mods & HELD_MODIFIERS) !== 0;
+        };
+        const press = () => {
+            try {
+                if (!this._virtualKeyboard) {
+                    // Clutter.get_default_backend() is gone from newer shells.
+                    const backend = global.stage.context?.get_backend?.() ?? Clutter.get_default_backend();
+                    const seat = backend.get_default_seat();
+                    this._virtualKeyboard = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
+                }
+                for (const keyval of keyvals) {
+                    this._virtualKeyboard.notify_keyval(GLib.get_monotonic_time(), keyval, Clutter.KeyState.PRESSED);
+                }
+                for (const keyval of [...keyvals].reverse()) {
+                    this._virtualKeyboard.notify_keyval(GLib.get_monotonic_time(), keyval, Clutter.KeyState.RELEASED);
+                }
+            } catch (e) {
+                console.error(`ClusterCut: couldn't press keys: ${e}`);
+                done(e);
+                return;
+            }
+            done(null);
+        };
+        if (!held()) {
+            press();
+            return;
+        }
+        // Past the timeout, press anyway rather than leave ClusterCut waiting.
+        const deadline = GLib.get_monotonic_time() + RELEASE_TIMEOUT_MS * 1000;
+        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, RELEASE_POLL_MS, () => {
+            if (held() && GLib.get_monotonic_time() < deadline) {
+                return GLib.SOURCE_CONTINUE;
+            }
+            this._releaseWaits.delete(id);
+            press();
+            return GLib.SOURCE_REMOVE;
+        });
+        this._releaseWaits.add(id);
     }
 
     _handleClipboardMethod(methodName, parameters, invocation) {

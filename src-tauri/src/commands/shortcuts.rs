@@ -9,16 +9,20 @@ pub(crate) struct ShortcutStatus {
     portal: Option<crate::portal_shortcuts::PortalStatus>,
     #[cfg(target_os = "linux")]
     hyprland: Option<crate::hyprland::HyprlandStatus>,
+    /// How the one-step shortcuts press Copy/Cut/Paste here.
+    keys: crate::keys::KeyStatus,
 }
 
 #[tauri::command]
-pub(crate) async fn get_shortcut_status() -> ShortcutStatus {
+pub(crate) async fn get_shortcut_status(app_handle: tauri::AppHandle) -> ShortcutStatus {
+    let keys = crate::keys::status(&app_handle).await;
     #[cfg(target_os = "linux")]
     if crate::clipboard::is_wayland() {
         return ShortcutStatus {
             backend: "portal",
             portal: Some(crate::portal_shortcuts::status().await),
             hyprland: crate::hyprland::status(),
+            keys,
         };
     }
     ShortcutStatus {
@@ -27,7 +31,17 @@ pub(crate) async fn get_shortcut_status() -> ShortcutStatus {
         portal: None,
         #[cfg(target_os = "linux")]
         hyprland: None,
+        keys,
     }
+}
+
+/// Ask for the desktop's permission to press keys now (KDE), not on first use.
+#[tauri::command]
+pub(crate) async fn allow_key_presses(app_handle: tauri::AppHandle) -> Result<(), String> {
+    crate::keys::request_permission(&app_handle).await.map_err(|e| match e {
+        crate::keys::KeysError::Declined => "Not allowed. Try again whenever you like.".to_string(),
+        e => format!("Couldn't ask: {e}"),
+    })
 }
 
 /// Open the desktop's own shortcut settings for ClusterCut (Wayland portal v2+).

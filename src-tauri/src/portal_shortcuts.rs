@@ -1,11 +1,11 @@
 //! Global shortcuts on Wayland through the XDG GlobalShortcuts portal
 //! (`org.freedesktop.portal.GlobalShortcuts`). The Tauri global-shortcut
-//! plugin is X11-only, so on Wayland the manual Send/Receive shortcuts are
-//! bound here instead.
+//! plugin is X11-only, so on Wayland the manual shortcuts are bound here
+//! instead.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Condvar, Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 
 use futures::StreamExt;
 use tauri::{Emitter, Manager};
@@ -14,19 +14,10 @@ use zbus::message::Type as MessageType;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream};
 
+use crate::portal::{self, next_token, parent_window, session_path, PORTAL_NAME, PORTAL_PATH};
+use crate::shortcuts::ManualAction;
 use crate::state::AppState;
 
-/// App ID the portal identifies us by. Must match the installed
-/// `app.clustercut.clustercut.desktop`, or `Registry.Register` is refused.
-pub(crate) const APP_ID: &str = "app.clustercut.clustercut";
-
-/// Stable shortcut IDs: KDE and GNOME remember approvals per app ID + shortcut
-/// ID, and Hyprland binds reference them as `app.clustercut.clustercut:<id>`.
-pub(crate) const SEND_ID: &str = "manual-send";
-pub(crate) const RECEIVE_ID: &str = "manual-receive";
-
-const PORTAL_NAME: &str = "org.freedesktop.portal.Desktop";
-const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const GLOBAL_SHORTCUTS: &str = "org.freedesktop.portal.GlobalShortcuts";
 
 /// Where the portal binding stands, for the settings UI.
@@ -178,28 +169,9 @@ async fn start(app: &tauri::AppHandle) -> Result<(Session, PortalStatus), StartE
         return Err(StartError::Unavailable(zbus::Error::Failure("forced by CLUSTERCUT_FORCE_NO_PORTAL".into())));
     }
 
-    let conn = Connection::session().await?;
+    let conn = portal::connect_as_app().await?;
     let unique_name = conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
-
-    // Host apps tell the portal who they are; without this it guesses from the
-    // launching process (from a VS Code terminal we became com.microsoft.VSCode).
-    // Inside Flatpak the sandbox supplies the ID.
-    if !crate::clipboard::is_flatpak() {
-        let options: HashMap<&str, Value> = HashMap::new();
-        if let Err(e) = conn
-            .call_method(Some(PORTAL_NAME), PORTAL_PATH, Some("org.freedesktop.host.portal.Registry"), "Register", &(APP_ID, options))
-            .await
-        {
-            tracing::warn!("Portal Registry.Register failed, app ID will be guessed: {}", e);
-        }
-    }
-
-    let version: u32 = conn
-        .call_method(Some(PORTAL_NAME), PORTAL_PATH, Some("org.freedesktop.DBus.Properties"), "Get", &(GLOBAL_SHORTCUTS, "version"))
-        .await
-        .and_then(|reply| reply.body().deserialize::<OwnedValue>())
-        .and_then(|value| u32::try_from(value).map_err(zbus::Error::from))
-        .map_err(StartError::Unavailable)?;
+    let version = portal::version(&conn, GLOBAL_SHORTCUTS).await.map_err(StartError::Unavailable)?;
 
     let token = next_token();
     let session_token = format!("clustercut{}", next_token());
@@ -207,7 +179,7 @@ async fn start(app: &tauri::AppHandle) -> Result<(Session, PortalStatus), StartE
         ("handle_token", Value::from(token.as_str())),
         ("session_handle_token", Value::from(session_token.as_str())),
     ]);
-    let (code, mut results) = request(&conn, "CreateSession", &(options,), &token).await?;
+    let (code, mut results) = portal::request(&conn, GLOBAL_SHORTCUTS, "CreateSession", &(options,), &token).await?;
     if code != 0 {
         return Err(StartError::Failed(zbus::Error::Failure(format!("CreateSession response {code}"))));
     }
@@ -226,26 +198,26 @@ async fn start(app: &tauri::AppHandle) -> Result<(Session, PortalStatus), StartE
     ];
     let session = Session { conn, handle, listeners };
 
-    let (send_accel, receive_accel) = {
+    // All of them, whatever the auto modes: binding again later would mean a new
+    // session, and activations for an automatic direction are ignored.
+    let shortcuts: Vec<(&str, HashMap<&str, Value>)> = {
         let state = app.state::<AppState>();
         let settings = state.settings.lock().unwrap();
-        (settings.shortcut_send.clone(), settings.shortcut_receive.clone())
+        ManualAction::ALL
+            .into_iter()
+            .map(|action| {
+                let mut props = HashMap::from([("description", Value::from(action.description()))]);
+                if let Some(trigger) = action.accelerator(&settings).and_then(to_xdg_trigger) {
+                    props.insert("preferred_trigger", Value::from(trigger));
+                }
+                (action.id(), props)
+            })
+            .collect()
     };
-    let shortcut = |description: &'static str, accel: Option<String>| {
-        let mut props = HashMap::from([("description", Value::from(description))]);
-        if let Some(trigger) = accel.as_deref().and_then(to_xdg_trigger) {
-            props.insert("preferred_trigger", Value::from(trigger));
-        }
-        props
-    };
-    let shortcuts = vec![
-        (SEND_ID, shortcut("Send clipboard to cluster", send_accel)),
-        (RECEIVE_ID, shortcut("Apply received clipboard", receive_accel)),
-    ];
     let parent = parent_window(app).await;
     let token = next_token();
     let options = HashMap::from([("handle_token", Value::from(token.as_str()))]);
-    let (code, results) = request(&session.conn, "BindShortcuts", &(&session.handle, shortcuts, parent.as_str(), options), &token).await?;
+    let (code, results) = portal::request(&session.conn, GLOBAL_SHORTCUTS, "BindShortcuts", &(&session.handle, shortcuts, parent.as_str(), options), &token).await?;
     match code {
         0 => {
             let triggers = triggers_from(results);
@@ -264,119 +236,7 @@ async fn start(app: &tauri::AppHandle) -> Result<(Session, PortalStatus), StartE
 }
 
 async fn stop(session: Session) {
-    if let Err(e) = session
-        .conn
-        .call_method(Some(PORTAL_NAME), &session.handle, Some("org.freedesktop.portal.Session"), "Close", &())
-        .await
-    {
-        tracing::debug!("Closing global shortcuts session failed: {}", e);
-    }
-}
-
-/// The main window as an xdg-foreign handle ("wayland:<handle>") so the desktop
-/// can attach its shortcuts dialog to it. GNOME's dialog never names the app,
-/// so the parent window is its only context. Empty when the window is hidden or
-/// not a Wayland surface, or GDK doesn't answer within a second.
-async fn parent_window(app: &tauri::AppHandle) -> String {
-    let Some(window) = app.get_webview_window("main") else {
-        return String::new();
-    };
-    if !window.is_visible().unwrap_or(false) {
-        return String::new();
-    }
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let main = window.clone();
-    if window.run_on_main_thread(move || gdk_export::export(&main, tx)).is_err() {
-        return String::new();
-    }
-    match tokio::time::timeout(std::time::Duration::from_secs(1), rx).await {
-        Ok(Ok(handle)) => format!("wayland:{handle}"),
-        _ => String::new(),
-    }
-}
-
-/// GDK's xdg-foreign export (gdk/gdkwayland.h, GTK 3.22+). Never unexported:
-/// GTK reuses one export per window until the window goes, and unexporting
-/// right after `ConfigureShortcuts` would race the desktop importing it.
-mod gdk_export {
-    use std::ffi::{c_char, c_int, c_void, CStr};
-
-    use gtk::glib::translate::ToGlibPtr;
-    use gtk::prelude::*;
-    use tokio::sync::oneshot::Sender;
-
-    type Exported = unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void);
-
-    // libgdk-3 is already linked through gtk.
-    extern "C" {
-        fn gdk_wayland_window_export_handle(
-            window: *mut c_void,
-            callback: Exported,
-            user_data: *mut c_void,
-            destroy: Option<unsafe extern "C" fn(*mut c_void)>,
-        ) -> c_int;
-    }
-
-    unsafe extern "C" fn on_exported(_window: *mut c_void, handle: *const c_char, slot: *mut c_void) {
-        let slot = &mut *(slot as *mut Option<Sender<String>>);
-        if let (Some(tx), false) = (slot.take(), handle.is_null()) {
-            let _ = tx.send(CStr::from_ptr(handle).to_string_lossy().into_owned());
-        }
-    }
-
-    unsafe extern "C" fn free_slot(slot: *mut c_void) {
-        drop(Box::from_raw(slot as *mut Option<Sender<String>>));
-    }
-
-    /// Main thread only. Sends the handle once GDK has it; drops `tx` unsent if
-    /// the window can't be exported.
-    pub(super) fn export(window: &tauri::WebviewWindow, tx: Sender<String>) {
-        let Some(gdk_window) = window.gtk_window().ok().and_then(|w| w.window()) else {
-            return;
-        };
-        // An X11 window (GDK_BACKEND=x11) has no xdg-foreign handle.
-        if gdk_window.type_().name() != "GdkWaylandWindow" {
-            return;
-        }
-        let ptr: *mut gtk::gdk::ffi::GdkWindow = gdk_window.to_glib_none().0;
-        let slot = Box::into_raw(Box::new(Some(tx))) as *mut c_void;
-        // SAFETY: `ptr` is a live GdkWaylandWindow (checked above) and we're on
-        // the GTK main thread. GDK calls `on_exported` at most once and then
-        // `free_slot` exactly once, unless it returns FALSE, in which case it
-        // kept nothing and the slot is still ours to free.
-        let queued = unsafe { gdk_wayland_window_export_handle(ptr as *mut c_void, on_exported, slot, Some(free_slot)) };
-        if queued == 0 {
-            unsafe { free_slot(slot) };
-        }
-    }
-}
-
-fn next_token() -> String {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    format!("clustercut_{}", NEXT.fetch_add(1, Ordering::Relaxed))
-}
-
-/// Call a portal method that answers through a Request object and wait for
-/// its Response. Subscribes first, so a fast reply can't be missed.
-async fn request<B>(conn: &Connection, method: &str, body: &B, token: &str) -> zbus::Result<(u32, HashMap<String, OwnedValue>)>
-where
-    B: serde::Serialize + zbus::zvariant::DynamicType,
-{
-    let unique_name = conn.unique_name().map(|n| n.to_string()).unwrap_or_default();
-    let rule = MatchRule::builder()
-        .msg_type(MessageType::Signal)
-        .interface("org.freedesktop.portal.Request")?
-        .member("Response")?
-        .path(request_path(&unique_name, token))?
-        .build();
-    let mut responses = MessageStream::for_match_rule(rule, conn, Some(1)).await?;
-    conn.call_method(Some(PORTAL_NAME), PORTAL_PATH, Some(GLOBAL_SHORTCUTS), method, body).await?;
-    // No timeout: BindShortcuts can wait on the user for as long as the dialog is open.
-    let response = responses
-        .next()
-        .await
-        .ok_or_else(|| zbus::Error::Failure(format!("{method}: portal went away before responding")))??;
-    response.body().deserialize()
+    portal::close_session(&session.conn, &session.handle).await;
 }
 
 /// Shortcut ID to `trigger_description` from a Bind/ListShortcuts response.
@@ -411,30 +271,87 @@ async fn signal_stream(conn: &Connection, interface: &'static str, member: &'sta
     MessageStream::for_match_rule(rule, conn, None).await
 }
 
+/// Which of our shortcuts the portal reports held, from Activated/Deactivated.
+/// KDE gives no other way to tell when the user lets go of the keys, and
+/// `keys::remote_desktop` must wait for that before pressing any: a held Alt
+/// turns its Ctrl+C into Ctrl+Alt+C.
+struct Held {
+    ids: Vec<String>,
+    activations: u64,
+}
+
+static HELD: StdMutex<Held> = StdMutex::new(Held { ids: Vec::new(), activations: 0 });
+static HELD_CHANGED: Condvar = Condvar::new();
+
+fn note_shortcut(id: &str, activated: bool) {
+    let mut held = HELD.lock().unwrap();
+    held.ids.retain(|held_id| held_id != id);
+    if activated {
+        held.ids.push(id.to_string());
+        held.activations += 1;
+    }
+    HELD_CHANGED.notify_all();
+}
+
+/// How many times any of our shortcuts has fired.
+pub(crate) fn activation_count() -> u64 {
+    HELD.lock().unwrap().activations
+}
+
+/// Wait until none of our shortcuts is held. False on timeout.
+pub(crate) fn wait_until_released(timeout: Duration) -> bool {
+    let held = HELD.lock().unwrap();
+    let (held, _) = HELD_CHANGED.wait_timeout_while(held, timeout, |held| !held.ids.is_empty()).unwrap();
+    held.ids.is_empty()
+}
+
+/// Whether one of our shortcuts fires after activation `since`, within `timeout`.
+pub(crate) fn wait_for_activation_after(since: u64, timeout: Duration) -> bool {
+    let held = HELD.lock().unwrap();
+    let (held, _) = HELD_CHANGED.wait_timeout_while(held, timeout, |held| held.activations <= since).unwrap();
+    held.activations > since
+}
+
 async fn spawn_activation_listener(
     app: &tauri::AppHandle,
     conn: &Connection,
     handle: &OwnedObjectPath,
 ) -> zbus::Result<tauri::async_runtime::JoinHandle<()>> {
-    let mut activations = signal_stream(conn, GLOBAL_SHORTCUTS, "Activated", PORTAL_PATH).await?;
+    let activations = signal_stream(conn, GLOBAL_SHORTCUTS, "Activated", PORTAL_PATH).await?;
+    let deactivations = signal_stream(conn, GLOBAL_SHORTCUTS, "Deactivated", PORTAL_PATH).await?;
+    let mut signals = futures::stream::select(activations, deactivations);
     let (app, handle) = (app.clone(), handle.clone());
     Ok(tauri::async_runtime::spawn(async move {
-        while let Some(Ok(msg)) = activations.next().await {
-            type Activated = (OwnedObjectPath, String, u64, HashMap<String, OwnedValue>);
-            let Ok((session, id, _timestamp, _options)) = msg.body().deserialize::<Activated>() else {
+        while let Some(Ok(msg)) = signals.next().await {
+            // Both carry (session, shortcut ID, timestamp, options).
+            type Signal = (OwnedObjectPath, String, u64, HashMap<String, OwnedValue>);
+            let Ok((session, id, _timestamp, _options)) = msg.body().deserialize::<Signal>() else {
                 continue;
             };
             if session != handle {
                 continue;
             }
+            let activated = msg.header().member().is_some_and(|member| member.as_str() == "Activated");
+            note_shortcut(&id, activated);
+            if !activated {
+                continue;
+            }
+            let Some(action) = ManualAction::from_id(&id) else {
+                continue;
+            };
+            let manual = {
+                let state = app.state::<AppState>();
+                let settings = state.settings.lock().unwrap();
+                action.is_manual(&settings)
+            };
+            if !manual {
+                tracing::info!("Portal shortcut {} ignored: that direction is automatic", id);
+                continue;
+            }
             tracing::info!("Portal shortcut activated: {}", id);
             let app = app.clone();
-            // Off the executor: the GNOME clipboard bridge is a blocking D-Bus call.
-            match id.as_str() {
-                SEND_ID => drop(tauri::async_runtime::spawn_blocking(move || crate::shortcuts::manual_send(&app))),
-                RECEIVE_ID => drop(tauri::async_runtime::spawn_blocking(move || crate::shortcuts::manual_receive(&app))),
-                _ => {}
-            }
+            // Off the executor: the actions wait on the clipboard and the desktop.
+            drop(tauri::async_runtime::spawn_blocking(move || action.run(&app)));
         }
     }))
 }
@@ -577,23 +494,6 @@ fn keysym_name(key: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// The sender element of portal object paths: the unique bus name without
-/// its leading `:` and with `.` replaced by `_` (`:1.42` becomes `1_42`).
-fn sender_element(unique_name: &str) -> String {
-    unique_name.trim_start_matches(':').replace('.', "_")
-}
-
-/// Object path the portal will use for the Request created with `token`.
-/// Known in advance so the Response signal can be subscribed before calling.
-pub(crate) fn request_path(unique_name: &str, token: &str) -> String {
-    format!("/org/freedesktop/portal/desktop/request/{}/{}", sender_element(unique_name), token)
-}
-
-/// Object path of the Session created with `session_handle_token`.
-pub(crate) fn session_path(unique_name: &str, token: &str) -> String {
-    format!("/org/freedesktop/portal/desktop/session/{}/{}", sender_element(unique_name), token)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,11 +526,5 @@ mod tests {
         assert_eq!(to_xdg_trigger("Control+Alt"), None);
         assert_eq!(to_xdg_trigger("Control+A+B"), None);
         assert_eq!(to_xdg_trigger(""), None);
-    }
-
-    #[test]
-    fn builds_portal_paths() {
-        assert_eq!(request_path(":1.27312", "cc_1"), "/org/freedesktop/portal/desktop/request/1_27312/cc_1");
-        assert_eq!(session_path(":1.93", "ccsession"), "/org/freedesktop/portal/desktop/session/1_93/ccsession");
     }
 }

@@ -667,6 +667,9 @@ pub fn process_clipboard_change_with(
             // back case there instead.
             if text.trim().is_empty() {
                 tracing::debug!("Skipping broadcast — whitespace-only text");
+                // The kept copy is no longer what's on the clipboard; Copy &
+                // Send of a selected space mustn't send it.
+                *PENDING_MANUAL_SEND.lock().unwrap() = None;
                 return;
             }
 
@@ -1252,6 +1255,20 @@ pub fn broadcast_clipboard(
             }
         });
     }
+}
+
+/// Put a received payload (not a descriptor) on the OS clipboard, as
+/// Auto-Receive would, and record it in History. Shared by the manual receive
+/// paths: the shortcuts, D-Bus and the app's Apply button.
+pub fn apply_received(app: &AppHandle, state: &AppState, payload: &ClipboardPayload) {
+    if let Some(blob) = payload.blob.clone() {
+        crate::clipboard::set_clipboard_image(app, blob);
+    } else if let Some(formats) = payload.formats.as_ref().filter(|fs| !fs.is_empty()).cloned() {
+        crate::clipboard::set_clipboard_rich(app, payload.text.clone(), formats);
+    } else {
+        crate::clipboard::set_clipboard(app, payload.text.clone());
+    }
+    record_and_emit(app, state, "clipboard-change", payload);
 }
 
 /// Set clipboard text, with feedback loop prevention.

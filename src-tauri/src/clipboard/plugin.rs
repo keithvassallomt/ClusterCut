@@ -587,11 +587,6 @@ pub fn read_text(app: &AppHandle) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Write clipboard text directly (for manual receive shortcut).
-pub fn write_text_direct(app: &AppHandle, text: String) -> Result<(), String> {
-    write_text(app, text)
-}
-
 pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transport) {
     let app_handle_worker = app_handle.clone();
 
@@ -725,11 +720,17 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 tracing::info!("Clipboard monitor received shutdown signal, exiting.");
                 break;
             }
+            let mut seen = change_events::change_count();
 
             if let Some(current) = rich::clipboard_change_count() {
                 if Some(current) == last_change_count {
+                    change_events::mark_processed(seen);
                     change_events::wait_for_change(&wake_rx, POLL_INTERVAL);
                     continue;
+                }
+                // macOS has no change listener; the changeCount is its event.
+                if last_change_count.is_some() {
+                    seen = change_events::note_change();
                 }
                 last_change_count = Some(current);
             }
@@ -779,6 +780,7 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 common::EchoVerdict::NoChange => {}
             }
 
+            change_events::mark_processed(seen);
             change_events::wait_for_change(&wake_rx, POLL_INTERVAL);
         }
     });

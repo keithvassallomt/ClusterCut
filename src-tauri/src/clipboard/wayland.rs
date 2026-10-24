@@ -463,10 +463,6 @@ pub fn read_text(_app: &AppHandle) -> Result<String, String> {
     read_clipboard_text().ok_or_else(|| "No text in clipboard".to_string())
 }
 
-pub fn write_text_direct(app: &AppHandle, text: String) -> Result<(), String> {
-    write_text(app, text)
-}
-
 /// Pick a single representative MIME to prefix-probe for change-detection,
 /// following `read_clipboard`'s priority (files → image → rich → text) so the
 /// probed representation is the one the monitor would actually act on.
@@ -561,6 +557,7 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 tracing::info!("Wayland clipboard monitor shutting down.");
                 break;
             }
+            let seen = change_events::change_count();
 
             // Cheap change-probe first. Without this the loop re-reads the whole
             // clipboard every 500 ms; for a large selection (e.g. 100 MB+ of
@@ -569,6 +566,7 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
             // fingerprint actually changes.
             let fp = clipboard_fingerprint();
             if fp == last_fp {
+                change_events::mark_processed(seen);
                 change_events::wait_for_change(&wake_rx, POLL_INTERVAL);
                 continue;
             }
@@ -592,6 +590,7 @@ pub fn start_monitor(app_handle: AppHandle, state: AppState, transport: Transpor
                 common::EchoVerdict::NoChange => {}
             }
 
+            change_events::mark_processed(seen);
             change_events::wait_for_change(&wake_rx, POLL_INTERVAL);
         }
     });

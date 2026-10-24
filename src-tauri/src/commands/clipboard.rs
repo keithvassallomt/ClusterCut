@@ -190,22 +190,7 @@ pub(crate) async fn confirm_pending_clipboard(
             }
         }
 
-        if let Some(blob) = payload.blob.clone() {
-            crate::clipboard::set_clipboard_image(&app_handle, blob);
-        } else if let Some(formats) = payload
-            .formats
-            .as_ref()
-            .filter(|fs| !fs.is_empty())
-            .cloned()
-        {
-            crate::clipboard::set_clipboard_rich(&app_handle, payload.text.clone(), formats);
-        } else {
-            crate::clipboard::set_clipboard(&app_handle, payload.text.clone());
-        }
-
-        // Emit change event so history updates
-        crate::clipboard::common::record_and_emit(&app_handle, &state, "clipboard-change", &payload);
-
+        crate::clipboard::common::apply_received(&app_handle, &state, &payload);
         Ok(())
     } else {
         Err("No pending clipboard content".to_string())

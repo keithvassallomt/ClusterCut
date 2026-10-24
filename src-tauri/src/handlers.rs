@@ -200,10 +200,10 @@ async fn handle_incoming_clipboard_blob_stream(
         return;
     }
 
-    let (auto_recv, notifications) = {
-        let s = state.settings.lock().unwrap();
-        (s.auto_receive, s.notifications.clone())
-    };
+    // Every fetch is one someone asked to land: Auto-Receive under its size
+    // limit, or the user accepting it (app button, Receive shortcuts). Manual
+    // mode used to stash it as pending again, so it never reached the clipboard.
+    let notifications = state.settings.lock().unwrap().notifications.clone();
     let byte_len = accum.len();
     let mb = byte_len as f64 / (1024.0 * 1024.0);
 
@@ -261,12 +261,7 @@ async fn handle_incoming_clipboard_blob_stream(
                 sender_id: String::new(),
             }
         };
-        if auto_recv {
-            crate::clipboard::set_clipboard(&app, text);
-        } else {
-            let mut pending = state.pending_clipboard.lock().unwrap();
-            *pending = Some(payload_event.clone());
-        }
+        crate::clipboard::set_clipboard(&app, text);
         crate::clipboard::common::record_and_emit(&app, &state, "clipboard-change", &payload_event);
         if notifications.data_received {
             send_notification(
@@ -320,12 +315,7 @@ async fn handle_incoming_clipboard_blob_stream(
                 sender_id: String::new(),
             }
         };
-        if auto_recv {
-            crate::clipboard::set_clipboard_image(&app, blob);
-        } else {
-            let mut pending = state.pending_clipboard.lock().unwrap();
-            *pending = Some(payload_event.clone());
-        }
+        crate::clipboard::set_clipboard_image(&app, blob);
         crate::clipboard::common::record_and_emit(&app, &state, "clipboard-change", &payload_event);
         if notifications.data_received {
             send_notification(

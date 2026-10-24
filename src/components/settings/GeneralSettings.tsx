@@ -4,13 +4,33 @@ import { listen } from "@tauri-apps/api/event";
 import { version } from "../../../package.json";
 import clsx from "clsx";
 import { Settings, Monitor, Wifi } from "lucide-react";
-import { SectionHeader, Card } from "../ui";
+import { SectionHeader, Card, Button } from "../ui";
 import { GlobalShortcutField } from "./GlobalShortcutField";
 import type { AppSettings, ShortcutStatus } from "../../types";
 
 // The firewall toggle only has an effect on Windows, where
 // configure_windows_firewall() exists. Match ShortcutRecorder's userAgent check.
 const isWindows = navigator.userAgent.toLowerCase().includes("win");
+
+// The manual shortcuts per direction. `id` is the backend's ManualAction ID.
+type ShortcutDef = {
+  id: string;
+  dbusMethod: string;
+  field: "shortcut_copy_send" | "shortcut_cut_send" | "shortcut_send" | "shortcut_receive_paste" | "shortcut_receive";
+  label: string;
+  hint: string;
+};
+
+const SEND_SHORTCUTS: ShortcutDef[] = [
+  { id: "copy-send", dbusMethod: "CopySend", field: "shortcut_copy_send", label: "Copy & Send", hint: "Copies the selection in the focused app and sends it." },
+  { id: "cut-send", dbusMethod: "CutSend", field: "shortcut_cut_send", label: "Cut & Send", hint: "Cuts the selection in the focused app and sends it." },
+  { id: "send-clipboard", dbusMethod: "ManualSend", field: "shortcut_send", label: "Send Clipboard", hint: "Sends what's already on the clipboard." },
+];
+
+const RECEIVE_SHORTCUTS: ShortcutDef[] = [
+  { id: "receive-paste", dbusMethod: "ReceivePaste", field: "shortcut_receive_paste", label: "Receive & Paste", hint: "Applies the received content and pastes it into the focused app." },
+  { id: "receive-only", dbusMethod: "ManualReceive", field: "shortcut_receive", label: "Receive Only", hint: "Puts the received content on the clipboard without pasting." },
+];
 
 export function GeneralSettings({
   settings,
@@ -31,10 +51,41 @@ export function GeneralSettings({
     const unlisten = listen("shortcut-status-changed", refresh);
     return () => { unlisten.then(f => f()); };
   }, []);
+  // KDE asks once before ClusterCut may press keys; offer to get that out of the way.
+  const showKeyPermission =
+    shortcutStatus?.keys.permission === false && (!settings.auto_send || !settings.auto_receive);
+  const [keyPermissionError, setKeyPermissionError] = useState<string | null>(null);
+  const allowKeyPresses = () => {
+    setKeyPermissionError(null);
+    invoke("allow_key_presses").catch((e) => setKeyPermissionError(String(e)));
+  };
+
   const showHyprlandToggle =
     !!shortcutStatus?.hyprland &&
     shortcutStatus.portal?.state === "bound" &&
     (!settings.auto_send || !settings.auto_receive);
+
+  const shortcutGroup = (title: string, shortcuts: ShortcutDef[]) => (
+    <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-white/10 dark:bg-white/5">
+      <div className="flex flex-col gap-4">
+        <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">{title}</div>
+        {shortcuts.map((s) => (
+          <div key={s.id} className="flex flex-col gap-2">
+            <div className="text-xs font-medium text-zinc-700 dark:text-zinc-300">{s.label}</div>
+            <GlobalShortcutField
+              shortcutId={s.id}
+              dbusMethod={s.dbusMethod}
+              value={settings[s.field]}
+              onChange={(val) => setSettings({ ...settings, [s.field]: val })}
+              status={shortcutStatus}
+              hyprlandBindKeys={settings.hyprland_bind_keys}
+            />
+            <div className="text-[10px] text-zinc-500">{s.hint}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 
   return (
     <div className="flex flex-col gap-4">
@@ -124,24 +175,7 @@ export function GeneralSettings({
             </button>
           </div>
 
-          {!settings.auto_send && (
-            <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-white/10 dark:bg-white/5">
-              <div className="flex flex-col gap-2">
-                <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">Global Shortcut (Send)</div>
-                <GlobalShortcutField
-                  shortcutId="manual-send"
-                  dbusMethod="ManualSend"
-                  value={settings.shortcut_send}
-                  onChange={(val) => setSettings({ ...settings, shortcut_send: val })}
-                  status={shortcutStatus}
-                  hyprlandBindKeys={settings.hyprland_bind_keys}
-                />
-                <div className="text-[10px] text-zinc-500">
-                  Keyboard shortcut to manually broadcast clipboard.
-                </div>
-              </div>
-            </div>
-          )}
+          {!settings.auto_send && shortcutGroup("Global Shortcuts (Send)", SEND_SHORTCUTS)}
 
           <div className="h-px bg-zinc-900/5 dark:bg-white/5" />
 
@@ -158,23 +192,22 @@ export function GeneralSettings({
             </button>
           </div>
 
-          {!settings.auto_receive && (
-            <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-white/10 dark:bg-white/5">
-              <div className="flex flex-col gap-2">
-                <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">Global Shortcut (Receive)</div>
-                <GlobalShortcutField
-                  shortcutId="manual-receive"
-                  dbusMethod="ManualReceive"
-                  value={settings.shortcut_receive}
-                  onChange={(val) => setSettings({ ...settings, shortcut_receive: val })}
-                  status={shortcutStatus}
-                  hyprlandBindKeys={settings.hyprland_bind_keys}
-                />
-                <div className="text-[10px] text-zinc-500">
-                  Keyboard shortcut to apply pending clipboard data.
+          {!settings.auto_receive && shortcutGroup("Global Shortcuts (Receive)", RECEIVE_SHORTCUTS)}
+
+          {showKeyPermission && (
+            <>
+              <div className="h-px bg-zinc-900/5 dark:bg-white/5" />
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">Allow Key Presses</div>
+                  <div className="text-xs text-zinc-500">
+                    Copy & Send, Cut & Send and Receive & Paste press keys for you, which your desktop asks you to allow once. Allow it now, or when you first use one.
+                  </div>
+                  {keyPermissionError && <div className="mt-1 text-[10px] text-amber-600 dark:text-amber-400">{keyPermissionError}</div>}
                 </div>
+                <Button size="sm" onClick={allowKeyPresses}>Allow</Button>
               </div>
-            </div>
+            </>
           )}
 
           {showHyprlandToggle && (

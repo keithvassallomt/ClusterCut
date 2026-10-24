@@ -520,8 +520,27 @@ pub struct AppSettings {
     pub auto_send: bool,
     pub auto_receive: bool,
     pub notifications: NotificationSettings,
+    /// Send Clipboard: sends what's already on the clipboard.
     pub shortcut_send: Option<String>,
+    /// Receive Only: applies the pending content without pasting.
     pub shortcut_receive: Option<String>,
+    /// Copy & Send: presses Copy in the focused app, then sends (issue #21).
+    #[serde(default)]
+    pub shortcut_copy_send: Option<String>,
+    /// Cut & Send: presses Cut in the focused app, then sends.
+    #[serde(default)]
+    pub shortcut_cut_send: Option<String>,
+    /// Receive & Paste: applies the pending content, then presses Paste.
+    #[serde(default)]
+    pub shortcut_receive_paste: Option<String>,
+    /// Bumped by `migrate_shortcuts`; 0 for settings written before issue #21.
+    #[serde(default)]
+    pub shortcuts_version: u32,
+    /// RemoteDesktop portal restore token (KDE): skips the desktop's permission
+    /// dialog when the one-step shortcuts press keys. Single use; replaced after
+    /// every session. Backend-owned.
+    #[serde(default)]
+    pub remote_desktop_token: Option<String>,
     pub enable_file_transfer: bool,
     pub max_auto_download_size: u64, // In bytes
     pub notify_large_files: bool,
@@ -574,6 +593,53 @@ fn default_history_store_max_bytes() -> u64 {
     200 * 1024 * 1024
 }
 
+const DEFAULT_COPY_SEND: &str = "CommandOrControl+Alt+C";
+const DEFAULT_CUT_SEND: &str = "CommandOrControl+Alt+X";
+const DEFAULT_SEND_CLIPBOARD: &str = "CommandOrControl+Alt+Shift+C";
+const DEFAULT_RECEIVE_PASTE: &str = "CommandOrControl+Alt+V";
+const DEFAULT_RECEIVE_ONLY: &str = "CommandOrControl+Alt+Shift+V";
+const SHORTCUTS_VERSION: u32 = 1;
+
+/// Same keys, whatever the order or case ("Alt+CommandOrControl+c").
+fn same_accelerator(a: &str, b: &str) -> bool {
+    let parts = |s: &str| {
+        let mut parts: Vec<String> = s.split('+').map(|p| p.trim().to_ascii_lowercase()).collect();
+        parts.sort();
+        parts
+    };
+    parts(a) == parts(b)
+}
+
+/// Issue #21 moved the old Send/Receive defaults (Ctrl+Alt+C/V) to the new
+/// Copy & Send and Receive & Paste. Settings still on those defaults move
+/// Send Clipboard and Receive Only to +Shift; customised keys keep their
+/// meaning, and a new default that would collide with one stays unset.
+/// Returns whether anything changed.
+fn migrate_shortcuts(s: &mut AppSettings) -> bool {
+    if s.shortcuts_version >= SHORTCUTS_VERSION {
+        return false;
+    }
+    let is = |stored: &Option<String>, default: &str| stored.as_deref().is_some_and(|k| same_accelerator(k, default));
+    if is(&s.shortcut_send, DEFAULT_COPY_SEND) {
+        s.shortcut_send = Some(DEFAULT_SEND_CLIPBOARD.to_string());
+    }
+    if is(&s.shortcut_receive, DEFAULT_RECEIVE_PASTE) {
+        s.shortcut_receive = Some(DEFAULT_RECEIVE_ONLY.to_string());
+    }
+    let taken = [s.shortcut_send.clone(), s.shortcut_receive.clone()];
+    for (field, default) in [
+        (&mut s.shortcut_copy_send, DEFAULT_COPY_SEND),
+        (&mut s.shortcut_cut_send, DEFAULT_CUT_SEND),
+        (&mut s.shortcut_receive_paste, DEFAULT_RECEIVE_PASTE),
+    ] {
+        if field.is_none() && !taken.iter().any(|t| is(t, default)) {
+            *field = Some(default.to_string());
+        }
+    }
+    s.shortcuts_version = SHORTCUTS_VERSION;
+    true
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -582,8 +648,13 @@ impl Default for AppSettings {
             auto_send: true,
             auto_receive: true,
             notifications: NotificationSettings::default(),
-            shortcut_send: Some("CommandOrControl+Alt+C".to_string()),
-            shortcut_receive: Some("CommandOrControl+Alt+V".to_string()),
+            shortcut_send: Some(DEFAULT_SEND_CLIPBOARD.to_string()),
+            shortcut_receive: Some(DEFAULT_RECEIVE_ONLY.to_string()),
+            shortcut_copy_send: Some(DEFAULT_COPY_SEND.to_string()),
+            shortcut_cut_send: Some(DEFAULT_CUT_SEND.to_string()),
+            shortcut_receive_paste: Some(DEFAULT_RECEIVE_PASTE.to_string()),
+            shortcuts_version: SHORTCUTS_VERSION,
+            remote_desktop_token: None,
             enable_file_transfer: true,
             max_auto_download_size: 50 * 1024 * 1024, // 50 MB
             notify_large_files: true,
@@ -611,10 +682,23 @@ pub fn load_settings(app: &AppHandle) -> AppSettings {
         return AppSettings::default();
     }
 
-    match fs::read_to_string(&path) {
+    let mut settings: AppSettings = match fs::read_to_string(&path) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => AppSettings::default(),
+        Err(_) => return AppSettings::default(),
+    };
+    // Saved straight away, so a key later set back to an old default isn't moved again.
+    if migrate_shortcuts(&mut settings) {
+        tracing::info!(
+            "Migrated shortcuts for issue #21: send={:?} receive={:?} copy_send={:?} cut_send={:?} receive_paste={:?}",
+            settings.shortcut_send,
+            settings.shortcut_receive,
+            settings.shortcut_copy_send,
+            settings.shortcut_cut_send,
+            settings.shortcut_receive_paste
+        );
+        save_settings(app, &settings);
     }
+    settings
 }
 
 pub fn save_settings(app: &AppHandle, settings: &AppSettings) {
@@ -699,6 +783,68 @@ mod settings_tests {
         let s = AppSettings::default();
         assert!(s.configure_firewall);
         assert!(s.mdns_advertising);
+    }
+
+    /// Settings as written before issue #21, with the given Send/Receive keys.
+    fn v0(send: Option<&str>, receive: Option<&str>) -> AppSettings {
+        let mut s = AppSettings::default();
+        s.shortcut_send = send.map(str::to_string);
+        s.shortcut_receive = receive.map(str::to_string);
+        s.shortcut_copy_send = None;
+        s.shortcut_cut_send = None;
+        s.shortcut_receive_paste = None;
+        s.shortcuts_version = 0;
+        s
+    }
+
+    fn keys(s: &AppSettings) -> [Option<&str>; 5] {
+        [
+            s.shortcut_copy_send.as_deref(),
+            s.shortcut_cut_send.as_deref(),
+            s.shortcut_send.as_deref(),
+            s.shortcut_receive_paste.as_deref(),
+            s.shortcut_receive.as_deref(),
+        ]
+    }
+
+    #[test]
+    fn migrates_old_defaults_to_the_new_layout() {
+        let mut s = v0(Some("CommandOrControl+Alt+C"), Some("CommandOrControl+Alt+V"));
+        assert!(super::migrate_shortcuts(&mut s));
+        assert_eq!(keys(&s), keys(&AppSettings::default()));
+        assert!(!super::migrate_shortcuts(&mut s), "migrates once");
+    }
+
+    #[test]
+    fn migration_keeps_customised_keys() {
+        let mut s = v0(Some("Super+S"), Some("Super+R"));
+        super::migrate_shortcuts(&mut s);
+        assert_eq!(s.shortcut_send.as_deref(), Some("Super+S"));
+        assert_eq!(s.shortcut_receive.as_deref(), Some("Super+R"));
+        assert_eq!(s.shortcut_copy_send.as_deref(), Some("CommandOrControl+Alt+C"));
+        assert_eq!(s.shortcut_receive_paste.as_deref(), Some("CommandOrControl+Alt+V"));
+    }
+
+    #[test]
+    fn migration_leaves_colliding_defaults_unset() {
+        let mut s = v0(Some("Alt+CommandOrControl+x"), None);
+        super::migrate_shortcuts(&mut s);
+        assert_eq!(s.shortcut_send.as_deref(), Some("Alt+CommandOrControl+x"));
+        assert_eq!(s.shortcut_cut_send, None);
+        assert_eq!(s.shortcut_copy_send.as_deref(), Some("CommandOrControl+Alt+C"));
+        assert_eq!(s.shortcut_receive, None, "a cleared key stays cleared");
+    }
+
+    #[test]
+    fn settings_from_before_issue_21_load_as_version_0() {
+        let json = serde_json::to_value(AppSettings::default()).unwrap();
+        let mut obj = json.as_object().unwrap().clone();
+        for field in ["shortcut_copy_send", "shortcut_cut_send", "shortcut_receive_paste", "shortcuts_version"] {
+            obj.remove(field);
+        }
+        let s: AppSettings = serde_json::from_value(obj.into()).unwrap();
+        assert_eq!(s.shortcuts_version, 0);
+        assert_eq!(s.shortcut_copy_send, None);
     }
 }
 

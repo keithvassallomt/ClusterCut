@@ -1,4 +1,4 @@
-mod change_events;
+pub(crate) mod change_events;
 pub mod common;
 pub mod history_store;
 pub mod preview;
@@ -64,6 +64,14 @@ pub fn is_wayland() -> bool {
 pub fn is_gnome() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP")
         .map(|v| v.to_ascii_uppercase().contains("GNOME"))
+        .unwrap_or(false)
+}
+
+/// True on a KDE Plasma session (KWin), where `keys::kwin` can ask which app is focused.
+#[cfg(target_os = "linux")]
+pub fn is_kde() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|v| v.to_ascii_uppercase().split(':').any(|d| d == "KDE"))
         .unwrap_or(false)
 }
 
@@ -262,29 +270,6 @@ pub fn read_text(app: &AppHandle) -> Result<String, String> {
             ClipboardBackend::Plugin => plugin::read_text(app),
             ClipboardBackend::WlrDataControl => wayland::read_text(app),
             ClipboardBackend::GnomeExtension => dbus_clipboard::read_text(app),
-            ClipboardBackend::Degraded => {
-                Err(format!(
-                    "No clipboard backend available on this Wayland session ({})",
-                    desktop_name()
-                ))
-            }
-        }
-    }
-}
-
-/// Write clipboard text directly. Used for manual receive shortcut.
-pub fn write_text_direct(app: &AppHandle, text: String) -> Result<(), String> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        plugin::write_text_direct(app, text)
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        match get_backend() {
-            ClipboardBackend::Plugin => plugin::write_text_direct(app, text),
-            ClipboardBackend::WlrDataControl => wayland::write_text_direct(app, text),
-            ClipboardBackend::GnomeExtension => dbus_clipboard::write_text_direct(app, text),
             ClipboardBackend::Degraded => {
                 Err(format!(
                     "No clipboard backend available on this Wayland session ({})",

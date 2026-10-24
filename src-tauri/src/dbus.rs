@@ -1,3 +1,4 @@
+use crate::shortcuts::ManualAction;
 use crate::state::AppState;
 use tauri::{Emitter, Listener, Manager};
 use zbus::interface;
@@ -56,6 +57,13 @@ pub struct ClusterCutDBus {
 impl ClusterCutDBus {
     pub fn new(app_handle: tauri::AppHandle) -> Self {
         Self { app_handle }
+    }
+
+    async fn run(&self, action: ManualAction) {
+        tracing::info!("{:?} requested over D-Bus", action);
+        let app = self.app_handle.clone();
+        // Blocks on the clipboard (and the GNOME bridge's D-Bus calls); keep it off the executor.
+        let _ = tauri::async_runtime::spawn_blocking(move || action.run(&app)).await;
     }
 }
 
@@ -116,20 +124,30 @@ impl ClusterCutDBus {
         self.app_handle.exit(0);
     }
 
-    /// Manual-mode Send, for desktops without a global-shortcuts portal: users
+    /// Send Clipboard, for desktops without a global-shortcuts portal: users
     /// bind a key to `gdbus call ... app.clustercut.clustercut.ManualSend`.
     async fn manual_send(&self) {
-        tracing::info!("ManualSend requested over D-Bus");
-        let app = self.app_handle.clone();
-        // The GNOME clipboard bridge is a blocking D-Bus call; keep it off the executor.
-        let _ = tauri::async_runtime::spawn_blocking(move || crate::shortcuts::manual_send(&app)).await;
+        self.run(ManualAction::SendClipboard).await;
     }
 
-    /// Manual-mode Receive; see `manual_send`.
+    /// Receive Only; see `manual_send`.
     async fn manual_receive(&self) {
-        tracing::info!("ManualReceive requested over D-Bus");
-        let app = self.app_handle.clone();
-        let _ = tauri::async_runtime::spawn_blocking(move || crate::shortcuts::manual_receive(&app)).await;
+        self.run(ManualAction::ReceiveOnly).await;
+    }
+
+    /// Copy & Send; see `manual_send`.
+    async fn copy_send(&self) {
+        self.run(ManualAction::CopySend).await;
+    }
+
+    /// Cut & Send; see `manual_send`.
+    async fn cut_send(&self) {
+        self.run(ManualAction::CutSend).await;
+    }
+
+    /// Receive & Paste; see `manual_send`.
+    async fn receive_paste(&self) {
+        self.run(ManualAction::ReceivePaste).await;
     }
 
     #[zbus(signal)]
@@ -140,11 +158,22 @@ impl ClusterCutDBus {
     ) -> zbus::Result<()>;
 }
 
+/// Where `keys::kwin`'s KWin script reports the focused window's app (KDE).
+pub struct KWinReports;
+
+#[interface(name = "app.clustercut.clustercut.KWin")]
+impl KWinReports {
+    async fn active_window(&self, app_id: String) {
+        crate::keys::kwin::report(app_id);
+    }
+}
+
 pub async fn start_dbus_server(app_handle: tauri::AppHandle) -> zbus::Result<()> {
     let service = ClusterCutDBus::new(app_handle.clone());
     let conn = zbus::connection::Builder::session()?
         .name("app.clustercut.clustercut")?
         .serve_at("/org/gnome/Shell/Extensions/ClusterCut", service)?
+        .serve_at(crate::keys::kwin::REPORT_PATH, KWinReports)?
         .build()
         .await?;
 

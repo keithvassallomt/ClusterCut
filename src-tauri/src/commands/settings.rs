@@ -20,11 +20,13 @@ pub(crate) fn save_settings(
 
     // Preserve backend-only fields that the frontend doesn't manage. These are
     // owned elsewhere (autostart plugin; the header-bar `set_pairing_accept`
-    // command) and are absent from the frontend `AppSettings` type, so a general
+    // command; the RemoteDesktop restore token, replaced on every key press by
+    // `keys::remote_desktop`) and are absent from the frontend `AppSettings` type, so a general
     // settings save must never overwrite them — otherwise a stale SettingsView
     // copy could clobber a value the header toggle just changed.
     settings.flatpak_autostart = prev.flatpak_autostart;
     settings.pairing_accept_enabled = prev.pairing_accept_enabled;
+    settings.remote_desktop_token = prev.remote_desktop_token;
     *state.settings.lock().unwrap() = settings.clone();
     // Re-budget the History content store (may evict down on a lower cap),
     // then clean up evicted entries: delete their disk files, drop their

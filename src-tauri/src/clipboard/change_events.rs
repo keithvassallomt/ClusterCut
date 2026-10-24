@@ -15,6 +15,7 @@
 /// macOS has no clipboard change notification; its monitor polls the cheap
 /// NSPasteboard changeCount at a shorter interval instead (see plugin.rs).
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -43,6 +44,55 @@ pub fn wait_for_change(wake: &Receiver<()>, timeout: Duration) {
         Err(RecvTimeoutError::Timeout) => {}
         Err(RecvTimeoutError::Disconnected) => thread::sleep(timeout),
     }
+}
+
+/// Clipboard change counts for the one-step shortcuts (issue #21). Copy & Send
+/// presses Copy in another app and has to know whether the clipboard changed,
+/// even to identical content, which the monitors' dedupe ignores. Every change
+/// event bumps `changes`; a monitor sets `processed` to the count it had seen
+/// when it finished a check, so a waiter knows the kept payload is current.
+struct Generation {
+    changes: u64,
+    processed: u64,
+}
+
+static GENERATION: Mutex<Generation> = Mutex::new(Generation { changes: 0, processed: 0 });
+static GENERATION_MOVED: Condvar = Condvar::new();
+
+/// Record a clipboard change event. Returns the new count.
+pub fn note_change() -> u64 {
+    let mut g = GENERATION.lock().unwrap();
+    g.changes += 1;
+    GENERATION_MOVED.notify_all();
+    g.changes
+}
+
+pub fn change_count() -> u64 {
+    GENERATION.lock().unwrap().changes
+}
+
+/// A monitor has finished checking the clipboard as of change count `upto`.
+pub fn mark_processed(upto: u64) {
+    let mut g = GENERATION.lock().unwrap();
+    if upto > g.processed {
+        g.processed = upto;
+        GENERATION_MOVED.notify_all();
+    }
+}
+
+/// Wait for a change after count `since`. Returns the new count, or `None` if
+/// the clipboard didn't change within `timeout`.
+pub fn wait_for_change_after(since: u64, timeout: Duration) -> Option<u64> {
+    let g = GENERATION.lock().unwrap();
+    let (g, _) = GENERATION_MOVED.wait_timeout_while(g, timeout, |g| g.changes <= since).unwrap();
+    (g.changes > since).then_some(g.changes)
+}
+
+/// Wait for a monitor to finish checking change `upto`. False on timeout.
+pub fn wait_until_processed(upto: u64, timeout: Duration) -> bool {
+    let g = GENERATION.lock().unwrap();
+    let (g, _) = GENERATION_MOVED.wait_timeout_while(g, timeout, |g| g.processed < upto).unwrap();
+    g.processed >= upto
 }
 
 /// Watch X11 CLIPBOARD ownership changes via XFixes and signal `wake` on each.
@@ -85,6 +135,7 @@ fn run_x11_listener(wake: &Sender<()>) -> Result<(), Box<dyn std::error::Error>>
 
     loop {
         if let Event::XfixesSelectionNotify(_) = conn.wait_for_event()? {
+            note_change();
             if wake.send(()).is_err() {
                 // Monitor thread has exited.
                 return Ok(());
@@ -116,6 +167,7 @@ pub fn spawn_windows_listener(wake: Sender<()>) {
         loop {
             match monitor.recv() {
                 Ok(true) => {
+                    note_change();
                     if wake.send(()).is_err() {
                         return;
                     }
@@ -175,6 +227,7 @@ mod data_control {
 
     impl Listener {
         fn selection_changed(&mut self) {
+            super::note_change();
             if self.wake.send(()).is_err() {
                 self.done = true;
             }
@@ -337,5 +390,25 @@ mod tests {
         let start = Instant::now();
         wait_for_change(&rx, Duration::from_millis(50));
         assert!(start.elapsed() >= Duration::from_millis(50));
+    }
+
+    // One test: the counts are process-wide, so parallel tests would race.
+    #[test]
+    fn generation_waits() {
+        let since = change_count();
+        assert_eq!(wait_for_change_after(since, Duration::from_millis(30)), None, "no change yet");
+
+        let bumper = thread::spawn(note_change);
+        let changed = wait_for_change_after(since, Duration::from_secs(5)).expect("woken by the change");
+        assert!(changed > since);
+        bumper.join().unwrap();
+
+        assert!(!wait_until_processed(changed, Duration::from_millis(30)), "not processed yet");
+        let marker = thread::spawn(move || mark_processed(changed));
+        assert!(wait_until_processed(changed, Duration::from_secs(5)));
+        marker.join().unwrap();
+
+        mark_processed(since);
+        assert!(wait_until_processed(changed, Duration::ZERO), "processed never goes backwards");
     }
 }

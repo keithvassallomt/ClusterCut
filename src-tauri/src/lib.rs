@@ -9,11 +9,14 @@ mod dbus;
 mod handlers;
 #[cfg(target_os = "linux")]
 mod hyprland;
+mod keys;
 mod net_util;
 mod pairing;
 mod discovery;
 mod netmon;
 mod peer;
+#[cfg(target_os = "linux")]
+mod portal;
 #[cfg(target_os = "linux")]
 mod portal_shortcuts;
 mod presence;

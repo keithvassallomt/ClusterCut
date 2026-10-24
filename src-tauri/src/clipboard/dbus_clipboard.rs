@@ -245,11 +245,6 @@ pub fn read_text(_app: &AppHandle) -> Result<String, String> {
     read_text_dbus()
 }
 
-/// Write clipboard text directly (for manual receive shortcut).
-pub fn write_text_direct(app: &AppHandle, text: String) -> Result<(), String> {
-    write_text(app, text)
-}
-
 /// Start the GNOME extension D-Bus clipboard monitor. Returns a cancel handle;
 /// call `Notify::notify_one()` on it (or drop the last Arc) to stop the monitor.
 pub fn start_monitor(
@@ -332,6 +327,18 @@ pub fn start_monitor(
             }
         };
 
+        // v4.2: every owner change, after any content signal for it. Without
+        // it a re-copy of the same content, or our own write, never registers
+        // as a change, which Copy & Send and Receive & Paste wait on. Older
+        // extensions never send it; the subscription then just stays quiet.
+        let mut selection_stream = match proxy.receive_signal("SelectionChanged").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to subscribe to SelectionChanged signal: {}", e);
+                return;
+            }
+        };
+
         use futures::StreamExt;
 
         let mut last_content = ClipboardContent::None;
@@ -342,7 +349,11 @@ pub fn start_monitor(
                 break;
             }
 
+            // Biased, in arm order: a content signal that's ready goes before the
+            // SelectionChanged that followed it, so the change is processed by the
+            // time it counts as one.
             let new_content: Option<ClipboardContent> = tokio::select! {
+                biased;
                 _ = cancel_task.notified() => {
                     tracing::info!("GNOME clipboard monitor cancelled, exiting.");
                     break;
@@ -414,8 +425,17 @@ pub fn start_monitor(
                         break;
                     }
                 },
+                next = selection_stream.next() => match next {
+                    Some(_) => None,
+                    None => {
+                        tracing::warn!("D-Bus SelectionChanged stream ended");
+                        break;
+                    }
+                },
             };
 
+            // Every signal is a change event.
+            let seen = super::change_events::note_change();
             if let Some(current_content) = new_content {
                 match common::should_process_content(&current_content, &last_content) {
                     common::EchoVerdict::Process => {
@@ -433,6 +453,7 @@ pub fn start_monitor(
                     common::EchoVerdict::NoChange => {}
                 }
             }
+            super::change_events::mark_processed(seen);
         }
     });
 

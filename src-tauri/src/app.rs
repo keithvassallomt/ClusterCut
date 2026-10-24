@@ -1310,6 +1310,7 @@ pub(crate) fn run() {
             crate::commands::shortcuts::get_shortcut_status,
             crate::commands::shortcuts::configure_portal_shortcuts,
             crate::commands::shortcuts::retry_portal_shortcuts,
+            crate::commands::shortcuts::allow_key_presses,
             crate::commands::identity::set_network_identity,
             crate::commands::identity::regenerate_network_identity,
             crate::commands::clipboard::manual_send,
@@ -1412,6 +1413,9 @@ pub(crate) fn run() {
                 // Runtime Hyprland binds would otherwise keep swallowing the keys.
                 #[cfg(target_os = "linux")]
                 crate::hyprland::unbind_on_exit();
+                // Nothing would answer the KWin script's reports.
+                #[cfg(target_os = "linux")]
+                crate::keys::kwin::unload();
 
                 let state = app_handle.state::<AppState>();
 
