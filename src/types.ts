@@ -125,7 +125,7 @@ export interface HyprlandShortcutStatus {
 // How the one-step shortcuts press Copy/Cut/Paste. permission: false while the
 // desktop's permission is still to be given (KDE), null where none is needed.
 export interface KeyStatus {
-  backend: "hyprland" | "gnome" | "remote_desktop" | "none";
+  backend: "hyprland" | "gnome" | "remote_desktop" | "x11" | "windows" | "mac_os" | "none";
   permission: boolean | null;
   needs_extension_update: boolean; // GNOME: the extension is missing or older than 4.2
 }

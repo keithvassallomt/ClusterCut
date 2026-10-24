@@ -4,7 +4,7 @@
 
 **Goal:** cut the manual-mode round trip from four key presses to two (issue #21, mtudor). The sender's shortcut copies the selection and sends it; the receiver's shortcut applies the pending content and pastes it. Plus a cut variant, the old "send what's on the clipboard" behaviour on its own combo, and an optional mode that leaves the local clipboard as it was.
 
-**Status:** stage 1 (core + Hyprland) done and tested by Keith 2026-10-23. Stage 2 (KDE) done 2026-10-24, Keith tested on the VM. Stage 3 (GNOME) done 2026-10-24, Keith tested on the VM. Stages 4-6 (X11, Windows, macOS) written 2026-10-24: X11 untested by design; Windows and macOS tested by Keith 2026-10-24. Stage 7 (Keep My Clipboard) done 2026-10-24. X11 is best effort: written, not tested (Keith, 2026-10-23).
+**Status:** stage 1 (core + Hyprland) done and tested by Keith 2026-10-23. Stage 2 (KDE) done 2026-10-24, Keith tested on the VM. Stage 3 (GNOME) done 2026-10-24, Keith tested on the VM. Stages 4-6 (X11, Windows, macOS) written 2026-10-24: X11 untested by design; Windows and macOS tested by Keith 2026-10-24. Stage 7 (Keep My Clipboard) done and tested 2026-10-24. Stage 8 done 2026-10-24, except posting the issue reply. X11 is best effort: written, not tested (Keith, 2026-10-23).
 
 ## Decisions (Keith, 2026-10-23)
 
@@ -162,12 +162,13 @@ Each stage ends with Keith testing on the named desktop.
 - [x] Tests: last-seen tracking (Process, NoChange, Echo, empty), URI to path. 169 pass.
 - [x] Tested locally (Hyprland, real keys): text, HTML (formats intact) and an image all came back after Copy & Send, and Send Clipboard afterwards sent the restored image.
 - Decided against the clipboard-manager hints: only KDE runs a manager by default (Klipper), what it would record is content the user just pasted, and it needs a "temporary write" flag through every write in four backends.
-- [ ] Keith: Receive & Paste with Keep My Clipboard (needs a peer); slow readers (LibreOffice, a large image) to judge the 500 ms.
+- [x] Keith: Receive & Paste with Keep My Clipboard on a peer: works (2026-10-24).
 
-### 8. UI, docs, CHANGELOG
-- [ ] Settings: five shortcut fields grouped under Send and Receive, the "Keep My Clipboard" switch, permission states (KDE approval, macOS Accessibility, GNOME extension too old, unsupported desktop).
-- [ ] Manual Sync panel / tray wording for the renamed actions.
-- [ ] CHANGELOG `[Unreleased]`; README shortcut table; reply on issue #21.
+### 8. UI, docs, CHANGELOG (DONE 2026-10-24)
+- [x] Settings: five shortcut fields grouped under Send and Receive, the Keep My Clipboard switch, permission row worded for KDE or macOS (re-checks status after Allow, since macOS grants in System Settings silently), amber hints for a GNOME extension older than 4.2 and for desktops that can't press keys.
+- [x] Manual Sync panel and tray: nothing to rename (the tray only has the auto toggles; the panel's buttons still fit).
+- [x] CHANGELOG `[Unreleased]` kept up to date per stage; README shortcut table under Manual Mode.
+- [ ] Reply on issue #21: drafted for Keith; he posts it (or says when).
 
 ### 9. Optional: wlroots virtual keyboard
 - [ ] `zwp_virtual_keyboard_v1` backend for Sway/river/Wayfire, tested on Hyprland.

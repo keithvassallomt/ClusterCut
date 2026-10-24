@@ -45,19 +45,35 @@ export function GeneralSettings({
 }) {
   // How global shortcuts are bound here (plugin, Wayland portal, Hyprland binds).
   const [shortcutStatus, setShortcutStatus] = useState<ShortcutStatus | null>(null);
+  const refreshShortcutStatus = () => invoke<ShortcutStatus>("get_shortcut_status").then(setShortcutStatus);
   useEffect(() => {
-    const refresh = () => invoke<ShortcutStatus>("get_shortcut_status").then(setShortcutStatus);
-    refresh();
-    const unlisten = listen("shortcut-status-changed", refresh);
+    refreshShortcutStatus();
+    const unlisten = listen("shortcut-status-changed", refreshShortcutStatus);
     return () => { unlisten.then(f => f()); };
   }, []);
-  // KDE asks once before ClusterCut may press keys; offer to get that out of the way.
-  const showKeyPermission =
-    shortcutStatus?.keys.permission === false && (!settings.auto_send || !settings.auto_receive);
+
+  // How the one-step shortcuts press keys here, and what's in their way.
+  const manualMode = !settings.auto_send || !settings.auto_receive;
+  const keys = shortcutStatus?.keys;
+  // KDE asks once and macOS needs Accessibility; offer to get that out of the way.
+  const showKeyPermission = manualMode && keys?.permission === false;
+  const keyPermissionText =
+    keys?.backend === "mac_os"
+      ? "Copy & Send, Cut & Send and Receive & Paste press keys for you, which macOS only lets apps do once they're allowed under System Settings > Privacy & Security > Accessibility."
+      : "Copy & Send, Cut & Send and Receive & Paste press keys for you, which your desktop asks you to allow once. Allow it now, or when you first use one.";
+  const keysUnavailable =
+    manualMode && keys?.backend === "none"
+      ? keys.needs_extension_update
+        ? "Copy & Send, Cut & Send and Receive & Paste need version 4.2 or newer of the ClusterCut GNOME extension."
+        : "This desktop doesn't let ClusterCut press keys, so Copy & Send, Cut & Send and Receive & Paste don't work here. Send Clipboard and Receive Only do."
+      : null;
   const [keyPermissionError, setKeyPermissionError] = useState<string | null>(null);
   const allowKeyPresses = () => {
     setKeyPermissionError(null);
-    invoke("allow_key_presses").catch((e) => setKeyPermissionError(String(e)));
+    // macOS grants in System Settings without telling us, so look again afterwards.
+    invoke("allow_key_presses")
+      .catch((e) => setKeyPermissionError(String(e)))
+      .finally(refreshShortcutStatus);
   };
 
   const showHyprlandToggle =
@@ -220,13 +236,18 @@ export function GeneralSettings({
               <div className="flex items-center justify-between gap-4">
                 <div>
                   <div className="text-sm font-medium text-zinc-900 dark:text-zinc-50">Allow Key Presses</div>
-                  <div className="text-xs text-zinc-500">
-                    Copy & Send, Cut & Send and Receive & Paste press keys for you, which your desktop asks you to allow once. Allow it now, or when you first use one.
-                  </div>
+                  <div className="text-xs text-zinc-500">{keyPermissionText}</div>
                   {keyPermissionError && <div className="mt-1 text-[10px] text-amber-600 dark:text-amber-400">{keyPermissionError}</div>}
                 </div>
                 <Button size="sm" onClick={allowKeyPresses}>Allow</Button>
               </div>
+            </>
+          )}
+
+          {keysUnavailable && (
+            <>
+              <div className="h-px bg-zinc-900/5 dark:bg-white/5" />
+              <div className="text-xs text-amber-600 dark:text-amber-400">{keysUnavailable}</div>
             </>
           )}
 

@@ -40,6 +40,18 @@ Never lose a clip again. ClusterCut automatically saves your clipboard history, 
 ### Manual Mode
 Don't want to automatically send or receive everything? Enable manual mode to be in full control of your data flow.
 
+In manual mode, these shortcuts move things through the cluster. You can change any of them in Settings.
+
+| Shortcut | Default (Cmd on macOS) | What it does |
+| :--- | :--- | :--- |
+| **Copy & Send** | Ctrl+Alt+C | Copies what's selected in the app you're using and sends it. |
+| **Cut & Send** | Ctrl+Alt+X | Cuts what's selected and sends it. |
+| **Send Clipboard** | Ctrl+Alt+Shift+C | Sends what's already on your clipboard. |
+| **Receive & Paste** | Ctrl+Alt+V | Pastes what the cluster sent you. |
+| **Receive Only** | Ctrl+Alt+Shift+V | Puts what the cluster sent you on your clipboard, without pasting. |
+
+Turn on **Keep My Clipboard** and Copy & Send, Cut & Send and Receive & Paste leave your own clipboard as it was. To press keys for you, ClusterCut needs a one-time permission on KDE Plasma, Accessibility access on macOS, and version 4.2 or newer of its extension on GNOME.
+
 <p align="center">
   <img src="assets/README/feature_manual.png" alt="Manual Mode" width="80%" />
 </p>
