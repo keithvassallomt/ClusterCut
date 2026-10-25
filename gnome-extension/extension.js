@@ -446,8 +446,10 @@ export default class ClusterCutExtension extends Extension {
             Gio.DBus.session.unregister_object(this._keysDbusId);
             this._keysDbusId = null;
         }
-        for (const id of this._releaseWaits ?? []) {
-            GLib.source_remove(id);
+        if (this._releaseWaits) {
+            for (const id of this._releaseWaits) {
+                GLib.source_remove(id);
+            }
         }
         this._releaseWaits = null;
         this._virtualKeyboard = null;
