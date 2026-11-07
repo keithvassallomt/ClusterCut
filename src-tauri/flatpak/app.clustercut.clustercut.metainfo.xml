@@ -67,6 +67,17 @@
   </branding>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.6.0" date="2026-11-07">
+      <description>
+        <p>No more phantom "Device Left" notifications, and help when a device falls out of its cluster.</p>
+        <ul>
+          <li>If your other devices stop recognising this one, because the cluster was re-created without it or it was removed while it was away, ClusterCut now tells you and offers to rejoin with the cluster's PIN. Until then, clipboard sent from it was silently going nowhere.</li>
+          <li>Settings warns when the cluster name you choose is already used by a different cluster nearby, and Nearby Clusters lists a cluster that shares your cluster's name as a separate entry.</li>
+          <li>Joining a different cluster now replaces your old one, instead of keeping the old cluster's devices in your list.</li>
+          <li>No more false "Device Left" notifications, often several at once after waking from sleep, for devices that were never actually connected.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-10-24">
       <description>
         <p>One-step shortcuts, shortcuts that work on Wayland, and control over your History.</p>
