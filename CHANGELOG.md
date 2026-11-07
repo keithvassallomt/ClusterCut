@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-11-07
 
 ### Added
 - When the rest of your cluster no longer recognises this device (the cluster was re-created without it, or it was removed while asleep or offline), ClusterCut now says so: one notification, plus a banner with a Rejoin button that pairs it back in with the cluster's PIN. Device Joined and Device Left notifications pause until it rejoins.
