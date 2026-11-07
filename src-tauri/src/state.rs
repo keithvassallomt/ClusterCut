@@ -130,6 +130,16 @@ pub struct AppState {
     pub pending_network_wipe: Arc<AtomicBool>,
     // Deferred join notifications (peer IDs awaiting ping verification)
     pub pending_join_notifications: Arc<Mutex<HashSet<String>>>,
+    /// Runtime peers we have actually talked to over mTLS since they last
+    /// entered the runtime map (an inbound heartbeat/Ping/Pong, or the ping
+    /// that verified a "Device Joined"). Gates "Device Left": a peer we only
+    /// ever saw in mDNS, typically one that doesn't have us paired, never
+    /// joined from our side, so dropping it is not news. Leaf lock: never
+    /// held while taking another.
+    pub confirmed_peers: Arc<Mutex<HashSet<String>>>,
+    /// Refusal/acceptance evidence about our own membership: are we still in
+    /// our cluster, and are our paired devices? See membership.rs. Leaf lock.
+    pub membership: Arc<Mutex<crate::membership::MembershipTracker>>,
     // Heartbeat fallback counter (consecutive rounds where all sends failed)
     pub consecutive_heartbeat_failures: Arc<AtomicU32>,
 
@@ -221,6 +231,8 @@ impl AppState {
             last_focus_reprobe: Arc::new(Mutex::new(None)),
             pending_network_wipe: Arc::new(AtomicBool::new(false)),
             pending_join_notifications: Arc::new(Mutex::new(HashSet::new())),
+            confirmed_peers: Arc::new(Mutex::new(HashSet::new())),
+            membership: Arc::new(Mutex::new(crate::membership::MembershipTracker::default())),
             consecutive_heartbeat_failures: Arc::new(AtomicU32::new(0)),
             pairing_failure_count: Arc::new(AtomicU32::new(0)),
             pairing_locked_out: Arc::new(AtomicBool::new(false)),
@@ -312,6 +324,50 @@ impl AppState {
         peers.insert(peer.id.clone(), peer);
     }
 
+    /// Add or refresh a runtime peer seen only through mDNS, i.e. without
+    /// any authenticated contact. Returns true if it was not already in the
+    /// runtime map. A new entry starts unconfirmed: a confirmation left over
+    /// from an earlier stay that ended silently (network wipe, kick) must not
+    /// vouch for a sighting we haven't verified.
+    pub fn add_discovered_peer(&self, peer: Peer) -> bool {
+        let id = peer.id.clone();
+        let is_new = self.peers.lock().unwrap().insert(id.clone(), peer).is_none();
+        if is_new {
+            self.confirmed_peers.lock().unwrap().remove(&id);
+        }
+        is_new
+    }
+
+    /// Record authenticated (mTLS) contact with a runtime peer. It also
+    /// proves that peer accepts us, which is membership evidence.
+    pub fn mark_peer_confirmed(&self, id: &str) {
+        self.confirmed_peers.lock().unwrap().insert(id.to_string());
+        self.membership
+            .lock()
+            .unwrap()
+            .record_accepted(Some(id), std::time::Instant::now());
+    }
+
+    /// Clear a peer's confirmation, returning whether it had one.
+    pub fn take_peer_confirmed(&self, id: &str) -> bool {
+        self.confirmed_peers.lock().unwrap().remove(id)
+    }
+
+    /// Our cluster tag, as advertised in mDNS (see cluster_id.rs).
+    pub fn cluster_tag(&self) -> String {
+        crate::cluster_id::tag(&self.cluster_id.lock().unwrap())
+    }
+
+    /// Cluster names currently advertised by devices nearby.
+    pub fn advertised_network_names(&self) -> HashSet<String> {
+        self.peers
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|p| p.network_name.clone())
+            .collect()
+    }
+
     pub fn get_peers(&self) -> HashMap<String, Peer> {
         let peers = self.peers.lock().unwrap();
         peers.clone()
@@ -330,5 +386,12 @@ impl AppState {
         // Outage/suspend/grace suppression shares one definition with the
         // presence machinery so the two can't drift apart.
         !crate::presence::presence_paused(self)
+    }
+
+    /// `should_notify`, plus silence while this device has been dropped from
+    /// its cluster: until it re-pairs, which devices come and go says
+    /// nothing about a cluster it isn't really in.
+    pub fn should_notify_peer_change(&self) -> bool {
+        self.should_notify() && !self.membership.lock().unwrap().is_dropped()
     }
 }

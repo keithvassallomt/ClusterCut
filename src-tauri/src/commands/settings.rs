@@ -48,6 +48,8 @@ pub(crate) fn save_settings(
 
     // --- Issue #18: apply mDNS advertising toggle live ---
     if settings.mdns_advertising != prev.mdns_advertising {
+        // Before the discovery lock: cluster_tag() takes the cluster_id lock.
+        let cluster_tag = state.cluster_tag();
         let mut disc_lock = state.discovery.lock().unwrap();
         if let Some(disc) = disc_lock.as_mut() {
             if settings.mdns_advertising {
@@ -61,7 +63,7 @@ pub(crate) fn save_settings(
                     .and_then(|t| t.local_addr().ok())
                     .map(|a| a.port())
                     .unwrap_or(4654);
-                if let Err(e) = disc.register(&device_id, &network_name, port) {
+                if let Err(e) = disc.register(&device_id, &network_name, &cluster_tag, port) {
                     tracing::error!("Failed to re-register mDNS service: {}", e);
                 }
             } else {

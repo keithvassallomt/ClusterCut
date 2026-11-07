@@ -37,7 +37,7 @@ function DevicesView({
   nearby: NearbyNetwork[];
   expandedNetworks: Set<string>;
   toggleNetwork: (name: string) => void;
-  onJoin: (networkName: string) => void;
+  onJoin: (network: NearbyNetwork) => void;
   onDeletePeer: (id: string) => void;
   onAddManual: () => void;
 }) {
@@ -183,25 +183,32 @@ function DevicesView({
             ) : (
               <div className="mt-2 space-y-3">
                 {nearby.map((n) => {
-                  const isExpanded = expandedNetworks.has(n.networkName);
+                  const isExpanded = expandedNetworks.has(n.key);
                   return (
-                    <div key={n.networkName} className="rounded-2xl border border-zinc-900/10 bg-white/60 p-3 dark:border-white/10 dark:bg-white/5">
+                    <div key={n.key} className="rounded-2xl border border-zinc-900/10 bg-white/60 p-3 dark:border-white/10 dark:bg-white/5">
                       <div className="flex flex-col gap-3">
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
                             <button
-                              onClick={() => toggleNetwork(n.networkName)}
+                              onClick={() => toggleNetwork(n.key)}
                               className="flex h-6 w-6 items-center justify-center rounded-lg text-zinc-500 hover:bg-zinc-900/5 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-white/10 dark:hover:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
                             >
                               {isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
                             </button>
-                            <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">{n.networkName}</div>
+                            <div>
+                              <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">{n.networkName}</div>
+                              {n.sharesOurName && (
+                                <div className="text-[11px] text-amber-700 dark:text-amber-300">
+                                  A different cluster using your cluster's name
+                                </div>
+                              )}
+                            </div>
                           </div>
                           <Button
                             variant="primary"
                             size="sm"
                             iconLeft={<PlusCircle className="h-4 w-4" />}
-                            onClick={() => onJoin(n.networkName)}
+                            onClick={() => onJoin(n)}
                             className="no-drag"
                           >
                             Join

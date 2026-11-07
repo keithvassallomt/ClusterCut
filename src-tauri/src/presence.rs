@@ -113,9 +113,11 @@ pub(crate) fn refresh_peer_liveness(state: &AppState) {
 }
 
 /// Refresh `last_seen` (and cancel any pending debounced removal) for the
-/// runtime peer at `addr`. Returns false if no runtime peer matches. The
-/// transport multiplexes client+server on one UDP socket, so a sender's
-/// source port IS its listening port — matching ip+port is exact.
+/// runtime peer at `addr`, and mark it confirmed: callers pass the source of
+/// an inbound message, which only arrives over mTLS. Returns false if no
+/// runtime peer matches. The transport multiplexes client+server on one UDP
+/// socket, so a sender's source port IS its listening port, which makes
+/// matching ip+port exact.
 pub(crate) fn touch_peer_by_addr(state: &AppState, addr: std::net::SocketAddr) -> bool {
     let now = now_unix_secs();
     let touched_id = {
@@ -134,6 +136,7 @@ pub(crate) fn touch_peer_by_addr(state: &AppState, addr: std::net::SocketAddr) -
     match touched_id {
         Some(id) => {
             state.pending_removals.lock().unwrap().remove(&id);
+            state.mark_peer_confirmed(&id);
             true
         }
         None => false,
@@ -379,6 +382,7 @@ mod tests {
             signature: None,
             fingerprint: Some(vec![1, 2, 3]),
             protocol_version: Some("0.3.4".to_string()),
+            cluster_tag: None,
         }
     }
 
@@ -537,6 +541,55 @@ mod tests {
         state.add_peer(peer("clustercut-a", "192.168.1.10", 4654));
         let addr: std::net::SocketAddr = "192.168.1.99:4654".parse().unwrap();
         assert!(!touch_peer_by_addr(&state, addr));
+    }
+
+    #[test]
+    fn touch_confirms_the_peer() {
+        let state = AppState::new();
+        state.add_peer(peer("clustercut-a", "192.168.1.10", 4654));
+        let addr: std::net::SocketAddr = "192.168.1.10:4654".parse().unwrap();
+        assert!(touch_peer_by_addr(&state, addr));
+        assert!(state.take_peer_confirmed("clustercut-a"));
+    }
+
+    // ── confirmed_peers (gates "Device Left") ──────────────────────────
+
+    #[test]
+    fn mdns_only_peer_is_unconfirmed() {
+        // The false-"Device Left" case: a device advertising our cluster
+        // name that refuses our cert. We see it in mDNS, never over mTLS.
+        let state = AppState::new();
+        assert!(state.add_discovered_peer(peer("clustercut-a", "192.168.1.10", 4654)));
+        assert!(!state.take_peer_confirmed("clustercut-a"));
+    }
+
+    #[test]
+    fn rediscovering_a_live_peer_keeps_its_confirmation() {
+        let state = AppState::new();
+        state.add_peer(peer("clustercut-a", "192.168.1.10", 4654));
+        state.mark_peer_confirmed("clustercut-a");
+        assert!(!state.add_discovered_peer(peer("clustercut-a", "192.168.1.10", 4654)));
+        assert!(state.take_peer_confirmed("clustercut-a"));
+    }
+
+    #[test]
+    fn stale_confirmation_does_not_vouch_for_a_new_sighting() {
+        let state = AppState::new();
+        state.add_peer(peer("clustercut-a", "192.168.1.10", 4654));
+        state.mark_peer_confirmed("clustercut-a");
+        // Dropped without going through the leave path (e.g. a network wipe)...
+        state.peers.lock().unwrap().clear();
+        // ...then seen again, but only in mDNS.
+        assert!(state.add_discovered_peer(peer("clustercut-a", "192.168.1.10", 4654)));
+        assert!(!state.take_peer_confirmed("clustercut-a"));
+    }
+
+    #[test]
+    fn confirmation_is_consumed_once() {
+        let state = AppState::new();
+        state.mark_peer_confirmed("clustercut-a");
+        assert!(state.take_peer_confirmed("clustercut-a"));
+        assert!(!state.take_peer_confirmed("clustercut-a"));
     }
 
     // ── peers_needing_probe ────────────────────────────────────────────

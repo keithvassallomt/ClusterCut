@@ -312,6 +312,7 @@ mod add_remote_tests {
             signature: None,
             fingerprint,
             protocol_version: None,
+            cluster_tag: None,
         }
     }
 

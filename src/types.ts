@@ -10,6 +10,9 @@ export interface Peer {
   platform?: string; // Backend doesn't send this yet, will mock or infer
   /// Protocol-compatibility version advertised via mDNS.
   protocol_version?: string | null;
+  /// Cluster tag the peer advertises (see the backend's cluster_id.rs). Absent
+  /// from builds that predate it.
+  cluster_tag?: string | null;
   /// True when the peer's `protocol_version` meets the minimum required by
   /// this build. Computed by the Rust backend (net_util::is_protocol_compatible)
   /// and injected into every frontend-bound payload; never travels peer-to-peer.
@@ -28,8 +31,19 @@ export interface DiagnosticEvent {
   message: string;
 }
 
+/// This device was dropped from its cluster: the devices listed refuse its
+/// certificate. Mirrors `membership::DroppedInfo` in the backend.
+export type ClusterDropped = {
+  clusterName: string;
+  devices: { id: string; hostname: string }[];
+};
+
 export type NearbyNetwork = {
+  /// Unique per cluster: name plus cluster tag, since two clusters can share a name.
+  key: string;
   networkName: string;
+  /// Uses our cluster's name but is provably a different cluster.
+  sharesOurName: boolean;
   devices: {
     id: string;
     hostname?: string;

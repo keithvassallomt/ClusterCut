@@ -175,6 +175,28 @@ pub fn save_cluster_id(app: &AppHandle, id: &str) {
     }
 }
 
+/// The cluster_id we last notified the user about being dropped from (see
+/// membership.rs), so the notification fires once per cluster rather than
+/// on every launch.
+pub fn load_dropped_notice(app: &AppHandle) -> Option<String> {
+    let path = app.path().resolve("dropped_notice", BaseDirectory::AppConfig).ok()?;
+    let id = fs::read_to_string(path).ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+pub fn save_dropped_notice(app: &AppHandle, cluster_id: &str) {
+    let Ok(path) = app.path().resolve("dropped_notice", BaseDirectory::AppConfig) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Err(e) = fs::write(path, cluster_id) {
+        tracing::warn!("Failed to write dropped_notice: {}", e);
+    }
+}
+
 /// Delete the legacy `cluster_key.bin` file from earlier versions. v0.3+
 /// no longer treats the cluster key as a secret (mTLS replaces its role);
 /// the file is wiped on first boot of the new build to avoid leaving a
@@ -483,14 +505,29 @@ pub fn reset_network_state(app: &AppHandle) {
 /// fresh generated name (`load_network_name` regenerates and persists it). The
 /// PIN is handled separately by `establish_network_pin` so its persistence
 /// follows the cluster mode (ephemeral in auto — issue 4).
-pub fn regenerate_network_name(app: &AppHandle) -> String {
-    let path_resolver = app.path();
-    if let Ok(path) = path_resolver.resolve("network_name", BaseDirectory::AppConfig) {
-        if path.exists() {
-            let _ = fs::remove_file(path);
+///
+/// `taken` holds names nearby devices already advertise; a random name that
+/// collides is re-rolled so a new cluster never shares a name by accident.
+pub fn regenerate_network_name(app: &AppHandle, taken: &std::collections::HashSet<String>) -> String {
+    let name = generate_network_name(taken);
+    save_network_name(app, &name);
+    tracing::info!("Generated new Network Name: {}", name);
+    name
+}
+
+/// A random cluster name not in `taken` (best effort: after 20 collisions,
+/// astronomically unlikely, it returns the last one anyway).
+pub(crate) fn generate_network_name(taken: &std::collections::HashSet<String>) -> String {
+    let mut generator = Generator::default();
+    let mut last = None;
+    for _ in 0..20 {
+        match generator.next() {
+            Some(name) if !taken.contains(&name) => return name,
+            Some(name) => last = Some(name),
+            None => break,
         }
     }
-    load_network_name(app)
+    last.unwrap_or_else(|| "unnamed-network".to_string())
 }
 // --- Settings Persistance ---
 

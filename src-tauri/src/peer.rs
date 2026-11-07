@@ -31,6 +31,12 @@ pub struct Peer {
     /// resolution.
     #[serde(default)]
     pub protocol_version: Option<String>,
+    /// Cluster tag the peer advertises (mDNS `c` property, or its own
+    /// heartbeat); see cluster_id.rs. None from builds that predate it. Like
+    /// `protocol_version` it may get persisted as a side effect of saves,
+    /// which is harmless: resolutions and heartbeats refresh it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_tag: Option<String>,
 }
 
 /// Frontend-only view of a peer. Carries all `Peer` fields plus a
@@ -70,6 +76,7 @@ pub struct PeerView {
     pub network_name: Option<String>,
     pub fingerprint: Option<Vec<u8>>,
     pub protocol_version: Option<String>,
+    pub cluster_tag: Option<String>,
     /// True when the peer's advertised `protocol_version` is >= the minimum
     /// this build requires. Computed by `net_util::is_protocol_compatible`;
     /// never travels over the peer-to-peer wire.
@@ -89,6 +96,7 @@ impl PeerView {
             network_name: peer.network_name.clone(),
             fingerprint: peer.fingerprint.clone(),
             protocol_version: peer.protocol_version.clone(),
+            cluster_tag: peer.cluster_tag.clone(),
             compatible: crate::net_util::is_protocol_compatible(peer.protocol_version.as_deref()),
         }
     }
@@ -111,6 +119,7 @@ mod tests {
             signature: None,
             fingerprint,
             protocol_version: None,
+            cluster_tag: None,
         }
     }
 

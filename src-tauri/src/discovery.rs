@@ -44,6 +44,7 @@ impl Discovery {
         &mut self,
         device_id: &str,
         network_name: &str,
+        cluster_tag: &str,
         port: u16,
     ) -> Result<(), Box<dyn Error>> {
         // If already registered, unregister first — and WAIT for the daemon to
@@ -89,13 +90,20 @@ impl Discovery {
         // `proto` carries the wire-protocol-compatibility version (see
         // [`CLUSTERCUT_PROTOCOL_VERSION`]). Peers below the receiver's expected
         // value get a yellow warning indicator in the UI.
-        let properties = [
+        //
+        // `c` carries the cluster tag (`cluster_id::tag`): the name alone
+        // can't tell two clusters apart when they share one. Older builds
+        // ignore it, and receivers fall back to the name when it's absent.
+        let mut properties = vec![
             ("version", "0.1.0"),
             ("proto", CLUSTERCUT_PROTOCOL_VERSION),
             ("id", device_id),
             ("n", network_name),     // n = network name
             ("h", &system_hostname), // h = visible hostname
         ];
+        if !cluster_tag.is_empty() {
+            properties.push(("c", cluster_tag));
+        }
 
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
@@ -138,6 +146,31 @@ impl Discovery {
     pub fn browse(&self) -> Result<mdns_sd::Receiver<ServiceEvent>, Box<dyn Error>> {
         let receiver = self.daemon.browse(SERVICE_TYPE)?;
         Ok(receiver)
+    }
+}
+
+/// Re-register our mDNS service from current state (device id, cluster name
+/// and tag, QUIC port), honouring the advertising setting. For changes made
+/// outside the paths that already re-register explicitly.
+pub(crate) fn readvertise(state: &crate::state::AppState) {
+    if !state.settings.lock().unwrap().mdns_advertising {
+        return;
+    }
+    let device_id = state.local_device_id.lock().unwrap().clone();
+    let network_name = state.network_name.lock().unwrap().clone();
+    let cluster_tag = state.cluster_tag();
+    let port = state
+        .transport
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|t| t.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(4654);
+    if let Some(discovery) = state.discovery.lock().unwrap().as_mut() {
+        if let Err(e) = discovery.register(&device_id, &network_name, &cluster_tag, port) {
+            tracing::error!("Failed to re-register mDNS service: {}", e);
+        }
     }
 }
 

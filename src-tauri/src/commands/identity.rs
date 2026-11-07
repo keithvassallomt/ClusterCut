@@ -65,8 +65,9 @@ fn apply_local_rename(
         .and_then(|t| t.local_addr().ok())
         .map(|a| a.port())
         .unwrap_or(4654);
+    let cluster_tag = state.cluster_tag();
     if let Some(discovery) = state.discovery.lock().unwrap().as_mut() {
-        let _ = discovery.register(&device_id, name, port);
+        let _ = discovery.register(&device_id, name, &cluster_tag, port);
     }
 
     // Propagate to connected peers.
@@ -102,9 +103,37 @@ pub(crate) fn regenerate_network_identity(
     // This command runs when switching to Auto mode. Generate a fresh random
     // name (persisted + version-bumped + propagated by apply_local_rename) and
     // an EPHEMERAL PIN — auto mode never stores the PIN on disk (issue 4).
-    let name = crate::storage::regenerate_network_name(&app_handle);
+    let name = crate::storage::regenerate_network_name(&app_handle, &state.advertised_network_names());
     let pin = crate::storage::establish_network_pin(&app_handle, "auto");
     *state.network_pin.lock().unwrap() = pin;
 
     apply_local_rename(&name, &state, &transport, &app_handle);
+}
+
+/// The dropped-from-cluster state (see membership.rs), for the banner on
+/// load. Later changes arrive as `cluster-dropped` / `cluster-rejoined`.
+#[tauri::command]
+pub(crate) fn get_cluster_dropped(
+    state: State<'_, AppState>,
+) -> Option<crate::membership::DroppedInfo> {
+    state.membership.lock().unwrap().dropped()
+}
+
+/// Hostnames of nearby devices already using `name` for a different cluster.
+/// Settings shows them as a warning under the name field; it never blocks.
+#[tauri::command]
+pub(crate) fn cluster_name_conflicts(name: String, state: State<'_, AppState>) -> Vec<String> {
+    let local_id = state.local_device_id.lock().unwrap().clone();
+    let local_tag = state.cluster_tag();
+    // Lock order: known_peers before peers.
+    let known = state.known_peers.lock().unwrap();
+    let runtime = state.peers.lock().unwrap();
+    crate::cluster_name::name_conflicts(name.trim(), &local_id, &local_tag, &known, &runtime)
+}
+
+/// Our cluster tag (see cluster_id.rs), so the UI can tell a nearby cluster
+/// that shares our name from our own.
+#[tauri::command]
+pub(crate) fn get_cluster_tag(state: State<'_, AppState>) -> String {
+    state.cluster_tag()
 }

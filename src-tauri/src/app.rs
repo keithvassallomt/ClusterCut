@@ -218,6 +218,7 @@ pub(crate) fn spawn_mdns_rescan(state: AppState, handle: tauri::AppHandle) {
                         signature: None,
                         fingerprint,
                         protocol_version: proto,
+                        cluster_tag: info.get_property_val_str("c").map(str::to_string),
                     };
 
                     // Something we just re-resolved is clearly alive; cancel any
@@ -225,7 +226,7 @@ pub(crate) fn spawn_mdns_rescan(state: AppState, handle: tauri::AppHandle) {
                     {
                         state.pending_removals.lock().unwrap().remove(&id);
                     }
-                    state.add_peer(peer.clone());
+                    state.add_discovered_peer(peer.clone());
                     let _ = handle.emit("peer-update", crate::peer::PeerView::from_peer(&peer));
                 }
                 Ok(Ok(_)) => {}                 // ignore ServiceRemoved etc. mid-rescan
@@ -815,8 +816,10 @@ pub(crate) fn run() {
                 // mdns_advertising setting (issue #18).
                 let mut discovery = Discovery::new().expect("Failed to initialize discovery");
                 if state.settings.lock().unwrap().mdns_advertising {
+                    // `cid_lock` is still held here, so derive the tag from
+                    // it (state.cluster_tag() would deadlock).
                     discovery
-                        .register(&device_id, &network_name, port)
+                        .register(&device_id, &network_name, &crate::cluster_id::tag(&cid_lock), port)
                         .expect("Failed to register service");
                 } else {
                     tracing::info!("mDNS advertising disabled by settings; browsing only.");
@@ -906,15 +909,11 @@ pub(crate) fn run() {
                                         // runtime peer record so it shows up in the UI.
                                         fingerprint: stored_fingerprint,
                                         protocol_version: proto_prop,
+                                        cluster_tag: info.get_property_val_str("c").map(str::to_string),
                                     };
 
-                                    // Check if peer is already active to prevent duplicate notifications
-                                    let is_new_peer = {
-                                        let peers = d_state.peers.lock().unwrap();
-                                        !peers.contains_key(&id)
-                                    };
-
-                                    d_state.add_peer(peer.clone());
+                                    // is_new_peer: already-active peers get no second join notification
+                                    let is_new_peer = d_state.add_discovered_peer(peer.clone());
                                     let _ = d_handle.emit("peer-update", crate::peer::PeerView::from_peer(&peer));
 
                                     // Trigger Notification (with Layer 2 ping verification)
@@ -926,7 +925,7 @@ pub(crate) fn run() {
 
                                         if same_network && is_new_peer
                                             && d_state.settings.lock().unwrap().notifications.device_join
-                                            && d_state.should_notify()
+                                            && d_state.should_notify_peer_change()
                                         {
                                             // Ping-verify before notifying
                                             let verify_state = d_state.clone();
@@ -949,6 +948,8 @@ pub(crate) fn run() {
                                                 }
 
                                                 if verified {
+                                                    // Announced as joined, so it gets a "Left" when it goes.
+                                                    verify_state.mark_peer_confirmed(&verify_peer.id);
                                                     tracing::info!("[Notification] Ping-verified 'Device Joined' for: {}", verify_peer.hostname);
                                                     crate::send_notification(&verify_handle, "Device Joined", &format!("{} has joined your cluster", verify_peer.hostname), false, Some(1), "devices", crate::NotificationPayload::None);
                                                 } else {
@@ -1165,6 +1166,10 @@ pub(crate) fn run() {
                     // routed IP actually changed.
                     crate::netmon::check_and_handle_network_change(&hb_state, &hb_handle);
 
+                    // Act on the membership evidence gathered so far (dropped
+                    // from our cluster? a member gone to another cluster?).
+                    crate::membership::tick(&hb_handle, &hb_state);
+
                     let peers: Vec<Peer> = {
                         // FIX: Heartbeat ALL runtime peers, not just known (connected) ones.
                         // This prevents pruning of discovered-but-not-yet-trusted peers.
@@ -1177,6 +1182,7 @@ pub(crate) fn run() {
                     let local_id = hb_state.local_device_id.lock().unwrap().clone();
                     let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or("Unknown".to_string());
                     let network_name = hb_state.network_name.lock().unwrap().clone();
+                    let local_tag = hb_state.cluster_tag();
 
                     // Self Peer (for payload)
                     let my_peer = Peer {
@@ -1187,25 +1193,59 @@ pub(crate) fn run() {
                         last_seen: 0,
                         is_trusted: false,
                         is_manual: true,
-                        network_name: Some(network_name),
+                        network_name: Some(network_name.clone()),
                         signature: None,
                         fingerprint: Some(hb_transport.local_fingerprint()),
                         protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
+                        cluster_tag: Some(local_tag.clone()),
                     };
 
                     let msg = Message::PeerDiscovery(my_peer);
                     let data = serde_json::to_vec(&msg).unwrap_or_default();
 
-                    let mut any_success = false;
+                    // A refusal still means the peer answered, so it counts
+                    // as reachable for the network-down fallback below.
+                    let mut any_reachable = false;
                     for p in &peers {
                         let addr = std::net::SocketAddr::new(p.ip, p.port);
-                        if hb_transport.send_message(addr, &data).await.is_ok() {
-                            any_success = true;
+                        match hb_transport.send_message(addr, &data).await {
+                            Ok(()) => {
+                                any_reachable = true;
+                                let was_refusing = hb_state
+                                    .membership
+                                    .lock()
+                                    .unwrap()
+                                    .record_accepted(Some(&p.id), std::time::Instant::now());
+                                if was_refusing {
+                                    tracing::info!("[Heartbeat] {} ({}) accepts our connection again", p.hostname, addr);
+                                }
+                            }
+                            Err(e) => {
+                                let Some(refused) = crate::transport::as_peer_refusal(e.as_ref()) else {
+                                    continue;
+                                };
+                                any_reachable = true;
+                                let affiliation = crate::membership::affiliation(p, &network_name, &local_tag);
+                                // Logged when it starts, not every 5 s.
+                                let started = hb_state.membership.lock().unwrap().record_refusal(
+                                    &p.id,
+                                    &p.hostname,
+                                    refused.server_fingerprint.clone(),
+                                    affiliation,
+                                    std::time::Instant::now(),
+                                );
+                                if started {
+                                    tracing::warn!(
+                                        "[Heartbeat] {} ({}) refuses our connection: this device is not paired on its side. {}",
+                                        p.hostname, addr, refused
+                                    );
+                                }
+                            }
                         }
                     }
 
                     // Heartbeat fallback: track consecutive rounds where all sends failed
-                    if any_success {
+                    if any_reachable {
                         let prev = hb_state.consecutive_heartbeat_failures.swap(0, std::sync::atomic::Ordering::Relaxed);
                         if prev >= 3 {
                             tracing::info!("[Netmon] Heartbeat fallback: network recovered (was down for {} rounds)", prev);
@@ -1292,6 +1332,9 @@ pub(crate) fn run() {
             crate::commands::peers::delete_peer,
             crate::commands::peers::leave_network,
             crate::commands::identity::get_network_name,
+            crate::commands::identity::get_cluster_dropped,
+            crate::commands::identity::cluster_name_conflicts,
+            crate::commands::identity::get_cluster_tag,
             crate::commands::clipboard::request_file,
             crate::commands::clipboard::delete_history_item,
             crate::commands::clipboard::clear_history,

@@ -1,7 +1,37 @@
-import { ShieldCheck, AlertTriangle } from "lucide-react";
+import { ShieldCheck, AlertTriangle, Unplug } from "lucide-react";
 import { Button } from "./ui";
+import type { ClusterDropped } from "../types";
 
 type LegacyPeer = { id: string; hostname: string };
+
+function listNames(names: string[]): string {
+  if (names.length <= 1) return names[0] ?? "";
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+export function ClusterDroppedBanner({ info, onRejoin }: { info: ClusterDropped; onRejoin: () => void }) {
+  const names = info.devices.map((d) => d.hostname);
+  const verb = names.length === 1 ? "recognises" : "recognise";
+  return (
+    <div className="fixed inset-x-0 top-0 z-40 border-b border-amber-300 bg-amber-50 px-4 py-3 shadow-sm dark:border-amber-700 dark:bg-amber-950/80">
+      <div className="mx-auto flex max-w-5xl items-start gap-3">
+        <Unplug className="mt-0.5 h-5 w-5 flex-shrink-0 text-amber-600 dark:text-amber-400" />
+        <div className="flex-1 text-sm">
+          <div className="font-medium text-amber-900 dark:text-amber-100">
+            This device was dropped from {info.clusterName}
+          </div>
+          <div className="mt-1 text-amber-800 dark:text-amber-200">
+            {listNames(names)} no longer {verb} this device, so nothing you copy here reaches them. The cluster was
+            probably re-created, or this device was removed while it was away. Rejoin with the cluster's PIN.
+          </div>
+        </div>
+        <Button variant="primary" onClick={onRejoin}>
+          Rejoin
+        </Button>
+      </div>
+    </div>
+  );
+}
 
 export function LegacyPeerBanner({ peers, onDismiss }: { peers: LegacyPeer[]; onDismiss: () => void }) {
   return (

@@ -426,6 +426,7 @@ pub(crate) async fn start_pairing(
             signature: None,
             fingerprint: Some(responder_fingerprint.clone()),
             protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
+            cluster_tag: None,
         };
         runtime_peers.insert(responder_device_id.clone(), pinned.clone());
         kp_lock.insert(responder_device_id.clone(), pinned.clone());
@@ -547,6 +548,12 @@ pub(crate) async fn start_pairing(
         cluster_mode: responder_cluster_mode,
     } = cluster_info;
     tracing::info!("Joined Network: {} (cluster {})", network_name, cluster_id);
+    // Joining a *different* cluster replaces the old one rather than merging
+    // into it (see the known_peers block below).
+    let switching_cluster = {
+        let previous = state.cluster_id.lock().unwrap();
+        !previous.is_empty() && *previous != cluster_id
+    };
     {
         let mut cid = state.cluster_id.lock().unwrap();
         *cid = cluster_id.clone();
@@ -573,13 +580,37 @@ pub(crate) async fn start_pairing(
     }
 
     let local_quic_port = transport.local_addr().map(|a| a.port()).unwrap_or(0);
+    let cluster_tag = state.cluster_tag();
     if let Some(discovery) = state.discovery.lock().unwrap().as_mut() {
-        let _ = discovery.register(&local_id, &network_name, local_quic_port);
+        let _ = discovery.register(&local_id, &network_name, &cluster_tag, local_quic_port);
     }
 
     {
         let mut kp_lock = state.known_peers.lock().unwrap();
         let mut runtime_peers = state.peers.lock().unwrap();
+
+        // Forget the old cluster's members. Merging kept them pinned forever:
+        // a device that was dropped from a re-created cluster and then
+        // rejoins it would otherwise carry every stale entry along. Any of
+        // them that really is in the new cluster comes straight back from
+        // the snapshot below. We deliberately don't send them a PeerRemoval:
+        // when the old cluster's devices ARE the new cluster's (a re-created
+        // cluster), that would remove us from the cluster we just joined.
+        if switching_cluster {
+            let stale = crate::membership::stale_on_cluster_switch(&kp_lock, &responder_device_id);
+            for id in &stale {
+                kp_lock.remove(id);
+                if let Some(p) = runtime_peers.get_mut(id) {
+                    p.is_trusted = false;
+                    let _ = app_handle.emit("peer-update", crate::peer::PeerView::from_peer(&*p));
+                }
+            }
+            tracing::info!(
+                "Switched cluster: forgot {} member(s) of the previous cluster",
+                stale.len()
+            );
+        }
+
         for peer in known_peers {
             // The cluster's view of the responder shouldn't clobber the
             // local pinned record we just wrote (which carries our pinned
@@ -609,6 +640,15 @@ pub(crate) async fn start_pairing(
         }
         crate::storage::save_known_peers(&app_handle, &kp_lock);
     }
+
+    if switching_cluster {
+        // Removals from the old cluster's life must not block membership
+        // sync in this one (same as a factory reset).
+        state.removed_peer_tombstones.lock().unwrap().clear();
+    }
+    // We're a member again: end any dropped-from-cluster state now rather
+    // than waiting for the first heartbeat to be accepted.
+    crate::membership::clear(&app_handle, &state);
 
     // Provisioned-cluster PIN convergence. In a provisioned cluster every
     // device shares one PIN, but the join handshake never carried it — so a
@@ -1100,6 +1140,7 @@ pub(crate) async fn handle_pairing_connection(
         signature: None,
         fingerprint: Some(initiator_fingerprint),
         protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
+        cluster_tag: None,
     };
     {
         let mut kp_lock = state.known_peers.lock().unwrap();

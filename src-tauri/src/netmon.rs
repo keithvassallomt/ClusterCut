@@ -172,13 +172,14 @@ pub fn start_recovery_tasks(app_handle: &tauri::AppHandle) {
         {
             let device_id = state.local_device_id.lock().unwrap().clone();
             let network_name = state.network_name.lock().unwrap().clone();
+            let cluster_tag = state.cluster_tag();
 
             let transport_opt = state.transport.lock().unwrap().clone();
             if let Some(transport) = transport_opt {
                 if let Ok(addr) = transport.local_addr() {
                     let mut discovery = state.discovery.lock().unwrap();
                     if let Some(disc) = discovery.as_mut() {
-                        match disc.register(&device_id, &network_name, addr.port()) {
+                        match disc.register(&device_id, &network_name, &cluster_tag, addr.port()) {
                             Ok(()) => tracing::info!("[Netmon] Re-registered mDNS service"),
                             Err(e) => tracing::error!("[Netmon] Failed to re-register mDNS: {}", e),
                         }

@@ -135,20 +135,33 @@ impl Transport {
             tracing::info!("send_message: connecting to {} for {} byte payload", addr, len);
         }
 
+        // A peer that refuses our client cert can surface at any step below
+        // (see `PeerRefused`), so every connection-level error goes through
+        // `classify_connection_error`.
         let connection = self
             .endpoint
             .connect_with(config, addr, "clustercut")?
-            .await?;
+            .await
+            .map_err(|e| classify_connection_error(addr, e, None))?;
         if large {
             tracing::info!("send_message: connection established to {}", addr);
         }
+        // Our verifier already matched this against a pin, so it names the
+        // device precisely if it goes on to refuse us.
+        let server_fp = server_fingerprint(&connection);
 
-        let (mut send, _recv) = connection.open_bi().await?;
+        let (mut send, _recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| classify_connection_error(addr, e, server_fp.clone()))?;
         if large {
             tracing::info!("send_message: bi stream opened to {}", addr);
         }
 
-        send.write_all(data).await?;
+        send.write_all(data).await.map_err(|e| match e {
+            quinn::WriteError::ConnectionLost(e) => classify_connection_error(addr, e, server_fp.clone()),
+            other => other.into(),
+        })?;
         if large {
             tracing::info!("send_message: write_all done ({} bytes) to {}", len, addr);
         }
@@ -177,6 +190,12 @@ impl Transport {
                 if large {
                     tracing::info!("send_message: peer ACKed all data ({} bytes) to {}", len, addr);
                 }
+            }
+            // The usual place a cert refusal shows up. Draining and then
+            // returning Ok here reported every send to a peer that doesn't
+            // have us paired as delivered, which hid one-sided pairings.
+            Ok(Err(quinn::StoppedError::ConnectionLost(quinn::ConnectionError::ConnectionClosed(close)))) => {
+                return Err(Box::new(PeerRefused::new(addr, &close, server_fp)));
             }
             other => {
                 let fallback_ms = ((len as u64 / 1024).max(500)).min(15_000);
@@ -362,6 +381,75 @@ pub fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>>
         "clustercut".into(), // Add generic SNI validity
     ])?;
     Ok((cert.cert.der().to_vec(), cert.signing_key.serialize_der()))
+}
+
+/// The peer was reachable but aborted the connection at the transport level,
+/// so nothing we sent was delivered. In practice this is mTLS: the peer does
+/// not have our cert pinned (it was reset, or removed us while we were
+/// offline). TLS 1.3 lets the client finish its half of the handshake before
+/// the server checks the client cert, so the refusal can arrive after we have
+/// already opened a stream and written to it.
+///
+/// Kept distinct from other send errors because it proves the network path
+/// works: the heartbeat must not read it as an outage.
+#[derive(Debug)]
+pub struct PeerRefused {
+    pub addr: SocketAddr,
+    pub reason: String,
+    /// SHA-256 of the refusing device's cert, when the refusal came after our
+    /// side of the handshake (the usual case). It matched one of our pins, so
+    /// it identifies which known peer no longer recognises us.
+    pub server_fingerprint: Option<Vec<u8>>,
+}
+
+impl PeerRefused {
+    fn new(addr: SocketAddr, close: &quinn::ConnectionClose, server_fingerprint: Option<Vec<u8>>) -> Self {
+        let reason = if close.reason.is_empty() {
+            close.error_code.to_string()
+        } else {
+            String::from_utf8_lossy(&close.reason).into_owned()
+        };
+        Self { addr, reason, server_fingerprint }
+    }
+}
+
+impl std::fmt::Display for PeerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} refused the connection: {}", self.addr, self.reason)
+    }
+}
+
+impl Error for PeerRefused {}
+
+/// The [`PeerRefused`] behind a `send_message` error, if the peer was
+/// reachable but refused us.
+pub fn as_peer_refusal<'a>(err: &'a (dyn Error + Send + Sync + 'static)) -> Option<&'a PeerRefused> {
+    err.downcast_ref::<PeerRefused>()
+}
+
+/// A peer-sent transport close (`ConnectionClosed`) becomes [`PeerRefused`].
+/// Everything else (timeouts, our own verifier rejecting the peer, resets)
+/// passes through unchanged.
+fn classify_connection_error(
+    addr: SocketAddr,
+    err: quinn::ConnectionError,
+    server_fingerprint: Option<Vec<u8>>,
+) -> Box<dyn Error + Send + Sync> {
+    match err {
+        quinn::ConnectionError::ConnectionClosed(close) => {
+            Box::new(PeerRefused::new(addr, &close, server_fingerprint))
+        }
+        other => Box::new(other),
+    }
+}
+
+/// SHA-256 of the cert the server presented on an established connection.
+fn server_fingerprint(connection: &quinn::Connection) -> Option<Vec<u8>> {
+    let chain = connection
+        .peer_identity()?
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    chain.first().map(|cert| cert_fingerprint(cert.as_ref()))
 }
 
 pub fn cert_fingerprint(cert_der: &[u8]) -> Vec<u8> {
@@ -768,5 +856,83 @@ mod fingerprint_tests {
         // No pin at all ⇒ never accepted (caller also errors before reaching
         // the verifier, but defend here too).
         assert!(!fingerprint_in_set(&[0x01, 0x02, 0x03], &[]));
+    }
+}
+
+/// Real QUIC sends over loopback between two `Transport`s, one pinned to the
+/// other. Guards the send outcome both ways: a peer that refuses our cert must
+/// be an error (it used to drain and return Ok), and a peer that knows us must
+/// still succeed.
+#[cfg(test)]
+mod send_outcome_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn transport() -> Transport {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (cert, key) = generate_self_signed_cert().unwrap();
+        Transport::new(0, cert, key).unwrap()
+    }
+
+    fn loopback(t: &Transport) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], t.endpoint.local_addr().unwrap().port()))
+    }
+
+    /// The client always pins the server's real cert; the server accepts the
+    /// client's cert only if `server_knows_client`. Returns a flag set when
+    /// the server receives a message.
+    fn wire(client: &Transport, server: &Transport, server_knows_client: bool) -> Arc<AtomicBool> {
+        let server_fp = server.local_fingerprint();
+        client.set_fingerprint_resolver(Arc::new(move |_| vec![server_fp.clone()]));
+        let client_fp = client.local_fingerprint();
+        server.set_known_fingerprints_resolver(Arc::new(move |fp| {
+            server_knows_client && fp == client_fp.as_slice()
+        }));
+        let received = Arc::new(AtomicBool::new(false));
+        let flag = received.clone();
+        server.start_listening(
+            move |_data: Vec<u8>, _addr: SocketAddr| flag.store(true, Ordering::SeqCst),
+            |_recv: quinn::RecvStream, _addr: SocketAddr| {},
+            |_kind: &str, _addr: SocketAddr, _detail: Option<String>| {},
+        );
+        received
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_to_peer_that_rejects_our_cert_is_a_refusal() {
+        let (client, server) = (transport(), transport());
+        let received = wire(&client, &server, false);
+
+        let err = client
+            .send_message(loopback(&server), b"hello")
+            .await
+            .expect_err("a peer that rejects our cert must not count as delivered");
+
+        let refused = as_peer_refusal(err.as_ref())
+            .unwrap_or_else(|| panic!("expected PeerRefused, got: {err}"));
+        assert!(refused.reason.contains("client cert fingerprint not in known peers"), "{err}");
+        // Names the refusing device by the cert we pinned for it.
+        assert_eq!(refused.server_fingerprint, Some(server.local_fingerprint()));
+        assert!(!received.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_to_peer_that_knows_us_succeeds() {
+        let (client, server) = (transport(), transport());
+        let received = wire(&client, &server, true);
+
+        client
+            .send_message(loopback(&server), b"hello")
+            .await
+            .expect("send to a peer that has us pinned must succeed");
+
+        // The ACK can beat the receive callback; give it a moment.
+        for _ in 0..50 {
+            if received.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("server never received the message");
     }
 }

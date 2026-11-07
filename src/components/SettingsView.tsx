@@ -37,6 +37,32 @@ export function SettingsView({
 
   const [provName, setProvName] = useState("");
   const [provPin, setProvPin] = useState("");
+  // Nearby devices already using `provName` for a different cluster. A
+  // warning only: the name still saves.
+  const [nameConflicts, setNameConflicts] = useState<string[]>([]);
+
+  const clusterMode = settings?.cluster_mode;
+  useEffect(() => {
+    if (clusterMode !== "provisioned" || !provName.trim()) {
+      setNameConflicts([]);
+      return;
+    }
+    let cancelled = false;
+    const check = () =>
+      invoke<string[]>("cluster_name_conflicts", { name: provName })
+        .then((hosts) => {
+          if (!cancelled) setNameConflicts(hosts);
+        })
+        .catch(() => {});
+    const debounce = setTimeout(check, 300);
+    // Devices come and go; keep the warning current while Settings is open.
+    const refresh = setInterval(check, 10_000);
+    return () => {
+      cancelled = true;
+      clearTimeout(debounce);
+      clearInterval(refresh);
+    };
+  }, [provName, clusterMode]);
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -257,6 +283,7 @@ export function SettingsView({
               setSettings={setSettings}
               provName={provName}
               setProvName={setProvName}
+              nameConflicts={nameConflicts}
               provPin={provPin}
               setProvPin={setProvPin}
               onAutoModeClick={handleAutoModeClick}

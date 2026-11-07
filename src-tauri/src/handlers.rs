@@ -1095,13 +1095,15 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                  peer.is_trusted = true;
 
                  listener_state.add_peer(peer.clone());
+                 // Arrived over mTLS, so this peer is really talking to us.
+                 listener_state.mark_peer_confirmed(&peer.id);
                  let _ = listener_handle.emit("peer-update", crate::peer::PeerView::from_peer(&peer));
 
                  // Fire deferred join notification if this peer was pending verification
                  {
                      let mut pending_joins = listener_state.pending_join_notifications.lock().unwrap();
                      if pending_joins.remove(&peer.id) {
-                         if listener_state.should_notify()
+                         if listener_state.should_notify_peer_change()
                              && listener_state.settings.lock().unwrap().notifications.device_join
                          {
                              tracing::info!("[Notification] Deferred 'Device Joined' fired for {} (confirmed by heartbeat)", peer.hostname);
@@ -1140,6 +1142,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                     signature: None,
                     fingerprint: Some(transport_inside.local_fingerprint()),
                     protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
+                    cluster_tag: Some(listener_state.cluster_tag()),
                 };
 
                 let msg = Message::PeerDiscovery(my_peer);
@@ -1549,14 +1552,22 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                     // Unsolicited ClusterInfo = reply to an anti-entropy
                     // membership-sync request (the sender passed mTLS, so it
                     // is a paired member). Merge members we're missing.
-                    let local_cluster = listener_state.cluster_id.lock().unwrap().clone();
-                    if local_cluster.is_empty() || info.cluster_id != local_cluster {
-                        tracing::warn!(
-                            "Ignoring ClusterInfo from {} for foreign/unset cluster ({})",
-                            addr,
-                            info.cluster_id
-                        );
+                    if info.cluster_id.is_empty() {
+                        tracing::warn!("Ignoring ClusterInfo from {} with no cluster id", addr);
                         return;
+                    }
+                    // The sender passed mTLS both ways, so it's a member of
+                    // our cluster whatever id it holds. Ids diverge when
+                    // devices upgraded from v0.2 each generated their own, or
+                    // a device with peers paired into another cluster. This
+                    // used to ignore such "foreign" snapshots, which left
+                    // members unable to learn about each other (sync only adds
+                    // on the asking side, so one pinned the other and was
+                    // refused). Converge on one id instead; the other side
+                    // does the same when it next asks us.
+                    let local_cluster = listener_state.cluster_id.lock().unwrap().clone();
+                    if crate::cluster_id::should_adopt(&local_cluster, &info.cluster_id) {
+                        crate::cluster_id::adopt(&listener_handle, &listener_state, &info.cluster_id);
                     }
                     let imported = crate::presence::merge_cluster_membership(&listener_state, &info);
                     if imported.is_empty() {
@@ -1615,8 +1626,9 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
                     .and_then(|t| t.local_addr().ok())
                     .map(|a| a.port())
                     .unwrap_or(4654);
+                let cluster_tag = listener_state.cluster_tag();
                 if let Some(discovery) = listener_state.discovery.lock().unwrap().as_mut() {
-                    let _ = discovery.register(&device_id, &name, port);
+                    let _ = discovery.register(&device_id, &name, &cluster_tag, port);
                 }
 
                 let _ = listener_handle.emit("network-update", ());
@@ -1660,7 +1672,7 @@ pub(crate) async fn handle_message(msg: Message, addr: std::net::SocketAddr, lis
              if let Some((peer_id, hostname)) = peer_id_opt {
                  let mut pending_joins = listener_state.pending_join_notifications.lock().unwrap();
                  if pending_joins.remove(&peer_id) {
-                     if listener_state.should_notify()
+                     if listener_state.should_notify_peer_change()
                          && listener_state.settings.lock().unwrap().notifications.device_join
                      {
                          tracing::info!("[Notification] Deferred 'Device Joined' fired for {} (confirmed by Pong)", hostname);

@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import { ShieldCheck, Wifi } from "lucide-react";
+import { ShieldCheck, Wifi, AlertTriangle } from "lucide-react";
 import { SectionHeader, Card } from "../ui";
 import type { AppSettings } from "../../types";
 
@@ -8,6 +8,7 @@ export function ClusterSettings({
   setSettings,
   provName,
   setProvName,
+  nameConflicts,
   provPin,
   setProvPin,
   onAutoModeClick,
@@ -16,6 +17,8 @@ export function ClusterSettings({
   setSettings: (s: AppSettings) => void;
   provName: string;
   setProvName: (v: string) => void;
+  /** Hostnames of nearby devices already using `provName` for another cluster. */
+  nameConflicts: string[];
   provPin: string;
   setProvPin: (v: string) => void;
   onAutoModeClick: () => void;
@@ -65,6 +68,15 @@ export function ClusterSettings({
                   onChange={(e) => setProvName(e.target.value.replace(/\s/g, ""))}
                 />
                 {provName.trim().includes(" ") && <span className="text-[10px] text-rose-500">Spaces not allowed.</span>}
+                {nameConflicts.length > 0 && (
+                  <div className="mt-1 flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 p-2.5 text-[11px] text-amber-900 dark:border-amber-700 dark:bg-amber-950/60 dark:text-amber-100">
+                    <AlertTriangle className="mt-px h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                    <span>
+                      A different cluster nearby is already called this ({nameConflicts.join(", ")}). Two clusters with
+                      the same name are easy to mix up, so pick another name unless you're replacing that cluster.
+                    </span>
+                  </div>
+                )}
               </div>
               <div className="flex flex-col gap-1">
                 <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">My Cluster PIN (Min 6 chars)</label>

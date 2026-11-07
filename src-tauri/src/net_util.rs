@@ -168,6 +168,7 @@ pub(crate) async fn probe_ip(
         signature: None,
         fingerprint: Some(transport.local_fingerprint()),
         protocol_version: Some(crate::discovery::CLUSTERCUT_PROTOCOL_VERSION.to_string()),
+        cluster_tag: Some(state.cluster_tag()),
     };
 
     let msg = Message::PeerDiscovery(my_peer);
@@ -186,6 +187,11 @@ pub(crate) async fn probe_ip(
             match tokio::time::timeout(std::time::Duration::from_millis(2000), send_future).await {
                 Ok(Ok(())) => {
                     tracing::debug!("Probe to {} SUCCESS (Packet Sent)", addr);
+                    state
+                        .membership
+                        .lock()
+                        .unwrap()
+                        .record_accepted(None, std::time::Instant::now());
 
                    // NOTIFY SUCCESS (Only if not startup)
                    if notify && state.should_notify() {
@@ -223,6 +229,7 @@ pub(crate) async fn probe_ip(
                              signature: None,
                              fingerprint: None,
                              protocol_version: None,
+                             cluster_tag: None,
                          };
                          peers.insert(id.clone(), peer.clone());
                          let _ = app_handle.emit("peer-update", crate::peer::PeerView::from_peer(&peer));
@@ -250,6 +257,9 @@ pub(crate) async fn probe_ip(
                 },
                 Ok(Err(e)) => {
                     tracing::warn!("Probe to {} FAILED (Send Error): {}", addr, e);
+                    if let Some(refused) = crate::transport::as_peer_refusal(e.as_ref()) {
+                        crate::membership::record_probe_refusal(&state, addr, refused);
+                    }
                     if notify && state.should_notify() {
                         crate::send_notification(&app_handle, "Connection Failed", &format!("Failed to send packet to {}: {}", ip, e), true, None, "devices", crate::NotificationPayload::None);
                     }

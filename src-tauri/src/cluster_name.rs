@@ -32,9 +32,98 @@ pub(crate) fn next_local_version(local_version: u64) -> u64 {
     local_version + 1
 }
 
+/// Hostnames of nearby devices already advertising `name` for a *different*
+/// cluster. Two clusters sharing a name can't be told apart by name alone,
+/// which is how a re-created cluster leaves a device behind that still thinks
+/// it's a member. Used to warn (never block) when choosing a name.
+///
+/// "Different cluster" compares cluster tags when the device advertises one.
+/// Older builds don't, so for them it falls back to "not one of our known
+/// peers": a device that pairs into our cluster is added to `known_peers`, so
+/// a same-name device outside it belongs to someone else's cluster.
+pub(crate) fn name_conflicts(
+    name: &str,
+    local_id: &str,
+    local_tag: &str,
+    known: &std::collections::HashMap<String, crate::peer::Peer>,
+    runtime: &std::collections::HashMap<String, crate::peer::Peer>,
+) -> Vec<String> {
+    let mut hosts: Vec<String> = runtime
+        .values()
+        .filter(|p| p.id != local_id && p.network_name.as_deref() == Some(name))
+        .filter(|p| match crate::membership::advertised_tag(p) {
+            Some(tag) if !local_tag.is_empty() => tag != local_tag,
+            _ => !known.contains_key(&p.id),
+        })
+        .map(|p| p.hostname.clone())
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn device(id: &str, host: &str, name: &str) -> (String, crate::peer::Peer) {
+        (
+            id.to_string(),
+            crate::peer::Peer {
+                id: id.to_string(),
+                ip: "192.168.96.7".parse().unwrap(),
+                port: 4654,
+                hostname: host.to_string(),
+                last_seen: 0,
+                is_trusted: false,
+                is_manual: false,
+                network_name: Some(name.to_string()),
+                signature: None,
+                fingerprint: None,
+                protocol_version: None,
+                cluster_tag: None,
+            },
+        )
+    }
+
+    #[test]
+    fn same_name_outside_our_cluster_conflicts() {
+        use std::collections::HashMap;
+        let runtime: HashMap<_, _> = [
+            device("eir", "eir.vassallo.cloud", "vassallo.cloud"),
+            device("mimir", "Mimir.local", "vassallo.cloud"),
+            device("ubuntu", "UbuntuVM", "vassallo.cloud"),
+            device("other", "Elsewhere", "abundant-peace"),
+            device("me", "thor", "vassallo.cloud"),
+        ]
+        .into_iter()
+        .collect();
+        // UbuntuVM is one of ours; the rest named vassallo.cloud are not.
+        let known: HashMap<_, _> = [device("ubuntu", "UbuntuVM", "vassallo.cloud")].into_iter().collect();
+        // No tags advertised (older builds): falls back to known_peers.
+        assert_eq!(
+            name_conflicts("vassallo.cloud", "me", "aaaa", &known, &runtime),
+            ["Mimir.local", "eir.vassallo.cloud"]
+        );
+        assert!(name_conflicts("unused-name", "me", "aaaa", &known, &runtime).is_empty());
+    }
+
+    #[test]
+    fn advertised_tags_decide_over_known_peers() {
+        use std::collections::HashMap;
+        // eir is still pinned from before it left, but advertises another
+        // cluster; UbuntuVM isn't pinned yet but advertises ours.
+        let mut eir = device("eir", "eir.vassallo.cloud", "vassallo.cloud");
+        eir.1.cluster_tag = Some("bbbb".into());
+        let mut ubuntu = device("ubuntu", "UbuntuVM", "vassallo.cloud");
+        ubuntu.1.cluster_tag = Some("aaaa".into());
+        let runtime: HashMap<_, _> = [eir.clone(), ubuntu].into_iter().collect();
+        let known: HashMap<_, _> = [eir].into_iter().collect();
+        assert_eq!(
+            name_conflicts("vassallo.cloud", "me", "aaaa", &known, &runtime),
+            ["eir.vassallo.cloud"]
+        );
+    }
 
     #[test]
     fn higher_version_wins() {
